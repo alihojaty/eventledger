@@ -3,89 +3,134 @@ package subscriber
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
 type Subscriber struct {
-	connection   *nats.Conn
-	subject      string
-	subscription *nats.Subscription
+	jetStream nats.JetStreamContext
+	stream    string
+	consumer  string
+	subject   string
 }
 
 func New(
-	connection *nats.Conn,
+	js nats.JetStreamContext,
+	stream string,
+	consumer string,
 	subject string,
 ) (*Subscriber, error) {
 
-	if connection == nil {
-		return nil, fmt.Errorf("NATS connection is nil")
+	if js == nil {
+		return nil, fmt.Errorf("jetstream context is nil")
+	}
+
+	if stream == "" {
+		return nil, fmt.Errorf("stream name is required")
+	}
+
+	if consumer == "" {
+		return nil, fmt.Errorf("consumer name is required")
 	}
 
 	if subject == "" {
-		return nil, fmt.Errorf("NATS subject is required")
+		return nil, fmt.Errorf("subject is required")
 	}
 
 	return &Subscriber{
-		connection: connection,
-		subject:    subject,
+		jetStream: js,
+		stream:    stream,
+		consumer:  consumer,
+		subject:   subject,
 	}, nil
 }
 
 func (s *Subscriber) Run(ctx context.Context) error {
 
 	zap.L().Info(
-		"starting NATS subscriber",
-		zap.String("subject", s.subject),
+		"starting jetstream subscriber",
+		zap.String("stream", s.stream),
+		zap.String("consumer", s.consumer),
 	)
 
-	subscription, err := s.connection.Subscribe(
+	sub, err := s.jetStream.PullSubscribe(
 		s.subject,
-		func(msg *nats.Msg) {
-
-			zap.L().Info(
-				"message received",
-				zap.String("subject", msg.Subject),
-				zap.String("payload", string(msg.Data)),
-			)
-
-		},
+		s.consumer,
+		nats.Bind(s.stream, s.consumer),
 	)
 
 	if err != nil {
 		return fmt.Errorf(
-			"failed to subscribe: %w",
+			"failed to create pull subscription: %w",
 			err,
 		)
 	}
 
-	s.subscription = subscription
-
 	zap.L().Info(
-		"NATS subscriber ready",
+		"jetstream subscriber ready",
 	)
 
-	// Wait for shutdown signal
-	<-ctx.Done()
+	for {
 
-	zap.L().Info(
-		"stopping NATS subscriber",
-	)
+		select {
 
-	if err := s.subscription.Unsubscribe(); err != nil {
+		case <-ctx.Done():
 
-		zap.L().Error(
-			"failed to unsubscribe",
-			zap.Error(err),
-		)
+			zap.L().Info(
+				"stopping jetstream subscriber",
+			)
 
-		return err
+			return nil
+
+		default:
+
+			msgs, err := sub.Fetch(
+				1,
+				nats.MaxWait(time.Second),
+			)
+
+			if err != nil {
+
+				if err == nats.ErrTimeout {
+					continue
+				}
+
+				return fmt.Errorf(
+					"failed to fetch messages: %w",
+					err,
+				)
+			}
+
+			for _, msg := range msgs {
+
+				zap.L().Info(
+					"message received",
+					zap.String(
+						"subject",
+						msg.Subject,
+					),
+					zap.String(
+						"payload",
+						string(msg.Data),
+					),
+				)
+
+				if err := msg.Ack(); err != nil {
+
+					zap.L().Error(
+						"failed to acknowledge message",
+						zap.Error(err),
+					)
+
+					continue
+				}
+
+				zap.L().Info(
+					"message acknowledged",
+				)
+			}
+		}
 	}
-
-	zap.L().Info(
-		"NATS subscriber stopped",
-	)
-
-	return nil
 }

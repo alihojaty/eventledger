@@ -11,6 +11,7 @@ import (
 	"github.com/alihojaty/eventledger/internal/messaging"
 	"github.com/alihojaty/eventledger/internal/publisher"
 	"github.com/alihojaty/eventledger/internal/subscriber"
+	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
@@ -58,6 +59,51 @@ func main() {
 		)
 	}
 
+	js := natsManager.JetStream()
+	if js == nil {
+		zap.L().Fatal("failed to create NATS JetStream")
+	}
+
+	jsManager, err := messaging.NewJetStreamManager(js)
+	if err != nil {
+		zap.L().Fatal("failed to create NATS JetStreamManager", zap.Error(err))
+	}
+
+	err = jsManager.EnsureStream(
+		messaging.StreamConfig{
+			Name:    "MESSAGES",
+			Subject: "demo.messages",
+			Storage: nats.FileStorage,
+		})
+
+	if err != nil {
+		zap.L().Fatal("failed to ensure stream", zap.Error(err))
+	}
+	consumerManager, err := messaging.NewConsumerManager(js)
+
+	if err != nil {
+		zap.L().Fatal(
+			"failed to create consumer manager",
+			zap.Error(err),
+		)
+	}
+
+	err = consumerManager.EnsureConsumer(
+		messaging.ConsumerConfig{
+			StreamName:    "MESSAGES",
+			DurableName:   "message-worker",
+			FilterSubject: "demo.messages",
+			AckWait:       30 * time.Second,
+		},
+	)
+
+	if err != nil {
+		zap.L().Fatal(
+			"failed to ensure consumer",
+			zap.Error(err),
+		)
+	}
+
 	zap.L().Info(
 		"EventLedger started",
 		zap.String("nats_url", cfg.NATSURL),
@@ -74,7 +120,7 @@ func main() {
 	pub, err := publisher.New(
 		natsManager.Connection(),
 		"demo.messages",
-		time.Second,
+		3*time.Second,
 	)
 
 	if err != nil {
@@ -100,7 +146,12 @@ func main() {
 		}
 	}()
 
-	sub, err := subscriber.New(natsManager.Connection(), "demo.messages")
+	sub, err := subscriber.New(
+		natsManager.JetStream(),
+		"MESSAGES",
+		"message-worker",
+		"demo.messages",
+	)
 	if err != nil {
 		zap.L().Fatal("failed to create subscriber", zap.Error(err))
 	}
