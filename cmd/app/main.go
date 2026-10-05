@@ -10,6 +10,7 @@ import (
 	"github.com/alihojaty/eventledger/internal/logger"
 	"github.com/alihojaty/eventledger/internal/messaging"
 	"github.com/alihojaty/eventledger/internal/publisher"
+	"github.com/alihojaty/eventledger/internal/subscriber"
 	"go.uber.org/zap"
 )
 
@@ -99,6 +100,18 @@ func main() {
 		}
 	}()
 
+	sub, err := subscriber.New(natsManager.Connection(), "demo.messages")
+	if err != nil {
+		zap.L().Fatal("failed to create subscriber", zap.Error(err))
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := sub.Run(ctx); err != nil {
+			zap.L().Error("sub stopped with error", zap.Error(err))
+		}
+	}()
 	// Temporary test lifecycle
 	// Later replaced by SIGTERM/SIGINT handling
 	time.Sleep(10 * time.Second)
