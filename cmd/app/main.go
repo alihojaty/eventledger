@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"log"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/alihojaty/eventledger/internal/config"
@@ -32,7 +34,6 @@ func main() {
 		)
 	}
 
-	// Create NATS manager
 	natsManager, err := messaging.NewNATSManager(
 		messaging.NATSConfig{
 			URL: cfg.NATSURL,
@@ -46,7 +47,6 @@ func main() {
 		)
 	}
 
-	// Connect NATS
 	if err := natsManager.Connect(
 		messaging.NATSConfig{
 			URL: cfg.NATSURL,
@@ -60,13 +60,18 @@ func main() {
 	}
 
 	js := natsManager.JetStream()
+
 	if js == nil {
 		zap.L().Fatal("failed to create NATS JetStream")
 	}
 
 	jsManager, err := messaging.NewJetStreamManager(js)
+
 	if err != nil {
-		zap.L().Fatal("failed to create NATS JetStreamManager", zap.Error(err))
+		zap.L().Fatal(
+			"failed to create JetStream Manager",
+			zap.Error(err),
+		)
 	}
 
 	err = jsManager.EnsureStream(
@@ -74,11 +79,16 @@ func main() {
 			Name:    "MESSAGES",
 			Subject: "demo.messages",
 			Storage: nats.FileStorage,
-		})
+		},
+	)
 
 	if err != nil {
-		zap.L().Fatal("failed to ensure stream", zap.Error(err))
+		zap.L().Fatal(
+			"failed to ensure stream",
+			zap.Error(err),
+		)
 	}
+
 	consumerManager, err := messaging.NewConsumerManager(js)
 
 	if err != nil {
@@ -110,13 +120,14 @@ func main() {
 		zap.String("nats_port", cfg.NATSPort),
 	)
 
-	// Application context
-	ctx, cancel := context.WithCancel(
+	ctx, cancel := signal.NotifyContext(
 		context.Background(),
+		syscall.SIGINT,
+		syscall.SIGTERM,
 	)
+
 	defer cancel()
 
-	// Create publisher
 	pub, err := publisher.New(
 		natsManager.Connection(),
 		"demo.messages",
@@ -130,7 +141,20 @@ func main() {
 		)
 	}
 
-	// Start publisher worker
+	sub, err := subscriber.New(
+		natsManager.JetStream(),
+		"MESSAGES",
+		"message-worker",
+		"demo.messages",
+	)
+
+	if err != nil {
+		zap.L().Fatal(
+			"failed to create subscriber",
+			zap.Error(err),
+		)
+	}
+
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -146,43 +170,42 @@ func main() {
 		}
 	}()
 
-	sub, err := subscriber.New(
-		natsManager.JetStream(),
-		"MESSAGES",
-		"message-worker",
-		"demo.messages",
-	)
-	if err != nil {
-		zap.L().Fatal("failed to create subscriber", zap.Error(err))
-	}
-
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
+
 		if err := sub.Run(ctx); err != nil {
-			zap.L().Error("sub stopped with error", zap.Error(err))
+			zap.L().Error(
+				"subscriber stopped with error",
+				zap.Error(err),
+			)
 		}
 	}()
-	// Temporary test lifecycle
-	// Later replaced by SIGTERM/SIGINT handling
-	time.Sleep(10 * time.Second)
 
-	// Shutdown publisher
-	zap.L().Info("stopping publisher")
+	<-ctx.Done()
+
+	zap.L().Info(
+		"shutdown signal received",
+	)
 
 	cancel()
 
 	wg.Wait()
 
-	zap.L().Info("publisher stopped successfully")
+	zap.L().Info(
+		"workers stopped successfully",
+	)
 
-	// Close NATS
 	if err := natsManager.Close(); err != nil {
+
 		zap.L().Fatal(
 			"failed to close NATS Manager",
 			zap.Error(err),
 		)
 	}
 
-	zap.L().Info("EventLedger shutdown complete")
+	zap.L().Info(
+		"EventLedger shutdown complete",
+	)
 }
