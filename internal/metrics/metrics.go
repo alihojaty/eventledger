@@ -38,8 +38,6 @@ func NewCollector() *Collector {
 	return &Collector{}
 }
 
-// RestoreState شمارنده‌های اولیه را در بدو بالا آمدن برنامه از دیتابیس و بروکر بازیابی می‌کند
-// تا پس از Restart، داشبورد از عدد واقعی قبلی (مثلاً ۲۴) به سمت ۲۵ ادامه دهد!
 func (c *Collector) RestoreState(processedInDB, dlqInBroker uint64) {
 	c.restoredAtStartup.Store(processedInDB)
 	c.processed.Store(processedInDB)

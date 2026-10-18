@@ -104,7 +104,6 @@ func main() {
 
 	pub := publisher.NewPublisher(natsBroker, cfg.PublishInterval, cfg.PublishEnabled, log)
 
-	// اتصال داشبورد به کنترلرهای Worker، Broker، دیتابیس و کلید زنده Publisher
 	metricsCollector.EnableDashboard(consumerGroup, natsBroker, repo, pub)
 	go metricsCollector.StartServer(pubCtx, cfg.MetricsPort, log)
 

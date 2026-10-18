@@ -15,9 +15,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// Publisher وظیفه تولید و انتشار دوره‌ای رویدادهای واریز به NATS JetStream را بر عهده دارد.
-// وضعیت فعال یا غیرفعال بودن آن با atomic.Bool مدیریت می‌شود تا هم از .env مقداردهی اولیه شود
-// و هم در حین اجرا از طریق داشبورد وب به صورت Thread-Safe قابل تغییر باشد.
 type Publisher struct {
 	broker   broker.Broker
 	interval time.Duration
@@ -26,7 +23,6 @@ type Publisher struct {
 	seq      atomic.Uint64
 }
 
-// NewPublisher یک نمونه جدید از سرویس تولیدکننده رویداد می‌سازد و وضعیت اولیه را از تنظیمات (.env) می‌گیرد.
 func NewPublisher(b broker.Broker, interval time.Duration, enabled bool, logger *zap.Logger) *Publisher {
 	p := &Publisher{
 		broker:   b,
@@ -37,12 +33,10 @@ func NewPublisher(b broker.Broker, interval time.Duration, enabled bool, logger 
 	return p
 }
 
-// IsEnabled وضعیت لحظه‌ای فعال یا غیرفعال بودن Publisher را به صورت اتمیک برمی‌گرداند.
 func (p *Publisher) IsEnabled() bool {
 	return p.enabled.Load()
 }
 
-// SetEnabled وضعیت Publisher را در حین اجرای برنامه به صورت زنده تغییر می‌دهد و لاگ متناظر را ثبت می‌کند.
 func (p *Publisher) SetEnabled(enable bool) {
 	prev := p.enabled.Swap(enable)
 	if prev == enable {
@@ -55,8 +49,6 @@ func (p *Publisher) SetEnabled(enable bool) {
 	}
 }
 
-// Start حلقه تایمر تولید رویداد را آغاز می‌کند.
-// اگر PUBLISH_ENABLED=false باشد، در حالت Standby می‌ماند تا زمانی که کاربر از داشبورد آن را فعال کند یا برنامه بسته شود.
 func (p *Publisher) Start(ctx context.Context) {
 	if p.enabled.Load() {
 		p.logger.Info("Publisher started", zap.Duration("interval", p.interval))
@@ -73,7 +65,6 @@ func (p *Publisher) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// بررسی اتمیک در هر تیک: فقط زمانی که PUBLISH_ENABLED فعال است رویداد تولید می‌شود
 			if p.enabled.Load() {
 				p.publishNextSimulatedEvent(ctx)
 			}

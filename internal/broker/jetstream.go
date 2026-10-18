@@ -25,7 +25,6 @@ const (
 	DefaultAckWait      = 3 * time.Second
 )
 
-// Broker رابط عملیات پیام‌رسان شامل انتشار همگام، ناهمگام و مدیریت Consumer است.
 type Broker interface {
 	PublishDeposit(ctx context.Context, eventID string, payload []byte) (*jetstream.PubAck, error)
 	PublishDepositAsync(eventID string, payload []byte) (jetstream.PubAckFuture, error)
@@ -197,7 +196,6 @@ func (b *NATSBroker) Close() {
 	}
 }
 
-// QueueStats وضعیت لحظه‌ای استریم NATS و Consumer پایدار را نشان می‌دهد.
 type QueueStats struct {
 	StreamTotalMsgs uint64 `json:"stream_total_msgs"`
 	DLQTotalMsgs    uint64 `json:"dlq_total_msgs"`
@@ -206,7 +204,6 @@ type QueueStats struct {
 	NextSequence    uint64 `json:"next_sequence"`
 }
 
-// GetQueueStats آمار دقیق پیام‌های داخل صف NATS و نقطه ادامه پردازش (Resume Sequence) را استخراج می‌کند.
 func (b *NATSBroker) GetQueueStats(ctx context.Context) (QueueStats, error) {
 	var stats QueueStats
 

@@ -194,7 +194,6 @@ func (r *PostgresRepository) Close() error {
 	return nil
 }
 
-// UserBalanceRow ساختار نمایشی موجودی هر کاربر برای داشبورد گرافیکی است.
 type UserBalanceRow struct {
 	UserID    int    `json:"user_id"`
 	USDT      string `json:"usdt"`
@@ -203,7 +202,6 @@ type UserBalanceRow struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-// GetAllUserBalances موجودی تمام کاربران را به تفکیک ارز از دیتابیس استخراج می‌کند.
 func (r *PostgresRepository) GetAllUserBalances(ctx context.Context) ([]UserBalanceRow, error) {
 	const query = `
 		SELECT 
@@ -234,7 +232,6 @@ func (r *PostgresRepository) GetAllUserBalances(ctx context.Context) ([]UserBala
 	return result, rows.Err()
 }
 
-// ProcessedDepositItem اطلاعات هر پیام پردازش‌شده به همراه شماره ردیف (Sequence) آن در دیتابیس است.
 type ProcessedDepositItem struct {
 	OrderNum    int    `json:"order_num"`
 	EventID     string `json:"event_id"`
@@ -244,15 +241,12 @@ type ProcessedDepositItem struct {
 	ProcessedAt string `json:"processed_at"`
 }
 
-// GetTotalProcessedCount تعداد کل رویدادهای واریزی که تا این لحظه در دیتابیس Commit شده‌اند را برمی‌گرداند.
 func (r *PostgresRepository) GetTotalProcessedCount(ctx context.Context) (uint64, error) {
 	var count uint64
 	err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM deposits").Scan(&count)
 	return count, err
 }
 
-// GetRecentProcessedDeposits آخرین رویدادهای پردازش‌شده را به ترتیب زمان ثبت برمی‌گرداند
-// تا در داشبورد دقیقاً ببینیم برنامه پس از Restart از کدام شماره پیام کار را ادامه داده است.
 func (r *PostgresRepository) GetRecentProcessedDeposits(ctx context.Context, limit int) ([]ProcessedDepositItem, error) {
 	const query = `
 		WITH numbered AS (

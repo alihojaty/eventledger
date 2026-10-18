@@ -36,7 +36,6 @@ type QueueInspector interface {
 	GetQueueStats(ctx context.Context) (broker.QueueStats, error)
 }
 
-// PublisherController رابط کنترل زنده سرویس Publisher از طریق داشبورد وب است.
 type PublisherController interface {
 	IsEnabled() bool
 	SetEnabled(enable bool)
@@ -137,7 +136,6 @@ func (c *Collector) registerDashboardRoutes(mux *http.ServeMux) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// وب‌سرویس تغییر زنده وضعیت PUBLISH_ENABLED با کلیک روی دکمه داخل داشبورد
 	mux.HandleFunc("/api/publisher/toggle", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

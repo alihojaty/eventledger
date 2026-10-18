@@ -43,7 +43,6 @@ func setupIntegrationEnv(t *testing.T) (*repository.PostgresRepository, *broker.
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 
-	// گرفتن قفل سراسری PostgreSQL تا پکیج‌های دیگر نتوانند هم‌زمان جدول‌ها یا استریم‌های NATS را پاک کنند
 	lockConn, err := repo.DB().Conn(ctx)
 	if err != nil {
 		_ = repo.Close()

@@ -61,7 +61,6 @@ func TestEndToEnd_CrashRecovery_ZeroDataLossAndZeroDoubleSpend(t *testing.T) {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 
-	// گرفتن قفل سراسری PostgreSQL برای جلوگیری از تداخل موازی سایر پکیج‌های تست
 	lockConn, err := realRepo.DB().Conn(ctx)
 	if err != nil {
 		_ = realRepo.Close()
@@ -137,7 +136,6 @@ func TestEndToEnd_CrashRecovery_ZeroDataLossAndZeroDoubleSpend(t *testing.T) {
 		t.Fatalf("failed to start group1: %v", err)
 	}
 
-	// انتظار هوشمند تا ۲ پیام اول در دیتابیس ثبت شوند (حداکثر ۵ ثانیه)
 	midDeadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(midDeadline) {
 		bal, _ := realRepo.GetBalance(ctx, targetUserID, domain.CurrencyUSDT)
@@ -158,7 +156,6 @@ func TestEndToEnd_CrashRecovery_ZeroDataLossAndZeroDoubleSpend(t *testing.T) {
 		t.Fatalf("expected balance of 200.00 after partial processing, got %s", midBalance.String())
 	}
 
-	// فاز دوم: بالا آمدن مجدد برنامه با دیتابیس سالم و تکمیل ۳ پیام باقی‌مانده
 	var wg2 sync.WaitGroup
 	collector2 := metrics.NewCollector()
 	proc2 := worker.NewProcessor(ctx, &wg2, realRepo, natsBroker, 200*time.Millisecond, nopLogger, collector2)

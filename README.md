@@ -32,8 +32,8 @@ This system is engineered around a strict golden rule for financial systems:
 ---
 
 ## 🛠️ Tech Stack
-- **Language:** Go 1.23+
-- **Database:** PostgreSQL 16 (with `pgx/v5` driver)
+- **Language:** Go 1.27.1+
+- **Database:** PostgreSQL 18 (with `pgx/v5` driver)
 - **Message Broker:** NATS JetStream (File Storage)
 - **Financial Math:** `shopspring/decimal` (Zero floating-point rounding errors)
 - **Logging:** `go.uber.org/zap` (Structured JSON logs)
@@ -45,7 +45,7 @@ This system is engineered around a strict golden rule for financial systems:
 
 ### Prerequisites
 - Docker & Docker Compose installed on your machine.
-- Go 1.23+ (if running locally without Docker).
+- Go 1.27.1+ (if running locally without Docker).
 
 ### Option A: Run Full Stack via Docker Compose (Recommended)
 1. Clone the repository and copy environment variables:

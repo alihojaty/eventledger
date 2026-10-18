@@ -30,7 +30,6 @@ func setupTestBroker(t *testing.T) *NATSBroker {
 	ctx := context.Background()
 	nopLogger := zap.NewNop()
 
-	// گرفتن قفل سراسری تا با تست‌های پکیج integration یا cmd/processor روی استریم NATS تداخل پیدا نکند
 	db, err := sql.Open("pgx", dbURL)
 	if err != nil {
 		t.Fatalf("failed to open db for advisory lock: %v", err)

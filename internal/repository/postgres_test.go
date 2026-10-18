@@ -31,8 +31,6 @@ func setupTestRepo(t *testing.T) *PostgresRepository {
 		t.Fatalf("failed to connect to test database: %v", err)
 	}
 
-	// گرفتن قفل سراسری در سطح PostgreSQL (Advisory Lock) تا وقتی go test ./... پکیج‌ها را
-	// به صورت موازی اجرا می‌کند، هیچ پکیج دیگری نتواند وسط این تست جدول‌ها را TRUNCATE کند!
 	lockConn, err := repo.DB().Conn(ctx)
 	if err != nil {
 		_ = repo.Close()
