@@ -296,7 +296,7 @@ func (c *Collector) registerDashboardRoutes(mux *http.ServeMux) {
 
 		case "burst":
 			batchPrefix := uuid.NewString()[:8]
-			for i := 1; i <= 500; i++ {
+			for i := 1; i <= 500000; i++ {
 				userID := (i % 20) + 1
 				evID := fmt.Sprintf("ui-burst-%s-%d", batchPrefix, i)
 				payload := fmt.Sprintf(

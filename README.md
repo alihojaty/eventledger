@@ -50,7 +50,7 @@ This system is engineered around a strict golden rule for financial systems:
 ### Option A: Run Full Stack via Docker Compose (Recommended)
 1. Clone the repository and copy environment variables:
    ```bash
-   git clone https://github.com/your-username/reliable-deposit-processor.git
+   git clone https://github.com/alihojaty/reliable-deposit-processor.git
    cd reliable-deposit-processor
    cp .env.example .env
    ```
