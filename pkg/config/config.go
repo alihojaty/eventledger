@@ -9,7 +9,7 @@ import (
 )
 
 type Config struct {
-	DatabaseURL     string        `env:"DATABASE_URL,required"`
+	DatabaseURL     string        `env:"DATABASE_URL"`
 	MigrationsPath  string        `env:"MIGRATIONS_PATH" envDefault:"file://migrations"`
 	NatsURL         string        `env:"NATS_URL,required"`
 	PublishEnabled  bool          `env:"PUBLISH_ENABLED" envDefault:"true"`

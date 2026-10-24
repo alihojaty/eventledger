@@ -1,4 +1,4 @@
-package publisher
+package generator
 
 import (
 	"context"
@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/alihojaty/reliable-deposit-processor/internal/broker"
-	"github.com/alihojaty/reliable-deposit-processor/internal/domain"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"

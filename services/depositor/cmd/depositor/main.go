@@ -9,13 +9,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/alihojaty/reliable-deposit-processor/internal/broker"
-	"github.com/alihojaty/reliable-deposit-processor/internal/config"
-	"github.com/alihojaty/reliable-deposit-processor/internal/logger"
-	"github.com/alihojaty/reliable-deposit-processor/internal/metrics"
-	"github.com/alihojaty/reliable-deposit-processor/internal/publisher"
-	"github.com/alihojaty/reliable-deposit-processor/internal/repository"
-	"github.com/alihojaty/reliable-deposit-processor/internal/worker"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
+	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/metrics"
+	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/repository"
+	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/worker"
 	"go.uber.org/zap"
 )
 
@@ -32,10 +31,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("Application started",
+	log.Info("Depositor service started",
 		zap.Int("worker_count", cfg.WorkerCount),
-		zap.Bool("publish_enabled", cfg.PublishEnabled),
-		zap.Duration("publish_interval", cfg.PublishInterval),
 		zap.Duration("retry_interval", cfg.RetryInterval),
 		zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 		zap.Int("metrics_port", cfg.MetricsPort),
@@ -47,8 +44,8 @@ func main() {
 	workCtx, workCancel := context.WithCancel(context.Background())
 	defer workCancel()
 
-	pubCtx, pubCancel := context.WithCancel(context.Background())
-	defer pubCancel()
+	srvCtx, srvCancel := context.WithCancel(context.Background())
+	defer srvCancel()
 
 	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer initCancel()
@@ -76,14 +73,6 @@ func main() {
 	qStats, _ := natsBroker.GetQueueStats(initCtx)
 	metricsCollector.RestoreState(prevProcessed, qStats.DLQTotalMsgs)
 
-	if prevProcessed > 0 || qStats.ConsumerPending > 0 {
-		log.Info("Restored previous state from Database and NATS JetStream",
-			zap.Uint64("already_processed_in_db", prevProcessed),
-			zap.Uint64("pending_in_nats_queue", qStats.ConsumerPending),
-			zap.Uint64("resuming_from_message_number", prevProcessed+1),
-		)
-	}
-
 	var inFlightWg sync.WaitGroup
 	proc := worker.NewProcessor(
 		workCtx,
@@ -102,16 +91,8 @@ func main() {
 		log.Fatal("Failed to start worker consumer group", zap.Error(err))
 	}
 
-	pub := publisher.NewPublisher(natsBroker, cfg.PublishInterval, cfg.PublishEnabled, log)
-
-	metricsCollector.EnableDashboard(consumerGroup, natsBroker, repo, pub)
-	go metricsCollector.StartServer(pubCtx, cfg.MetricsPort, log)
-
-	pubDone := make(chan struct{})
-	go func() {
-		defer close(pubDone)
-		pub.Start(pubCtx)
-	}()
+	metricsCollector.EnableDashboard(consumerGroup, natsBroker, repo, nil)
+	go metricsCollector.StartServer(srvCtx, cfg.MetricsPort, log)
 
 	termCtrl := worker.NewTerminalController(consumerGroup, os.Stdin, os.Stdout, log)
 	go termCtrl.Start(sigCtx)
@@ -139,12 +120,10 @@ func main() {
 		log.Info("Workers stopped")
 	}
 
-	pubCancel()
-	<-pubDone
-
+	srvCancel()
 	natsBroker.Close()
 	_ = repo.Close()
 
-	log.Info("Application stopped")
+	log.Info("Depositor service stopped")
 	_ = log.Sync()
 }

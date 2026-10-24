@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alihojaty/reliable-deposit-processor/internal/domain"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/nats-io/nats.go/jetstream"

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alihojaty/reliable-deposit-processor/internal/domain"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"

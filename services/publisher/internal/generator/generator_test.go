@@ -1,4 +1,4 @@
-package publisher
+package generator
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alihojaty/reliable-deposit-processor/internal/domain"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )

@@ -5,13 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 
-	"github.com/alihojaty/reliable-deposit-processor/internal/domain"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/dbx"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
@@ -28,57 +25,17 @@ type PostgresRepository struct {
 }
 
 func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) (*PostgresRepository, error) {
-	db, err := sql.Open("pgx", databaseURL)
+	db, err := dbx.ConnectAndMigrate(ctx, databaseURL, migrationsPath, logger)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database connection: %w", err)
+		return nil, err
 	}
-
-	db.SetMaxOpenConns(50)
-	db.SetMaxIdleConns(25)
-	db.SetConnMaxLifetime(30 * time.Minute)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-
-	var pingErr error
-	for attempt := 1; attempt <= 10; attempt++ {
-		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		pingErr = db.PingContext(pingCtx)
-		cancel()
-
-		if pingErr == nil {
-			break
-		}
-
-		logger.Warn("Temporary failure",
-			zap.String("component", "postgres_repository"),
-			zap.Int("attempt", attempt),
-			zap.Error(pingErr),
-		)
-
-		select {
-		case <-ctx.Done():
-			_ = db.Close()
-			return nil, fmt.Errorf("context canceled while waiting for database: %w", ctx.Err())
-		case <-time.After(1 * time.Second):
-		}
-	}
-
-	if pingErr != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to ping database after retries: %w", pingErr)
-	}
-
-	logger.Info("Connected to Database")
-
-	if err := runMigrations(databaseURL, migrationsPath, logger); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to run database migrations: %w", err)
-	}
-
 	return &PostgresRepository{
 		db:     db,
 		logger: logger,
 	}, nil
 }
+
+// بقیه متدها (ProcessDeposit, GetBalance, DB, Close, GetAllUserBalances, ...) دقیقاً مثل قبل
 
 func runMigrations(databaseURL, migrationsPath string, logger *zap.Logger) error {
 	m, err := migrate.New(migrationsPath, databaseURL)
