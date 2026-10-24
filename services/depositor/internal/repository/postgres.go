@@ -8,7 +8,6 @@ import (
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/dbx"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
-	"github.com/golang-migrate/migrate/v4"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
@@ -33,25 +32,6 @@ func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath stri
 		db:     db,
 		logger: logger,
 	}, nil
-}
-
-// بقیه متدها (ProcessDeposit, GetBalance, DB, Close, GetAllUserBalances, ...) دقیقاً مثل قبل
-
-func runMigrations(databaseURL, migrationsPath string, logger *zap.Logger) error {
-	m, err := migrate.New(migrationsPath, databaseURL)
-	if err != nil {
-		return fmt.Errorf("failed to create migrate instance: %w", err)
-	}
-	defer func() {
-		_, _ = m.Close()
-	}()
-
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("failed to apply up migrations: %w", err)
-	}
-
-	logger.Debug("Database migrations applied successfully")
-	return nil
 }
 
 func (r *PostgresRepository) ProcessDeposit(ctx context.Context, event *domain.DepositEvent) error {

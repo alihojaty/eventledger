@@ -4,7 +4,6 @@ go 1.27.3
 
 require (
 	github.com/alihojaty/reliable-deposit-processor/pkg v0.0.0
-	github.com/golang-migrate/migrate/v4 v4.20.1
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/shopspring/decimal v1.5.0
@@ -13,6 +12,7 @@ require (
 
 require (
 	github.com/caarlos0/env/v11 v11.4.1 // indirect
+	github.com/golang-migrate/migrate/v4 v4.20.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/pgx/v5 v5.11.0 // indirect
