@@ -42,17 +42,15 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable
-      MIGRATIONS_PATH: file://migrations
+      MIGRATIONS_PATH: file:///app/migrations
       NATS_URL: nats://nats:4222
       WORKER_COUNT: 3
       RETRY_INTERVAL: 5s
       SHUTDOWN_TIMEOUT: 10s
       METRICS_PORT: 8080
       LOG_LEVEL: info
-    ports:
-      - "8080-8085:8080"
-    stdin_open: true
-    tty: true
+    deploy:
+      replicas: 3
     restart: unless-stopped
 
   publisher:
@@ -67,6 +65,23 @@ services:
       PUBLISH_ENABLED: "true"
       PUBLISH_INTERVAL: 1s
       LOG_LEVEL: info
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: services/dashboard/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable
+      NATS_URL: nats://nats:4222
+      PORT: 8080
+    ports:
+      - "8080:8080"
     restart: unless-stopped
 
 volumes:

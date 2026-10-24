@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -12,6 +13,7 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/generator"
+	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
@@ -46,6 +48,19 @@ func main() {
 	defer natsBroker.Close()
 
 	pub := generator.NewPublisher(natsBroker, cfg.PublishInterval, cfg.PublishEnabled, log)
+
+	if ctrlConn, err := nats.Connect(cfg.NatsURL, nats.MaxReconnects(-1)); err == nil {
+		defer ctrlConn.Close()
+		_, _ = ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
+			var cmd struct {
+				PublishEnabled bool `json:"publish_enabled"`
+			}
+			if err := json.Unmarshal(msg.Data, &cmd); err == nil {
+				pub.SetEnabled(cmd.PublishEnabled)
+			}
+		})
+	}
+
 	pub.Start(sigCtx)
 
 	log.Info("Publisher service stopped")

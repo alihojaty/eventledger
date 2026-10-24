@@ -1,6 +1,6 @@
 module github.com/alihojaty/reliable-deposit-processor/pkg
 
-go 1.27.3
+go 1.26.0
 
 require (
 	github.com/caarlos0/env/v11 v11.4.1

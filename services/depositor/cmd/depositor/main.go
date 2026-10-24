@@ -44,9 +44,6 @@ func main() {
 	workCtx, workCancel := context.WithCancel(context.Background())
 	defer workCancel()
 
-	srvCtx, srvCancel := context.WithCancel(context.Background())
-	defer srvCancel()
-
 	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer initCancel()
 
@@ -91,8 +88,7 @@ func main() {
 		log.Fatal("Failed to start worker consumer group", zap.Error(err))
 	}
 
-	metricsCollector.EnableDashboard(consumerGroup, natsBroker, repo, nil)
-	go metricsCollector.StartServer(srvCtx, cfg.MetricsPort, log)
+	StartTelemetryReporter(sigCtx, cfg.NatsURL, cfg.WorkerCount, metricsCollector.GetSnapshot)
 
 	termCtrl := worker.NewTerminalController(consumerGroup, os.Stdin, os.Stdout, log)
 	go termCtrl.Start(sigCtx)
@@ -120,7 +116,6 @@ func main() {
 		log.Info("Workers stopped")
 	}
 
-	srvCancel()
 	natsBroker.Close()
 	_ = repo.Close()
 

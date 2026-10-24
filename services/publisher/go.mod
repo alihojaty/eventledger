@@ -1,6 +1,6 @@
 module github.com/alihojaty/reliable-deposit-processor/services/publisher
 
-go 1.27.3
+go 1.26.0
 
 require (
 	github.com/alihojaty/reliable-deposit-processor/pkg v0.0.0
