@@ -31,6 +31,7 @@ jobs:
         image: nats:2.10-alpine
         ports:
           - 4222:4222
+        args: [ "-js" ]
 
     steps:
       - name: Checkout repository
