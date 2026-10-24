@@ -1,0 +1,23 @@
+# Binaries
+bin/
+dist/
+*.exe
+*.out
+*.test
+processor
+depositor
+publisher
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE & OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Coverage
+coverage.out

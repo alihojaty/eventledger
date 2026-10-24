@@ -1,7 +1,6 @@
 services:
   postgres:
-    image: postgres:latest
-    container_name: deposit_postgres
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -9,7 +8,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d deposits_db"]
       interval: 5s
@@ -18,8 +17,7 @@ services:
     restart: unless-stopped
 
   nats:
-    image: nats:latest
-    container_name: deposit_nats
+    image: nats:2.10-alpine
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
       - "4222:4222"
@@ -28,15 +26,15 @@ services:
       - nats_data:/data
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 4222 || exit 1"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 3
+      retries: 5
     restart: unless-stopped
-  processor:
+
+  depositor:
     build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: deposit_processor
+      context: ..
+      dockerfile: services/depositor/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,19 +44,31 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable
       MIGRATIONS_PATH: file://migrations
       NATS_URL: nats://nats:4222
-      PUBLISH_ENABLED: "true"
-      PUBLISH_INTERVAL: 1s
       WORKER_COUNT: 3
       RETRY_INTERVAL: 5s
       SHUTDOWN_TIMEOUT: 10s
       METRICS_PORT: 8080
       LOG_LEVEL: info
     ports:
-      - "8080:8080"
+      - "8080-8085:8080"
     stdin_open: true
     tty: true
-    profiles:
-      - full
+    restart: unless-stopped
+
+  publisher:
+    build:
+      context: ..
+      dockerfile: services/publisher/Dockerfile
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: nats://nats:4222
+      PUBLISH_ENABLED: "true"
+      PUBLISH_INTERVAL: 1s
+      LOG_LEVEL: info
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   nats_data:
