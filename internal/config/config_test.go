@@ -9,7 +9,9 @@ import (
 func TestLoad_OSEnvOverridesDotEnv(t *testing.T) {
 	tmpDir := t.TempDir()
 	envFile := filepath.Join(tmpDir, ".env")
-	envContent := "DATABASE_URL=postgres://dotenv:5432/db\nNATS_URL=nats://dotenv:4222\nWORKER_COUNT=5\n"
+
+	envContent := "WORKER_COUNT=5\n"
+
 	if err := os.WriteFile(envFile, []byte(envContent), 0600); err != nil {
 		t.Fatalf("failed to write temp .env file: %v", err)
 	}
@@ -23,6 +25,8 @@ func TestLoad_OSEnvOverridesDotEnv(t *testing.T) {
 		t.Fatalf("failed to chdir: %v", err)
 	}
 
+	t.Setenv("DATABASE_URL", "postgres://test:test@localhost:5432/testdb")
+	t.Setenv("NATS_URL", "nats://localhost:4222")
 	t.Setenv("WORKER_COUNT", "12")
 
 	cfg, err := Load()
