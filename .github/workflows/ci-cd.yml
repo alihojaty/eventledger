@@ -17,37 +17,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Start PostgreSQL
-        run: |
-          docker run -d \
-            --name postgres \
-            -e POSTGRES_USER=postgres \
-            -e POSTGRES_PASSWORD=postgres \
-            -e POSTGRES_DB=deposits_db \
-            -p 5432:5432 \
-            postgres:18-alpine
-
-      - name: Start NATS with JetStream
-        run: |
-          docker run -d \
-            --name nats \
-            -p 4222:4222 \
-            -p 8222:8222 \
-            nats:2.10-alpine -js -m 8222
-
-      - name: Wait for PostgreSQL to be ready
-        run: |
-          for i in {1..30}; do
-            if docker exec postgres pg_isready -U postgres -d deposits_db; then
-              echo "PostgreSQL is ready!"
-              exit 0
-            fi
-            echo "Waiting for PostgreSQL..."
-            sleep 1
-          done
-          echo "PostgreSQL startup timeout"
-          exit 1
-
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
