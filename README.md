@@ -34,7 +34,7 @@ This system is engineered around a strict golden rule for financial systems[cite
 ---
 
 ## 🛠️ Tech Stack
-- **Language:** Go 1.27.3+ (Multi-Module Workspace via `go.work`)[cite: 2]
+- **Language:** Go 1.26+ (Multi-Module Workspace via `go.work`)[cite: 2]
 - **Database:** PostgreSQL 18 (with `pgx/v5` driver)[cite: 1, 2]
 - **Message Broker:** NATS JetStream (File Storage)[cite: 1, 2]
 - **Financial Math:** `shopspring/decimal` (Zero floating-point rounding errors)[cite: 1, 2]
@@ -187,3 +187,21 @@ eventledger/
 #### ۳. چرا `pkg` و `internal` هر دو لازم‌اند؟ یک مثال از هر کدام در پروژهٔ خودت.
 * **`pkg/` برای اشتراک‌گذاری کنترل‌شدهٔ زیرساخت و قراردادها (Code Reuse & Contracts):** از تکرار کد (DRY) بین سرویس‌ها جلوگیری می‌کند[cite: 2]. **مثال در پروژه:** پکیج `pkg/domain` (شامل ساختار `DepositEvent` و اعتبارسنجی مبالغ با `shopspring/decimal`)؛ هم سرویس `publisher` برای تولید پیام معتبر و هم سرویس `depositor` برای اعتبارسنجی پیام دریافتی به یک قرارداد واحد نیاز دارند[cite: 2].
 * **`internal/` برای حفظ مرزهای سرویس و کپسوله‌سازی (Encapsulation & Service Boundaries):** کامپایلر Go در سطح کامپایل اجازه نمی‌دهد هیچ کدی خارج از درختِ والدِ `internal` آن را ایمپورت کند[cite: 2]. این کار مانع از ایجاد وابستگی پنهان (Tight Coupling) بین سرویس‌ها می‌شود[cite: 2]. **مثال در پروژه:** پکیج `services/depositor/internal/repository` که تراکنش‌های جدول `balances` را اجرا می‌کند؛ سرویس `publisher` تحت هیچ شرایطی نباید بتواند مستقیماً کدهای دیتابیس `depositor` را صدا بزند، و کامپایلر Go این قانون معماری را در زمان کامپایل تضمین می‌کند[cite: 2].
+
+#### ۴. اگر تراکنش در دیتابیس Commit شود اما برنامه دقیقاً قبل از ارسال `Ack` به NATS کرش کند، چه اتفاقی می‌افتد؟ (`DOC-05`)
+* از آنجا که JetStream پیام‌های تحویل‌شده‌ای را که در بازهٔ `AckWait` تأیید (`Ack`) نشده‌اند مجدداً ارسال می‌کند (**At-Least-Once Delivery**)، پس از بالا آمدن مجدد سرویس یا توسط Replica دیگر، همان پیام دوباره دریافت می‌شود.
+* هنگام اجرای مجدد `ProcessDeposit`، دستور `INSERT INTO deposits ... ON CONFLICT (event_id) DO NOTHING` به دلیل وجود کلید اصلی `event_id` از تراکنش قبلی، مقدار `RowsAffected = 0` برمی‌گرداند.
+* کد برنامه خطای `domain.ErrDuplicateEvent` را تشخیص داده، از اجرای کوئری افزایش موجودی (`balances`) صرف‌نظر می‌کند و بلافاصله پیام را `Ack` می‌نماید. در نتیجه **Exactly-Once Financial Effect** تضمین شده و هیچ افزایش موجودی مضاعفی (Double Spend) رخ نمی‌دهد.
+
+#### ۵. اگر دیتابیس PostgreSQL به مدت ۱۰ دقیقه کامل قطع شود، رفتار سیستم چیست؟ (`DOC-06`)
+* سرویس `depositor` به هیچ وجه کرش (`panic` یا `os.Exit`) نمی‌کند و پیام‌ها را نیز به اشتباه وارد DLQ نمی‌کند (زیرا خطای زیرساخت با پیام نامعتبر تفاوت دارد).
+* به ازای هر خطای اتصال یا تراکنش، Workerها پیام را با `msg.NakWithDelay(cfg.RetryInterval)` به NATS برمی‌گردانند تا بدون ایجاد Busy-Loop یا فشار CPU، پس از بازهٔ تنظیم‌شده مجدداً تلاش شود.
+* استریم `DEPOSITS` از نوع `FileStorage` بدون محدودیت حذف زودهنگام و مصرف‌کننده دارای `MaxDeliver: -1` است؛ بنابراین تمام رویدادهای جدید تولیدشده توسط `publisher` در دیسک JetStream محفوظ می‌مانند و به محض بازگشت PostgreSQL، کل Backlog به صورت خودکار و بدون دخالت دستی پردازش و تسویه می‌شود.
+
+#### ۶. چرا استفاده از `float32` / `float64` برای مبالغ مالی ممنوع است؟ (`DOC-07`)
+* اعداد ممیز شناور استاندارد IEEE 754 در مبنای ۲ (Binary Floating-Point) ذخیره می‌شوند و قادر به نمایش دقیق بسیاری از کسرهای دهدهی ساده (مانند `0.1` یا `0.2`) نیستند (برای نمونه در ممیز شناور دوگانه `0.1 + 0.2 = 0.30000000000000004` است).
+* در مقیاس هزاران تراکنش مالی هم‌زمان، این خطاهای گرد کردن دودویی انباشته شده و باعث عدم تطابق موجودی کیف‌پول با جمع دفتر کل (`SUM(deposits.amount) != balances.balance`) می‌شوند. به همین دلیل در سراسر این سیستم، مبالغ در JSON به صورت رشته (`string`)، در Go با کتابخانهٔ دهدهی با دقت دلخواه (`shopspring/decimal`) و در PostgreSQL با نوع `NUMERIC(36, 18)` پردازش و ذخیره می‌گردند.
+
+#### ۷. نکات تکمیلی دربارهٔ چرخهٔ حیات دو سرویس و مقایسهٔ `COUNT(deposits)` با `LastSequence` (`DOC-13`، `DOC-14`)
+* **چرخهٔ حیات مستقل (`A-13`):** پس از تفکیک معماری به دو میکروسرویس مستقل، هر سرویس Graceful Shutdown مختص به خود را دارد؛ `publisher` تولید رویداد جدید را متوقف کرده و ارسال‌های در جریان را تکمیل می‌کند، و `depositor` دریافت پیام جدید را متوقف (`DrainAll`) کرده و منتظر اتمام تراکنش‌های باز دیتابیس تا سقف `SHUTDOWN_TIMEOUT` می‌ماند.
+* **شرط برابری با `LastSequence` (`A-01`):** برابری `COUNT(deposits) == stream.LastSequence` زمانی برقرار است که استریم تمیز بوده، تمامی رویدادهای ارسال‌شده معتبر و دارای `event_id` یکتا باشند و Backlog کامل تخلیه شده باشد. در سناریوهایی که پیام نامعتبر (ارسال به `DEPOSITS_DLQ`) یا پیام تکراری خارج از پنجرهٔ Deduplication ارسال شود، `LastSequence` استریم بزرگ‌تر از `COUNT(deposits)` خواهد بود که رفتار صحیح سیستم است.

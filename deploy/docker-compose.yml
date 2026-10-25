@@ -40,17 +40,18 @@ services:
         condition: service_healthy
       nats:
         condition: service_healthy
+    stop_grace_period: 25s
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL_DOCKER:-postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable}
       MIGRATIONS_PATH: file:///app/migrations
-      NATS_URL: nats://nats:4222
-      WORKER_COUNT: 3
-      RETRY_INTERVAL: 5s
-      SHUTDOWN_TIMEOUT: 10s
-      METRICS_PORT: 8080
-      LOG_LEVEL: info
+      NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
+      WORKER_COUNT: ${WORKER_COUNT:-3}
+      RETRY_INTERVAL: ${RETRY_INTERVAL:-5s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      METRICS_PORT: ${METRICS_PORT:-8080}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     deploy:
-      replicas: 3
+      replicas: 2
     restart: unless-stopped
 
   publisher:
@@ -60,11 +61,12 @@ services:
     depends_on:
       nats:
         condition: service_healthy
+    stop_grace_period: 15s
     environment:
-      NATS_URL: nats://nats:4222
-      PUBLISH_ENABLED: "true"
-      PUBLISH_INTERVAL: 1s
-      LOG_LEVEL: info
+      NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
+      PUBLISH_ENABLED: ${PUBLISH_ENABLED:-true}
+      PUBLISH_INTERVAL: ${PUBLISH_INTERVAL:-1s}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     restart: unless-stopped
 
   dashboard:
@@ -77,8 +79,8 @@ services:
       nats:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable
-      NATS_URL: nats://nats:4222
+      DATABASE_URL: ${DATABASE_URL_DOCKER:-postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable}
+      NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
       PORT: 8080
     ports:
       - "8080:8080"

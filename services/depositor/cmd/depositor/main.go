@@ -25,11 +25,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	log, err := logger.New(cfg.LogLevel)
+	baseLog, err := logger.New(cfg.LogLevel)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}
+
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "depositor-local"
+	}
+	log := baseLog.With(
+		zap.String("service", "depositor"),
+		zap.String("instance_id", hostname),
+	)
 
 	log.Info("Depositor service started",
 		zap.Int("worker_count", cfg.WorkerCount),
@@ -88,7 +97,7 @@ func main() {
 		log.Fatal("Failed to start worker consumer group", zap.Error(err))
 	}
 
-	StartTelemetryReporter(sigCtx, cfg.NatsURL, cfg.WorkerCount, metricsCollector.GetSnapshot)
+	metrics.StartTelemetryReporter(sigCtx, cfg.NatsURL, cfg.WorkerCount, metricsCollector.GetSnapshot)
 
 	termCtrl := worker.NewTerminalController(consumerGroup, os.Stdin, os.Stdout, log)
 	go termCtrl.Start(sigCtx)
@@ -110,6 +119,7 @@ func main() {
 	case <-time.After(cfg.ShutdownTimeout):
 		log.Warn("Shutdown timeout exceeded; canceling in-flight database transactions",
 			zap.Duration("timeout", cfg.ShutdownTimeout),
+			zap.Int64("in_flight_remaining", proc.InFlightCount()),
 		)
 		workCancel()
 		<-waitDone

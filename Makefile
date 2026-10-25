@@ -12,11 +12,24 @@ build:
 	go build -o bin/publisher ./services/publisher/cmd/publisher
 
 test:
-	@echo "==> Running tests across all modules..."
-	@for mod in $(MODULES); do \
-		echo "--- Testing $$mod ---"; \
-		(cd $$mod && go test -v -race -count=1 ./...) || exit 1; \
+	@echo "==> Starting infrastructure services for testing..."
+	docker compose -f $(COMPOSE_FILE) up -d postgres nats
+	@echo "==> Waiting for PostgreSQL to be ready..."
+	@for i in {1..30}; do \
+		if docker compose -f $(COMPOSE_FILE) exec -T postgres pg_isready -U postgres -d deposits_db >/dev/null 2>&1; then \
+			echo "PostgreSQL is ready!"; \
+			break; \
+		fi; \
+		sleep 1; \
 	done
+	@echo "==> Running tests across all modules..."
+	@set -e; \
+	for mod in $(MODULES); do \
+		echo "--- Testing $$mod ---"; \
+		(cd $$mod && go test -v -race -count=1 ./...) || { docker compose -f $(COMPOSE_FILE) down; exit 1; }; \
+	done
+	@echo "==> Stopping infrastructure services..."
+	docker compose -f $(COMPOSE_FILE) down
 
 lint:
 	@echo "==> Vet & Linting all modules..."
