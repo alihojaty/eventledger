@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -13,7 +12,6 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/generator"
-	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 )
 
@@ -24,11 +22,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	log, err := logger.New(cfg.LogLevel)
+	baseLog, err := logger.New(cfg.LogLevel)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
 		os.Exit(1)
 	}
+
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "publisher-local"
+	}
+	log := baseLog.With(
+		zap.String("service", "publisher"),
+		zap.String("instance_id", hostname),
+	)
 
 	log.Info("Publisher service started",
 		zap.Bool("publish_enabled", cfg.PublishEnabled),
@@ -48,19 +55,7 @@ func main() {
 	defer natsBroker.Close()
 
 	pub := generator.NewPublisher(natsBroker, cfg.PublishInterval, cfg.PublishEnabled, log)
-
-	if ctrlConn, err := nats.Connect(cfg.NatsURL, nats.MaxReconnects(-1)); err == nil {
-		defer ctrlConn.Close()
-		_, _ = ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
-			var cmd struct {
-				PublishEnabled bool `json:"publish_enabled"`
-			}
-			if err := json.Unmarshal(msg.Data, &cmd); err == nil {
-				pub.SetEnabled(cmd.PublishEnabled)
-			}
-		})
-	}
-
+	pub.StartControlListener(sigCtx, cfg.NatsURL)
 	pub.Start(sigCtx)
 
 	log.Info("Publisher service stopped")

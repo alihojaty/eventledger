@@ -71,18 +71,30 @@ func ConnectAndMigrate(ctx context.Context, databaseURL, migrationsPath string, 
 }
 
 func RunMigrations(databaseURL, migrationsPath string, logger *zap.Logger) error {
-	m, err := migrate.New(migrationsPath, databaseURL)
-	if err != nil {
-		return fmt.Errorf("failed to create migrate instance: %w", err)
-	}
-	defer func() {
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		m, err := migrate.New(migrationsPath, databaseURL)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create migrate instance: %w", err)
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+			continue
+		}
+
+		err = m.Up()
 		_, _ = m.Close()
-	}()
 
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("failed to apply up migrations: %w", err)
+		if err == nil || errors.Is(err, migrate.ErrNoChange) {
+			logger.Debug("Database migrations applied successfully")
+			return nil
+		}
+
+		lastErr = fmt.Errorf("failed to apply up migrations: %w", err)
+		logger.Warn("Migration lock contention or temporary failure; retrying",
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 	}
 
-	logger.Debug("Database migrations applied successfully")
-	return nil
+	return lastErr
 }

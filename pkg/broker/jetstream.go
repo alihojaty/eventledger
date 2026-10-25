@@ -22,7 +22,7 @@ const (
 	ConsumerDurableName = "deposits_processor"
 
 	DeduplicationWindow = 10 * time.Minute
-	DefaultAckWait      = 3 * time.Second
+	DefaultAckWait      = 15 * time.Second
 )
 
 type Broker interface {

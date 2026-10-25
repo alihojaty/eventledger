@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
@@ -39,6 +40,7 @@ func (noopMetrics) IncRetried()   {}
 type Processor struct {
 	workCtx       context.Context
 	inFlightWg    *sync.WaitGroup
+	inFlightCount atomic.Int64
 	repo          repository.DepositRepository
 	broker        broker.Broker
 	retryInterval time.Duration
@@ -73,9 +75,17 @@ func NewProcessor(
 	}
 }
 
+func (p *Processor) InFlightCount() int64 {
+	return p.inFlightCount.Load()
+}
+
 func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 	p.inFlightWg.Add(1)
-	defer p.inFlightWg.Done()
+	p.inFlightCount.Add(1)
+	defer func() {
+		p.inFlightCount.Add(-1)
+		p.inFlightWg.Done()
+	}()
 
 	rawPayload := msg.Data()
 	p.metrics.IncReceived()
@@ -96,7 +106,10 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 		return
 	}
 
-	err = p.repo.ProcessDeposit(p.workCtx, event)
+	dbCtx, cancel := context.WithTimeout(p.workCtx, 10*time.Second)
+	defer cancel()
+
+	err = p.repo.ProcessDeposit(dbCtx, event)
 	if err != nil {
 		if errors.Is(err, domain.ErrDuplicateEvent) {
 			p.metrics.IncDuplicate()
@@ -170,12 +183,14 @@ func (p *Processor) handleInvalidMessage(
 	)
 
 	dlqPayload := domain.DLQMessage{
+		EventID:       invalidErr.EventID,
+		ErrorCode:     "VALIDATION_ERROR",
 		OriginalEvent: string(rawPayload),
 		Reason:        invalidErr.Reason,
 		Timestamp:     time.Now().UTC(),
 	}
 
-	dlqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	dlqCtx, cancel := context.WithTimeout(p.workCtx, 5*time.Second)
 	defer cancel()
 
 	if err := p.broker.PublishDLQ(dlqCtx, dlqPayload); err != nil {

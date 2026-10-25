@@ -3,7 +3,6 @@ package generator
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"math/rand"
 	"sync/atomic"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/google/uuid"
+	"github.com/nats-io/nats.go"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 )
@@ -20,7 +20,6 @@ type Publisher struct {
 	interval time.Duration
 	enabled  atomic.Bool
 	logger   *zap.Logger
-	seq      atomic.Uint64
 }
 
 func NewPublisher(b broker.Broker, interval time.Duration, enabled bool, logger *zap.Logger) *Publisher {
@@ -49,6 +48,28 @@ func (p *Publisher) SetEnabled(enable bool) {
 	}
 }
 
+func (p *Publisher) StartControlListener(ctx context.Context, natsURL string) {
+	ctrlConn, err := nats.Connect(natsURL, nats.MaxReconnects(-1))
+	if err != nil {
+		p.logger.Warn("Failed to connect control listener to NATS", zap.Error(err))
+		return
+	}
+
+	_, _ = ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
+		var cmd struct {
+			PublishEnabled bool `json:"publish_enabled"`
+		}
+		if err := json.Unmarshal(msg.Data, &cmd); err == nil {
+			p.SetEnabled(cmd.PublishEnabled)
+		}
+	})
+
+	go func() {
+		<-ctx.Done()
+		ctrlConn.Close()
+	}()
+}
+
 func (p *Publisher) Start(ctx context.Context) {
 	if p.enabled.Load() {
 		p.logger.Info("Publisher started", zap.Duration("interval", p.interval))
@@ -73,22 +94,6 @@ func (p *Publisher) Start(ctx context.Context) {
 }
 
 func (p *Publisher) publishNextSimulatedEvent(ctx context.Context) {
-	count := p.seq.Add(1)
-
-	if count%10 == 0 {
-		badID := fmt.Sprintf("evt-invalid-%d-%s", count, uuid.NewString()[:8])
-		badPayload := fmt.Sprintf(
-			`{"event_id":%q,"user_id":5,"currency":"DOGE","amount":"50.00","created_at":%q}`,
-			badID, time.Now().UTC().Format(time.RFC3339),
-		)
-		if _, err := p.broker.PublishDeposit(ctx, badID, []byte(badPayload)); err != nil {
-			if ctx.Err() == nil {
-				p.logger.Error("Failed to publish simulated invalid event", zap.Error(err))
-			}
-		}
-		return
-	}
-
 	event := p.generateValidEvent()
 	payload, err := json.Marshal(event)
 	if err != nil {
@@ -96,15 +101,43 @@ func (p *Publisher) publishNextSimulatedEvent(ctx context.Context) {
 		return
 	}
 
-	if _, err := p.broker.PublishDeposit(ctx, event.EventID, payload); err != nil {
-		if ctx.Err() == nil {
-			p.logger.Error("Failed to publish deposit event",
+	const maxAttempts = 3
+	backoff := 200 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		pubCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ack, pubErr := p.broker.PublishDeposit(pubCtx, event.EventID, payload)
+		cancel()
+
+		if pubErr == nil {
+			p.logger.Info("Deposit event published successfully",
 				zap.String("event_id", event.EventID),
-				zap.Error(err),
+				zap.Int("user_id", event.UserID),
+				zap.String("currency", event.Currency),
+				zap.String("amount", event.Amount.String()),
+				zap.Uint64("sequence", ack.Sequence),
+				zap.Bool("duplicate", ack.Duplicate),
 			)
+			return
 		}
-		return
+
+		p.logger.Warn("Temporary failure publishing deposit event; retrying with same event_id",
+			zap.String("event_id", event.EventID),
+			zap.Int("attempt", attempt),
+			zap.Error(pubErr),
+		)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			backoff *= 2
+		}
 	}
+
+	p.logger.Error("Failed to publish deposit event after max retries",
+		zap.String("event_id", event.EventID),
+	)
 }
 
 func (p *Publisher) generateValidEvent() domain.DepositEvent {
