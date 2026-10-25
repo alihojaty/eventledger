@@ -4,9 +4,9 @@ dist/
 *.exe
 *.out
 *.test
-processor
-depositor
-publisher
+/processor
+/depositor
+/publisher
 
 # Environment variables
 .env
