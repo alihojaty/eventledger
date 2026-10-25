@@ -16,9 +16,12 @@ const (
 )
 
 const (
-	MinUserID = 1
-	MaxUserID = 20
+	MinUserID        = 1
+	MaxUserID        = 20
+	MaxDecimalPlaces = -18
 )
+
+var maxAllowedAmount = decimal.New(1, 18)
 
 type DepositEvent struct {
 	EventID   string          `json:"event_id"`
@@ -29,6 +32,8 @@ type DepositEvent struct {
 }
 
 type DLQMessage struct {
+	EventID       string    `json:"event_id,omitempty"`
+	ErrorCode     string    `json:"error_code,omitempty"`
 	OriginalEvent string    `json:"original_event"`
 	Reason        string    `json:"reason"`
 	Timestamp     time.Time `json:"timestamp"`
@@ -76,6 +81,22 @@ func (e *DepositEvent) Validate() error {
 		return NewInvalidMessageError(
 			e.EventID,
 			fmt.Sprintf("amount must be strictly greater than zero, got %s", e.Amount.String()),
+			nil,
+		)
+	}
+
+	if e.Amount.Exponent() < MaxDecimalPlaces {
+		return NewInvalidMessageError(
+			e.EventID,
+			fmt.Sprintf("amount precision exceeds maximum 18 decimal places, got %s", e.Amount.String()),
+			nil,
+		)
+	}
+
+	if e.Amount.GreaterThanOrEqual(maxAllowedAmount) {
+		return NewInvalidMessageError(
+			e.EventID,
+			fmt.Sprintf("amount exceeds maximum allowed limit, got %s", e.Amount.String()),
 			nil,
 		)
 	}

@@ -147,6 +147,30 @@ func TestParseAndValidateDepositEvent(t *testing.T) {
 			wantErr:        true,
 			expectedReason: "amount must be strictly greater than zero",
 		},
+		{
+			name: "Invalid - Exceeds 18 decimal places",
+			payload: `{
+				"event_id": "evt-1010",
+				"user_id": 10,
+				"currency": "BTC",
+				"amount": "0.1234567890123456789",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount precision exceeds maximum 18 decimal places",
+		},
+		{
+			name: "Invalid - Exceeds maximum allowed limit",
+			payload: `{
+				"event_id": "evt-1011",
+				"user_id": 10,
+				"currency": "IRT",
+				"amount": "1000000000000000000",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount exceeds maximum allowed limit",
+		},
 	}
 
 	for _, tt := range tests {
