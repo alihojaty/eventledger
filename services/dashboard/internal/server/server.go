@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"sync"
@@ -11,6 +12,13 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+)
+
+const (
+	streamDeposits       = "DEPOSITS"
+	subjectDepositEvents = "deposits.events"
+	streamDepositsDLQ    = "DEPOSITS_DLQ"
 )
 
 type DepositorTelemetry struct {
@@ -24,18 +32,51 @@ type DepositorTelemetry struct {
 	LastSeen        time.Time `json:"-"`
 }
 
+type LedgerReconciliationReport struct {
+	IsBalanced       bool                    `json:"is_balanced"`
+	DiscrepancyCount int                     `json:"discrepancy_count"`
+	TotalLedgerUSDT  string                  `json:"total_ledger_usdt"`
+	TotalLedgerBTC   string                  `json:"total_ledger_btc"`
+	TotalLedgerIRT   string                  `json:"total_ledger_irt"`
+	CheckedAt        string                  `json:"checked_at"`
+	Discrepancies    []LedgerDiscrepancyItem `json:"discrepancies"`
+}
+
+type LedgerDiscrepancyItem struct {
+	UserID          int    `json:"user_id"`
+	Currency        string `json:"currency"`
+	ExpectedBalance string `json:"expected_balance"`
+	ActualBalance   string `json:"actual_balance"`
+	Difference      string `json:"difference"`
+}
+
+type DLQInspectorItem struct {
+	DLQSequence    uint64 `json:"dlq_sequence"`
+	EventID        string `json:"event_id"`
+	ErrorCode      string `json:"error_code"`
+	SourceStream   string `json:"source_stream"`
+	Subject        string `json:"subject"`
+	StreamSequence uint64 `json:"stream_sequence"`
+	OriginalEvent  string `json:"original_event"`
+	Reason         string `json:"reason"`
+	Timestamp      string `json:"timestamp"`
+}
+
 type AggregatedResponse struct {
-	ActiveReplicas  int                  `json:"active_replicas"`
-	TotalWorkers    int                  `json:"total_workers"`
-	GlobalTPS       float64              `json:"global_tps"`
-	GlobalProcessed uint64               `json:"global_processed"`
-	GlobalFailed    uint64               `json:"global_failed"`
-	GlobalDuplicate uint64               `json:"global_duplicates"`
-	DBTotalDeposits int64                `json:"db_total_deposits"`
-	PublishEnabled  bool                 `json:"publish_enabled"`
-	Replicas        []DepositorTelemetry `json:"replicas"`
-	RecentDeposits  []RecentDepositItem  `json:"recent_deposits"`
-	Balances        []UserBalanceRow     `json:"balances"`
+	ActiveReplicas  int                        `json:"active_replicas"`
+	TotalWorkers    int                        `json:"total_workers"`
+	GlobalTPS       float64                    `json:"global_tps"`
+	GlobalProcessed uint64                     `json:"global_processed"`
+	GlobalFailed    uint64                     `json:"global_failed"`
+	GlobalDuplicate uint64                     `json:"global_duplicates"`
+	DBTotalDeposits int64                      `json:"db_total_deposits"`
+	DLQTotalCount   uint64                     `json:"dlq_total_count"`
+	PublishEnabled  bool                       `json:"publish_enabled"`
+	Reconciliation  LedgerReconciliationReport `json:"reconciliation"`
+	Replicas        []DepositorTelemetry       `json:"replicas"`
+	RecentDeposits  []RecentDepositItem        `json:"recent_deposits"`
+	DLQMessages     []DLQInspectorItem         `json:"dlq_messages"`
+	Balances        []UserBalanceRow           `json:"balances"`
 }
 
 type RecentDepositItem struct {
@@ -59,14 +100,17 @@ type DashboardServer struct {
 	mu             sync.RWMutex
 	replicas       map[string]DepositorTelemetry
 	nc             *nats.Conn
+	js             jetstream.JetStream
 	db             *sql.DB
 	publishEnabled atomic.Bool
 }
 
 func NewDashboardServer(nc *nats.Conn, db *sql.DB) *DashboardServer {
+	js, _ := jetstream.New(nc)
 	s := &DashboardServer{
 		replicas: make(map[string]DepositorTelemetry),
 		nc:       nc,
+		js:       js,
 		db:       db,
 	}
 	s.publishEnabled.Store(true)
@@ -77,6 +121,8 @@ func (s *DashboardServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", s.handleUI)
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/publisher/toggle", s.handleTogglePublisher)
+	mux.HandleFunc("/api/dlq/replay", s.handleReplayDLQ)
+	mux.HandleFunc("/api/dlq/inject", s.handleInjectInvalidEvent)
 }
 
 func (s *DashboardServer) StartNATSListener(ctx context.Context) error {
@@ -141,12 +187,20 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	var dbCount int64
 	var recentDeposits []RecentDepositItem
 	var balances []UserBalanceRow
+	reconReport := LedgerReconciliationReport{
+		IsBalanced:      true,
+		TotalLedgerUSDT: "0",
+		TotalLedgerBTC:  "0",
+		TotalLedgerIRT:  "0",
+		CheckedAt:       time.Now().Format("15:04:05"),
+		Discrepancies:   []LedgerDiscrepancyItem{},
+	}
 
 	if s.db != nil {
 		_ = s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM deposits").Scan(&dbCount)
 
 		rows, err := s.db.QueryContext(r.Context(), `
-			SELECT ROW_NUMBER() OVER (ORDER BY processed_at DESC) as rn, event_id, user_id, currency, amount, TO_CHAR(processed_at, 'YYYY-MM-DD HH24:MI:SS') 
+			SELECT ROW_NUMBER() OVER (ORDER BY processed_at DESC) as rn, event_id, user_id, currency, ROUND(amount, 8)::TEXT, TO_CHAR(processed_at, 'YYYY-MM-DD HH24:MI:SS') 
 			FROM deposits ORDER BY processed_at DESC LIMIT 15
 		`)
 		if err == nil {
@@ -174,7 +228,11 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 				balances = append(balances, b)
 			}
 		}
+
+		reconReport = s.runLedgerReconciliation(r.Context())
 	}
+
+	dlqTotal, dlqItems := s.fetchDLQMessages(r.Context(), 15)
 
 	if recentDeposits == nil {
 		recentDeposits = []RecentDepositItem{}
@@ -191,14 +249,206 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		GlobalFailed:    globalFail,
 		GlobalDuplicate: globalDup,
 		DBTotalDeposits: dbCount,
+		DLQTotalCount:   dlqTotal,
 		PublishEnabled:  s.publishEnabled.Load(),
+		Reconciliation:  reconReport,
 		Replicas:        replicasList,
 		RecentDeposits:  recentDeposits,
+		DLQMessages:     dlqItems,
 		Balances:        balances,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *DashboardServer) runLedgerReconciliation(ctx context.Context) LedgerReconciliationReport {
+	report := LedgerReconciliationReport{
+		IsBalanced:      true,
+		TotalLedgerUSDT: "0",
+		TotalLedgerBTC:  "0",
+		TotalLedgerIRT:  "0",
+		CheckedAt:       time.Now().Format("15:04:05"),
+		Discrepancies:   []LedgerDiscrepancyItem{},
+	}
+
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT 
+			COALESCE(SUM(CASE WHEN currency='USDT' THEN amount END), 0)::TEXT,
+			COALESCE(SUM(CASE WHEN currency='BTC'  THEN amount END), 0)::TEXT,
+			COALESCE(SUM(CASE WHEN currency='IRT'  THEN amount END), 0)::TEXT
+		FROM deposits
+	`).Scan(&report.TotalLedgerUSDT, &report.TotalLedgerBTC, &report.TotalLedgerIRT)
+
+	const reconQuery = `
+		WITH expected AS (
+			SELECT user_id, currency, SUM(amount) AS expected_amount
+			FROM deposits
+			GROUP BY user_id, currency
+		)
+		SELECT
+			COALESCE(e.user_id, b.user_id) AS user_id,
+			COALESCE(e.currency, b.currency) AS currency,
+			COALESCE(e.expected_amount, 0)::TEXT AS expected_balance,
+			COALESCE(b.balance, 0)::TEXT AS actual_balance,
+			(COALESCE(b.balance, 0) - COALESCE(e.expected_amount, 0))::TEXT AS difference
+		FROM expected e
+		FULL OUTER JOIN balances b
+			ON b.user_id = e.user_id AND b.currency = e.currency
+		WHERE COALESCE(e.expected_amount, 0) IS DISTINCT FROM COALESCE(b.balance, 0)
+		ORDER BY user_id ASC, currency ASC
+	`
+
+	rows, err := s.db.QueryContext(ctx, reconQuery)
+	if err != nil {
+		return report
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item LedgerDiscrepancyItem
+		if err := rows.Scan(&item.UserID, &item.Currency, &item.ExpectedBalance, &item.ActualBalance, &item.Difference); err == nil {
+			report.Discrepancies = append(report.Discrepancies, item)
+		}
+	}
+
+	report.DiscrepancyCount = len(report.Discrepancies)
+	report.IsBalanced = report.DiscrepancyCount == 0
+	return report
+}
+
+func (s *DashboardServer) fetchDLQMessages(ctx context.Context, limit int) (uint64, []DLQInspectorItem) {
+	items := []DLQInspectorItem{}
+	if s.js == nil {
+		return 0, items
+	}
+
+	stream, err := s.js.Stream(ctx, streamDepositsDLQ)
+	if err != nil {
+		return 0, items
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return 0, items
+	}
+
+	totalMsgs := info.State.Msgs
+	if totalMsgs == 0 || info.State.LastSeq == 0 {
+		return 0, items
+	}
+
+	count := 0
+	for seq := info.State.LastSeq; seq >= info.State.FirstSeq && count < limit; seq-- {
+		rawMsg, err := stream.GetMsg(ctx, seq)
+		if err == nil {
+			var parsed struct {
+				EventID        string    `json:"event_id"`
+				ErrorCode      string    `json:"error_code"`
+				SourceStream   string    `json:"source_stream"`
+				Subject        string    `json:"subject"`
+				StreamSequence uint64    `json:"stream_sequence"`
+				OriginalEvent  string    `json:"original_event"`
+				Reason         string    `json:"reason"`
+				Timestamp      time.Time `json:"timestamp"`
+			}
+
+			if err := json.Unmarshal(rawMsg.Data, &parsed); err == nil {
+				items = append(items, DLQInspectorItem{
+					DLQSequence:    rawMsg.Sequence,
+					EventID:        parsed.EventID,
+					ErrorCode:      parsed.ErrorCode,
+					SourceStream:   parsed.SourceStream,
+					Subject:        parsed.Subject,
+					StreamSequence: parsed.StreamSequence,
+					OriginalEvent:  parsed.OriginalEvent,
+					Reason:         parsed.Reason,
+					Timestamp:      parsed.Timestamp.Format("2006-01-02 15:04:05"),
+				})
+				count++
+			}
+		}
+
+		if seq == 0 {
+			break
+		}
+	}
+
+	return totalMsgs, items
+}
+
+func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		DLQSequence uint64 `json:"dlq_sequence"`
+		NewPayload  string `json:"new_payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if s.js == nil {
+		http.Error(w, "jetstream not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	replayMsgID := fmt.Sprintf("replay-dlq-%d-%d", req.DLQSequence, time.Now().UnixNano())
+
+	ack, err := s.js.Publish(
+		r.Context(),
+		subjectDepositEvents,
+		[]byte(req.NewPayload),
+		jetstream.WithMsgID(replayMsgID),
+	)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to publish replayed event: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	if req.DLQSequence > 0 {
+		if dlqStream, err := s.js.Stream(r.Context(), streamDepositsDLQ); err == nil {
+			_ = dlqStream.DeleteMsg(r.Context(), req.DLQSequence)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"replayed":       true,
+		"dlq_sequence":   req.DLQSequence,
+		"new_stream_seq": ack.Sequence,
+	})
+}
+
+func (s *DashboardServer) handleInjectInvalidEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.js == nil {
+		http.Error(w, "jetstream not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	badEventID := fmt.Sprintf("evt-poison-%d", time.Now().UnixNano()%100000)
+	poisonPayload := fmt.Sprintf(
+		`{"event_id":%q,"user_id":7,"currency":"DOGE","amount":"250.00","created_at":%q}`,
+		badEventID,
+		time.Now().UTC().Format(time.RFC3339),
+	)
+
+	_, err := s.js.Publish(r.Context(), subjectDepositEvents, []byte(poisonPayload), jetstream.WithMsgID(badEventID))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"injected_event_id": badEventID})
 }
 
 func (s *DashboardServer) handleTogglePublisher(w http.ResponseWriter, r *http.Request) {
@@ -245,20 +495,19 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-3xl shadow-inner">⚡</div>
       <div>
         <h1 class="text-xl font-extrabold text-white">مرکز کنترل مانیتورینگ خوشه‌ای (Cluster Control Center)</h1>
-        <p class="text-xs text-slate-400 mt-1">NATS Consumer Grouping &bull; Horizontal Scaled Replicas &bull; PostgreSQL ACID</p>
+        <p class="text-xs text-slate-400 mt-1">NATS Consumer Grouping &bull; Automated Ledger Reconciliation &bull; DLQ Inspector & Replay</p>
       </div>
     </div>
     <div class="flex flex-wrap items-center gap-3">
+      <button onclick="injectPoisonMessage()" class="px-3.5 py-2.5 rounded-xl text-xs font-bold transition shadow-md bg-amber-600/90 text-white hover:bg-amber-500 cursor-pointer">
+        🧪 تزریق پیام خراب تستی (Poison Pill)
+      </button>
       <button id="pubBtn" class="px-4 py-2.5 rounded-xl text-xs font-bold transition shadow-md flex items-center gap-2 cursor-pointer bg-emerald-600 text-white hover:bg-emerald-500" onclick="togglePublisher()">
         <span>Publisher: Running</span>
       </button>
       <div class="bg-slate-950 border border-slate-800 px-4 py-2 rounded-xl text-center">
         <span class="text-[10px] text-slate-400 block">کل سرعت خوشه (Cluster TPS)</span>
         <span id="tps" class="text-base font-bold text-emerald-400 ltr-num">0 TPS</span>
-      </div>
-      <div class="flex items-center gap-2 bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 px-4 py-2.5 rounded-xl text-xs font-medium">
-        <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping"></span>
-        <span>Cluster Healthy</span>
       </div>
     </div>
   </div>
@@ -282,16 +531,83 @@ const dashboardHTML = `<!DOCTYPE html>
       <div class="text-2xl font-black text-amber-400 ltr-num" id="duplicates">0</div>
     </div>
     <div class="card-glow border border-slate-800 p-4 rounded-2xl shadow-lg">
-      <h4 class="text-xs text-slate-400 mb-1">Failed / Retried</h4>
-      <div class="text-2xl font-black text-rose-400 ltr-num" id="failed">0</div>
+      <h4 class="text-xs text-slate-400 mb-1">DLQ Messages</h4>
+      <div class="text-2xl font-black text-rose-400 ltr-num" id="dlqCount">0</div>
     </div>
     <div class="card-glow border border-slate-800 p-4 rounded-2xl shadow-lg">
       <h4 class="text-xs text-slate-400 mb-1">DB Total Records</h4>
       <div class="text-2xl font-black text-teal-400 ltr-num" id="dbTotal">0</div>
     </div>
     <div class="card-glow border border-slate-800 p-4 rounded-2xl shadow-lg">
-      <h4 class="text-xs text-slate-400 mb-1">Cluster Status</h4>
-      <div class="text-lg font-bold text-emerald-400 mt-1">Online 🟢</div>
+      <h4 class="text-xs text-slate-400 mb-1">Ledger Audit</h4>
+      <div class="text-sm font-bold text-emerald-400 mt-2" id="reconBadge">Verified ✅</div>
+    </div>
+  </div>
+
+  <!-- Automated Ledger Reconciliation Panel (Invariant I-3) -->
+  <div class="card-glow border border-slate-800 rounded-2xl p-5 shadow-xl">
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-2">
+      <div>
+        <h2 class="font-bold text-white text-base">موتور مغایرت‌گیری خودکار حسابداری (Automated Ledger Reconciliation — Invariant I-3)</h2>
+        <p class="text-xs text-slate-400 mt-0.5">بررسی مستمر انطباق <code class="text-sky-400">SUM(deposits.amount)</code> با <code class="text-sky-400">balances.balance</code> از طریق <code class="text-amber-300">FULL OUTER JOIN</code></p>
+      </div>
+      <div id="reconStatusBox" class="px-4 py-1.5 rounded-xl text-xs font-bold bg-emerald-500/10 border border-emerald-500/30 text-emerald-400">
+        انطباق ۱۰۰٪ دفتر کل و کیف‌پول‌ها (۰ مغایرت)
+      </div>
+    </div>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-3">
+      <div class="bg-slate-950/70 border border-slate-800/80 p-3 rounded-xl flex justify-between items-center">
+        <span class="text-xs text-slate-400">مجموع کل واریزهای USDT در دفتر کل:</span>
+        <span id="ledgerUSDT" class="text-sm font-bold text-emerald-400 ltr-num">0 USDT</span>
+      </div>
+      <div class="bg-slate-950/70 border border-slate-800/80 p-3 rounded-xl flex justify-between items-center">
+        <span class="text-xs text-slate-400">مجموع کل واریزهای BTC در دفتر کل:</span>
+        <span id="ledgerBTC" class="text-sm font-bold text-amber-400 ltr-num">0 BTC</span>
+      </div>
+      <div class="bg-slate-950/70 border border-slate-800/80 p-3 rounded-xl flex justify-between items-center">
+        <span class="text-xs text-slate-400">مجموع کل واریزهای IRT در دفتر کل:</span>
+        <span id="ledgerIRT" class="text-sm font-bold text-cyan-400 ltr-num">0 IRT</span>
+      </div>
+    </div>
+    <div id="discrepancyContainer" class="hidden overflow-x-auto border border-rose-800/80 rounded-xl mt-3">
+      <table class="w-full text-right text-xs">
+        <thead class="text-rose-300 bg-rose-950/60 border-b border-rose-800">
+          <tr>
+            <th class="py-2 px-4">کاربر</th>
+            <th class="py-2 px-4">ارز</th>
+            <th class="py-2 px-4">موجودی مورد انتظار (SUM Deposits)</th>
+            <th class="py-2 px-4">موجودی فعلی ( جدول Balances)</th>
+            <th class="py-2 px-4">میزان مغایرت</th>
+          </tr>
+        </thead>
+        <tbody id="discrepancyRows" class="divide-y divide-rose-900/40 bg-rose-950/20"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- DLQ Inspector & Deterministic Replay Panel -->
+  <div class="card-glow border border-slate-800 rounded-2xl p-5 shadow-xl">
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-2">
+      <div>
+        <h2 class="font-bold text-white text-base">بازرس صف پیام‌های مرده و بازپخش (DLQ Inspector & Replay — Stream: DEPOSITS_DLQ)</h2>
+        <p class="text-xs text-slate-400 mt-0.5">ثبت متادیتای کامل استریم مبدا (<code class="text-rose-400">source_stream, subject, stream_sequence</code>) با شناسه قطعی ضدتکرار</p>
+      </div>
+      <span class="text-xs text-slate-400">می‌توانید Payload پیام خراب را اصلاح کرده و مجدداً به چرخه پردازش بازگردانید</span>
+    </div>
+    <div class="overflow-x-auto border border-slate-800 rounded-xl">
+      <table class="w-full text-right text-xs">
+        <thead class="text-slate-400 bg-slate-950 border-b border-slate-800">
+          <tr>
+            <th class="py-3 px-3">DLQ Seq</th>
+            <th class="py-3 px-3">متادیتای مبدا (Stream / Subject / Seq)</th>
+            <th class="py-3 px-3">شناسه رویداد</th>
+            <th class="py-3 px-3">علت خطا (Reason)</th>
+            <th class="py-3 px-3">Payload اصلی</th>
+            <th class="py-3 px-3">عملیات بازپخش</th>
+          </tr>
+        </thead>
+        <tbody id="dlqRows" class="divide-y divide-slate-800/60"></tbody>
+      </table>
     </div>
   </div>
 
@@ -369,9 +685,27 @@ const dashboardHTML = `<!DOCTYPE html>
 
 </div>
 
+<!-- Replay Modal -->
+<div id="replayModal" class="fixed inset-0 bg-black/75 hidden items-center justify-center p-4 z-50">
+  <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-xl w-full p-6 space-y-4 shadow-2xl">
+    <div class="flex justify-between items-center">
+      <h3 class="text-base font-bold text-white">اصلاح و بازپخش پیام DLQ (Edit & Replay to DEPOSITS)</h3>
+      <button onclick="closeReplayModal()" class="text-slate-400 hover:text-white text-lg">&times;</button>
+    </div>
+    <p class="text-xs text-slate-400">می‌توانید خطای موجود در JSON (مثلاً تغییر ارز <code class="text-amber-400">DOGE</code> به <code class="text-emerald-400">USDT</code>) را اصلاح کرده و پیام را مجدداً به استریم اصلی ارسال کنید:</p>
+    <input type="hidden" id="replaySeq" value="0" />
+    <textarea id="replayPayload" rows="5" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-emerald-300 ltr-num focus:outline-none focus:border-sky-500"></textarea>
+    <div class="flex justify-end gap-3">
+      <button onclick="closeReplayModal()" class="px-4 py-2 rounded-xl text-xs bg-slate-800 text-slate-300 hover:bg-slate-700">انصراف</button>
+      <button onclick="submitReplay()" class="px-4 py-2 rounded-xl text-xs font-bold bg-emerald-600 text-white hover:bg-emerald-500">ارسال به استریم اصلی و حذف از DLQ</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let lastGlobalProc = null;
 let lastTick = Date.now();
+let dlqCache = {};
 
 const ctx = document.getElementById('clusterChart').getContext('2d');
 const chartData = {
@@ -416,8 +750,65 @@ async function refresh() {
     document.getElementById('tps').innerText = d.global_tps.toFixed(1) + ' TPS';
     document.getElementById('processed').innerText = d.global_processed.toLocaleString();
     document.getElementById('duplicates').innerText = d.global_duplicates.toLocaleString();
-    document.getElementById('failed').innerText = d.global_failed.toLocaleString();
+    document.getElementById('dlqCount').innerText = d.dlq_total_count.toLocaleString();
     document.getElementById('dbTotal').innerText = d.db_total_deposits.toLocaleString();
+
+    // Update Reconciliation UI
+    if (d.reconciliation) {
+        document.getElementById('ledgerUSDT').innerText = formatDec(d.reconciliation.total_ledger_usdt) + ' USDT';
+        document.getElementById('ledgerBTC').innerText = formatDec(d.reconciliation.total_ledger_btc) + ' BTC';
+        document.getElementById('ledgerIRT').innerText = formatDec(d.reconciliation.total_ledger_irt) + ' IRT';
+
+        const badge = document.getElementById('reconBadge');
+        const statusBox = document.getElementById('reconStatusBox');
+        const discContainer = document.getElementById('discrepancyContainer');
+        const discRows = document.getElementById('discrepancyRows');
+
+        if (d.reconciliation.is_balanced) {
+            badge.className = 'text-sm font-bold text-emerald-400 mt-2';
+            badge.innerText = 'Verified ✅';
+            statusBox.className = 'px-4 py-1.5 rounded-xl text-xs font-bold bg-emerald-500/10 border border-emerald-500/30 text-emerald-400';
+            statusBox.innerText = 'انطباق ۱۰۰٪ دفتر کل و کیف‌پول‌ها (آخرین بررسی: ' + d.reconciliation.checked_at + ')';
+            discContainer.classList.add('hidden');
+        } else {
+            badge.className = 'text-sm font-bold text-rose-400 mt-2 animate-pulse';
+            badge.innerText = 'Discrepancy ❌ (' + d.reconciliation.discrepancy_count + ')';
+            statusBox.className = 'px-4 py-1.5 rounded-xl text-xs font-bold bg-rose-500/20 border border-rose-500/40 text-rose-300';
+            statusBox.innerText = 'هشدار مغایرت حسابداری! تعداد مغایرت: ' + d.reconciliation.discrepancy_count;
+            discContainer.classList.remove('hidden');
+            discRows.innerHTML = d.reconciliation.discrepancies.map(item =>
+                '<tr>' +
+                '<td class="py-2 px-4 font-bold text-white">کاربر #' + item.user_id + '</td>' +
+                '<td class="py-2 px-4 text-amber-300">' + item.currency + '</td>' +
+                '<td class="py-2 px-4 ltr-num text-emerald-300">' + formatDec(item.expected_balance) + '</td>' +
+                '<td class="py-2 px-4 ltr-num text-rose-300">' + formatDec(item.actual_balance) + '</td>' +
+                '<td class="py-2 px-4 ltr-num font-bold text-rose-400">' + formatDec(item.difference) + '</td>' +
+                '</tr>'
+            ).join('');
+        }
+    }
+
+    // Update DLQ Inspector Table
+    const dlqTbody = document.getElementById('dlqRows');
+    if (!d.dlq_messages || d.dlq_messages.length === 0) {
+        dlqTbody.innerHTML = '<tr><td colspan="6" class="py-5 text-center text-slate-500">صف DLQ خالی است (هیچ پیام خرابی وجود ندارد).</td></tr>';
+    } else {
+        dlqCache = {};
+        dlqTbody.innerHTML = d.dlq_messages.map(m => {
+            dlqCache[m.dlq_sequence] = m.original_event;
+            const srcMeta = (m.source_stream || 'DEPOSITS') + ' / ' + (m.subject || 'deposits.events') + ' #' + m.stream_sequence;
+            return '<tr class="hover:bg-slate-800/40 transition">' +
+                '<td class="py-2.5 px-3 ltr-num font-bold text-rose-400">#' + m.dlq_sequence + '</td>' +
+                '<td class="py-2.5 px-3 ltr-num text-sky-300 text-[11px]">' + srcMeta + '</td>' +
+                '<td class="py-2.5 px-3 ltr-num text-indigo-300">' + (m.event_id || 'N/A') + '</td>' +
+                '<td class="py-2.5 px-3 text-amber-300">' + m.reason + '</td>' +
+                '<td class="py-2.5 px-3 ltr-num text-slate-400 max-w-xs truncate">' + m.original_event + '</td>' +
+                '<td class="py-2.5 px-3">' +
+                '<button onclick="openReplayModal(' + m.dlq_sequence + ')" class="px-3 py-1 rounded-lg bg-sky-600 hover:bg-sky-500 text-white font-bold text-[11px] cursor-pointer">اصلاح و بازپخش ♻️</button>' +
+                '</td>' +
+                '</tr>';
+        }).join('');
+    }
 
     const btn = document.getElementById('pubBtn');
     if (d.publish_enabled) {
@@ -497,6 +888,37 @@ async function refresh() {
 async function togglePublisher() {
   await fetch('/api/publisher/toggle', { method: 'POST' });
   refresh();
+}
+
+async function injectPoisonMessage() {
+  await fetch('/api/dlq/inject', { method: 'POST' });
+  setTimeout(refresh, 400);
+}
+
+function openReplayModal(seq) {
+  document.getElementById('replaySeq').value = seq;
+  document.getElementById('replayPayload').value = dlqCache[seq] || '';
+  const modal = document.getElementById('replayModal');
+  modal.classList.remove('hidden');
+  modal.classList.add('flex');
+}
+
+function closeReplayModal() {
+  const modal = document.getElementById('replayModal');
+  modal.classList.add('hidden');
+  modal.classList.remove('flex');
+}
+
+async function submitReplay() {
+  const seq = Number(document.getElementById('replaySeq').value);
+  const payload = document.getElementById('replayPayload').value;
+  await fetch('/api/dlq/replay', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dlq_sequence: seq, new_payload: payload })
+  });
+  closeReplayModal();
+  setTimeout(refresh, 400);
 }
 
 setInterval(refresh, 1000);

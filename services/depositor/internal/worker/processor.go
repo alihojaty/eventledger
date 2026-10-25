@@ -10,6 +10,7 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/repository"
+	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
 )
 
@@ -17,6 +18,11 @@ type JetStreamMessage interface {
 	Data() []byte
 	Ack() error
 	NakWithDelay(delay time.Duration) error
+}
+
+type JetStreamMetadataProvider interface {
+	Subject() string
+	Metadata() (*jetstream.MsgMetadata, error)
 }
 
 type MetricsRecorder interface {
@@ -175,19 +181,41 @@ func (p *Processor) handleInvalidMessage(
 	rawPayload []byte,
 	invalidErr *domain.InvalidMessageError,
 ) {
+	sourceStream := broker.StreamDeposits
+	subject := broker.SubjectDepositEvents
+	var streamSeq uint64
+
+	if metaProvider, ok := msg.(JetStreamMetadataProvider); ok {
+		if subj := metaProvider.Subject(); subj != "" {
+			subject = subj
+		}
+		if meta, err := metaProvider.Metadata(); err == nil && meta != nil {
+			if meta.Stream != "" {
+				sourceStream = meta.Stream
+			}
+			streamSeq = meta.Sequence.Stream
+		}
+	}
+
 	p.metrics.IncInvalid()
 	p.logger.Warn("Invalid message",
 		zap.Int("worker_id", workerID),
 		zap.String("event_id", invalidErr.EventID),
+		zap.String("source_stream", sourceStream),
+		zap.String("subject", subject),
+		zap.Uint64("stream_sequence", streamSeq),
 		zap.String("reason", invalidErr.Reason),
 	)
 
 	dlqPayload := domain.DLQMessage{
-		EventID:       invalidErr.EventID,
-		ErrorCode:     "VALIDATION_ERROR",
-		OriginalEvent: string(rawPayload),
-		Reason:        invalidErr.Reason,
-		Timestamp:     time.Now().UTC(),
+		EventID:        invalidErr.EventID,
+		ErrorCode:      "VALIDATION_ERROR",
+		SourceStream:   sourceStream,
+		Subject:        subject,
+		StreamSequence: streamSeq,
+		OriginalEvent:  string(rawPayload),
+		Reason:         invalidErr.Reason,
+		Timestamp:      time.Now().UTC(),
 	}
 
 	dlqCtx, cancel := context.WithTimeout(p.workCtx, 5*time.Second)
@@ -220,6 +248,8 @@ func (p *Processor) handleInvalidMessage(
 	p.logger.Info("Message moved to DLQ",
 		zap.Int("worker_id", workerID),
 		zap.String("event_id", invalidErr.EventID),
+		zap.String("source_stream", sourceStream),
+		zap.Uint64("stream_sequence", streamSeq),
 		zap.String("reason", invalidErr.Reason),
 	)
 }

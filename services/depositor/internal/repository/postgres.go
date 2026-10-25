@@ -218,3 +218,54 @@ func (r *PostgresRepository) GetRecentProcessedDeposits(ctx context.Context, lim
 	}
 	return items, rows.Err()
 }
+
+func (r *PostgresRepository) ReconcileLedger(ctx context.Context) ([]domain.LedgerDiscrepancy, error) {
+	const query = `
+		WITH expected AS (
+			SELECT
+				user_id,
+				currency,
+				SUM(amount) AS expected_amount
+			FROM deposits
+			GROUP BY user_id, currency
+		)
+		SELECT
+			COALESCE(e.user_id, b.user_id) AS user_id,
+			COALESCE(e.currency, b.currency) AS currency,
+			COALESCE(e.expected_amount, 0) AS expected_balance,
+			COALESCE(b.balance, 0) AS actual_balance,
+			(COALESCE(b.balance, 0) - COALESCE(e.expected_amount, 0)) AS difference
+		FROM expected e
+		FULL OUTER JOIN balances b
+			ON b.user_id = e.user_id
+		   AND b.currency = e.currency
+		WHERE
+			COALESCE(e.expected_amount, 0)
+			IS DISTINCT FROM
+			COALESCE(b.balance, 0)
+		ORDER BY user_id ASC, currency ASC
+	`
+
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute ledger reconciliation query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var discrepancies []domain.LedgerDiscrepancy
+	for rows.Next() {
+		var d domain.LedgerDiscrepancy
+		if err := rows.Scan(
+			&d.UserID,
+			&d.Currency,
+			&d.ExpectedBalance,
+			&d.ActualBalance,
+			&d.Difference,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan ledger discrepancy row: %w", err)
+		}
+		discrepancies = append(discrepancies, d)
+	}
+
+	return discrepancies, rows.Err()
+}

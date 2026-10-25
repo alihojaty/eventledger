@@ -32,11 +32,22 @@ type DepositEvent struct {
 }
 
 type DLQMessage struct {
-	EventID       string    `json:"event_id,omitempty"`
-	ErrorCode     string    `json:"error_code,omitempty"`
-	OriginalEvent string    `json:"original_event"`
-	Reason        string    `json:"reason"`
-	Timestamp     time.Time `json:"timestamp"`
+	EventID        string    `json:"event_id,omitempty"`
+	ErrorCode      string    `json:"error_code,omitempty"`
+	SourceStream   string    `json:"source_stream,omitempty"`
+	Subject        string    `json:"subject,omitempty"`
+	StreamSequence uint64    `json:"stream_sequence,omitempty"`
+	OriginalEvent  string    `json:"original_event"`
+	Reason         string    `json:"reason"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+type LedgerDiscrepancy struct {
+	UserID          int             `json:"user_id"`
+	Currency        string          `json:"currency"`
+	ExpectedBalance decimal.Decimal `json:"expected_balance"`
+	ActualBalance   decimal.Decimal `json:"actual_balance"`
+	Difference      decimal.Decimal `json:"difference"`
 }
 
 func ParseAndValidateDepositEvent(rawPayload []byte) (*DepositEvent, error) {

@@ -1,4 +1,4 @@
-MODULES := ./pkg ./services/depositor ./services/publisher
+MODULES := ./pkg ./services/depositor ./services/publisher ./services/dashboard
 COMPOSE_FILE := deploy/docker-compose.yml
 
 .PHONY: all build test lint tidy up down scale

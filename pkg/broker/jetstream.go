@@ -102,9 +102,10 @@ func (b *NATSBroker) setupStreams(ctx context.Context) error {
 	}
 
 	_, err = b.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:     StreamDepositsDLQ,
-		Subjects: []string{SubjectDepositsDLQ},
-		Storage:  jetstream.FileStorage,
+		Name:       StreamDepositsDLQ,
+		Subjects:   []string{SubjectDepositsDLQ},
+		Storage:    jetstream.FileStorage,
+		Duplicates: DeduplicationWindow,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create or update %s stream: %w", StreamDepositsDLQ, err)
@@ -176,7 +177,15 @@ func (b *NATSBroker) PublishDLQ(ctx context.Context, dlqMsg domain.DLQMessage) e
 		return fmt.Errorf("failed to marshal DLQ message: %w", err)
 	}
 
-	_, err = b.js.Publish(ctx, SubjectDepositsDLQ, data)
+	var opts []jetstream.PublishOpt
+	if dlqMsg.SourceStream != "" && dlqMsg.StreamSequence > 0 {
+		dlqMsgID := fmt.Sprintf("dlq-%s-%d", dlqMsg.SourceStream, dlqMsg.StreamSequence)
+		opts = append(opts, jetstream.WithMsgID(dlqMsgID))
+	} else if dlqMsg.EventID != "" {
+		opts = append(opts, jetstream.WithMsgID("dlq-evt-"+dlqMsg.EventID))
+	}
+
+	_, err = b.js.Publish(ctx, SubjectDepositsDLQ, data, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to publish message to %s: %w", StreamDepositsDLQ, err)
 	}
