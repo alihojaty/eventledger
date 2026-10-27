@@ -3,68 +3,41 @@ stages:
   - quality
   - build
 
-variables:
-  GO_VERSION:
+before_script:
+  - export PATH=$PATH:/usr/local/go/bin:~/go/bin
 
-  DOCKER_DRIVER: overlay2
-
-
-.go-cache:
-  variables:
-    GOPATH: $CI_PROJECT_DIR/.go
-  before_script:
-    - mkdir -p .go
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}
-    paths:
-      - .go/pkg/mod/
-
-
+# ۱. اجرای تست‌های واحد (Unit Tests)
 unit_tests:
   stage: test
-  image: golang:${GO_VERSION}-alpine
-  extends: .go-cache
   script:
-    - echo "Running tests for shared pkg..."
-    - cd pkg && go test -v -race ./... && cd ..
-    - echo "Running tests for gateway..."
-    - cd services/gateway && go test -v -race ./... && cd ../..
+    - go version
+    - echo "Running tests in pkg..."
+    - cd pkg && go test -v -race ./...
+    - echo "Running tests in gateway..."
+    - cd ../services/gateway && go test -v -race ./...
 
+# ۲. بررسی کیفیت کد با SonarQube
 sonarqube_check:
   stage: quality
-  image:
-    name: sonarsource/sonar-scanner-cli:latest
-    entrypoint: [""]
-  variables:
-    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
-    GIT_DEPTH: "0"
-  cache:
-    key: "${CI_JOB_NAME}"
-    paths:
-      - .sonar/cache
   script:
-    - sonar-scanner
+    - |
+      docker run --rm \
+        --network host \
+        -v "$(pwd):/usr/src" \
+        sonarsource/sonar-scanner-cli \
+        -Dsonar.host.url="${SONAR_HOST_URL:-http://localhost:9000}" \
+        -Dsonar.token="${SONAR_TOKEN}"
+  allow_failure: true
   only:
     - main
-    - merge_requests
-  allow_failure: true
 
-
+# ۳. بیلد همزمان ایمیج‌های داکر
 build_services:
   stage: build
-  image: docker:24.0.5
-  services:
-    - docker:24.0.5-dind
   parallel:
     matrix:
       - SERVICE: [dashboard, depositor]
-  before_script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
     - echo "Building Docker image for $SERVICE..."
-
-    - docker build -f services/$SERVICE/Dockerfile -t "$CI_REGISTRY_IMAGE/$SERVICE:$CI_COMMIT_SHORT_SHA" -t "$CI_REGISTRY_IMAGE/$SERVICE:latest" .
-    - docker push "$CI_REGISTRY_IMAGE/$SERVICE:$CI_COMMIT_SHORT_SHA"
-    - docker push "$CI_REGISTRY_IMAGE/$SERVICE:latest"
-  only:
-    - main
+    - docker build -t my-project/$SERVICE:$CI_COMMIT_SHORT_SHA -f services/$SERVICE/Dockerfile .
+    - docker tag my-project/$SERVICE:$CI_COMMIT_SHORT_SHA my-project/$SERVICE:latest
