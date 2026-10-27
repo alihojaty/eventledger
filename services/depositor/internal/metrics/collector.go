@@ -32,7 +32,6 @@ func (c *Collector) RestoreState(processedInDB, dlqInBroker uint64) {
 	c.restoredAtStartup.Store(processedInDB)
 	c.processed.Store(processedInDB)
 	c.dlq.Store(dlqInBroker)
-	c.invalid.Store(dlqInBroker)
 	c.received.Store(processedInDB + dlqInBroker)
 }
 

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS deposits (
     );
 
 CREATE INDEX IF NOT EXISTS idx_deposits_user_id ON deposits(user_id);
+CREATE INDEX IF NOT EXISTS idx_deposits_processed_at_desc ON deposits(processed_at DESC);
 
 CREATE TABLE IF NOT EXISTS balances (
                                         user_id    INTEGER NOT NULL CHECK (user_id > 0),
