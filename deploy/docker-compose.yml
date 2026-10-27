@@ -51,7 +51,7 @@ services:
       METRICS_PORT: ${METRICS_PORT:-8080}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     deploy:
-      replicas: 2
+      replicas: 5
     restart: unless-stopped
 
   publisher:
@@ -64,9 +64,40 @@ services:
     stop_grace_period: 15s
     environment:
       NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
-      PUBLISH_ENABLED: ${PUBLISH_ENABLED:-true}
+      PUBLISH_ENABLED: ${PUBLISH_ENABLED:-false}
       PUBLISH_INTERVAL: ${PUBLISH_INTERVAL:-1s}
+      PUBLISHER_GRPC_PORT: 50051
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: services/gateway/Dockerfile
+    depends_on:
+      publisher:
+        condition: service_started
+    stop_grace_period: 15s
+    environment:
+      GATEWAY_PORT: 8081
+      PUBLISHER_GRPC_ADDR: publisher:50051
+      API_KEY: ${API_KEY:-dev-secret-api-key}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-3s}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-500}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-200}
+      GRPC_MAX_ATTEMPTS: ${GRPC_MAX_ATTEMPTS:-3}
+      GRPC_RETRY_BACKOFF: ${GRPC_RETRY_BACKOFF:-50ms}
+      MTLS_ENABLED: ${MTLS_ENABLED:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
   dashboard:
@@ -81,6 +112,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL_DOCKER:-postgres://postgres:postgres@postgres:5432/deposits_db?sslmode=disable}
       NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
+      GATEWAY_URL: http://gateway:8081
+      API_KEY: ${API_KEY:-dev-secret-api-key}
       PORT: 8080
     ports:
       - "8080:8080"

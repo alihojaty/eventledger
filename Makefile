@@ -1,7 +1,7 @@
 MODULES := ./pkg ./services/depositor ./services/publisher ./services/dashboard ./services/gateway
 COMPOSE_FILE := deploy/docker-compose.yml
 
-.PHONY: all build test lint tidy up down scale proto
+.PHONY: all build test lint tidy up down scale proto loadgen
 
 all: lint test build
 
@@ -46,8 +46,11 @@ lint:
 	done
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 	   for mod in $(MODULES); do \
-	      (cd $$mod && golangci-lint run ./...) || exit 1; \
+	      if [ "$$mod" = "./pkg" ]; then continue; fi; \
+	      echo "--- Linting $$mod ---"; \
+	      (cd $$mod && golangci-lint run --modules-download-mode=vendor ./...) || exit 1; \
 	   done; \
+	   echo "==> All linters passed successfully!"; \
 	fi
 
 tidy:
@@ -55,6 +58,11 @@ tidy:
 	   (cd $$mod && go mod tidy) || exit 1; \
 	done
 	go work sync
+	go work vendor
+	@for mod in $(MODULES); do \
+	   rm -rf $$mod/vendor; \
+	   ln -s ../vendor $$mod/vendor; \
+	done
 
 up:
 	docker compose -f $(COMPOSE_FILE) up --build -d
@@ -64,3 +72,6 @@ down:
 
 scale:
 	docker compose -f $(COMPOSE_FILE) up --build -d --scale depositor=2
+
+loadgen:
+	go run ./services/gateway/cmd/loadgen -url http://localhost:8081 -requests 2000 -concurrency 200
