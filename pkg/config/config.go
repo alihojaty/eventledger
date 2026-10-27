@@ -18,16 +18,27 @@ type Config struct {
 	MetricsPort     int           `env:"METRICS_PORT" envDefault:"8080"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 
-	// Publisher Configuration (Random simulator disabled by default)
-	PublishEnabled    bool          `env:"PUBLISH_ENABLED" envDefault:"false"`
-	PublishInterval   time.Duration `env:"PUBLISH_INTERVAL" envDefault:"1s"`
-	PublisherGRPCPort int           `env:"PUBLISHER_GRPC_PORT" envDefault:"50051"`
+	// Publisher Configuration
+	PublishEnabled  bool          `env:"PUBLISH_ENABLED" envDefault:"false"`
+	PublishInterval time.Duration `env:"PUBLISH_INTERVAL" envDefault:"1s"`
 
 	// Gateway Configuration
 	GatewayPort       int           `env:"GATEWAY_PORT" envDefault:"8081"`
+	PublisherGRPCPort int           `env:"PUBLISHER_GRPC_PORT" envDefault:"50051"`
 	PublisherGRPCAddr string        `env:"PUBLISHER_GRPC_ADDR" envDefault:"localhost:50051"`
 	APIKey            string        `env:"API_KEY" envDefault:"dev-secret-api-key"`
 	RequestTimeout    time.Duration `env:"REQUEST_TIMEOUT" envDefault:"3s"`
+
+	// Bonus: Rate Limiting, gRPC Retry & mTLS
+	RateLimitRPS     float64       `env:"RATE_LIMIT_RPS" envDefault:"500"`
+	RateLimitBurst   int           `env:"RATE_LIMIT_BURST" envDefault:"200"`
+	GRPCMaxAttempts  int           `env:"GRPC_MAX_ATTEMPTS" envDefault:"3"`
+	GRPCRetryBackoff time.Duration `env:"GRPC_RETRY_BACKOFF" envDefault:"50ms"`
+	MTLSEnabled      bool          `env:"MTLS_ENABLED" envDefault:"false"`
+	TLSCertFile      string        `env:"TLS_CERT_FILE" envDefault:""`
+	TLSKeyFile       string        `env:"TLS_KEY_FILE" envDefault:""`
+	TLSCAFile        string        `env:"TLS_CA_FILE" envDefault:""`
+	TLSServerName    string        `env:"TLS_SERVER_NAME" envDefault:"publisher"`
 }
 
 func Load() (*Config, error) {

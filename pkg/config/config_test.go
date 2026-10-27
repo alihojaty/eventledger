@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoad_OSEnvOverridesDotEnv(t *testing.T) {
@@ -36,5 +37,28 @@ func TestLoad_OSEnvOverridesDotEnv(t *testing.T) {
 
 	if cfg.WorkerCount != 12 {
 		t.Errorf("expected OS env WORKER_COUNT=12 to override .env (5), but got %d", cfg.WorkerCount)
+	}
+}
+
+func TestLoad_Defaults(t *testing.T) {
+	// پاکسازی متغیرهای محیطی برای اطمینان از اعمال مقادیر پیش‌فرض
+	os.Clearenv()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("failed to load default config: %v", err)
+	}
+
+	if cfg.GatewayPort != 8081 {
+		t.Errorf("expected GatewayPort 8081, got %d", cfg.GatewayPort)
+	}
+	if cfg.PublisherGRPCPort != 50051 {
+		t.Errorf("expected PublisherGRPCPort 50051, got %d", cfg.PublisherGRPCPort)
+	}
+	if cfg.APIKey != "dev-secret-api-key" {
+		t.Errorf("expected default APIKey 'dev-secret-api-key', got %s", cfg.APIKey)
+	}
+	if cfg.RequestTimeout != 3*time.Second {
+		t.Errorf("expected RequestTimeout 3s, got %v", cfg.RequestTimeout)
 	}
 }
