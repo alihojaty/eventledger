@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -11,8 +12,13 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
+	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/generator"
+	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/grpcserver"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func main() {
@@ -37,11 +43,6 @@ func main() {
 		zap.String("instance_id", hostname),
 	)
 
-	log.Info("Publisher service started",
-		zap.Bool("publish_enabled", cfg.PublishEnabled),
-		zap.Duration("publish_interval", cfg.PublishInterval),
-	)
-
 	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -52,12 +53,71 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to initialize NATS JetStream broker", zap.Error(err))
 	}
-	defer natsBroker.Close()
 
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.PublisherGRPCPort))
+	if err != nil {
+		natsBroker.Close()
+		log.Fatal("Failed to listen on gRPC port", zap.Int("port", cfg.PublisherGRPCPort), zap.Error(err))
+	}
+
+	grpcSrv := grpc.NewServer(grpcserver.UnaryInterceptors(log))
+	pubGRPC := grpcserver.NewServer(natsBroker, log)
+	depositv1.RegisterDepositPublisherServiceServer(grpcSrv, pubGRPC)
+
+	healthSrv := health.NewServer()
+	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
+	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+
+	// Monitor NATS connection status for readiness checks
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sigCtx.Done():
+				return
+			case <-ticker.C:
+				if natsBroker.IsConnected() {
+					healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+				} else {
+					healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+				}
+			}
+		}
+	}()
+
+	go func() {
+		log.Info("Publisher gRPC server listening", zap.Int("grpc_port", cfg.PublisherGRPCPort))
+		if err := grpcSrv.Serve(lis); err != nil {
+			log.Error("gRPC server stopped with error", zap.Error(err))
+		}
+	}()
+
+	// Keep background simulator (disabled by default, controllable via Dashboard)
 	pub := generator.NewPublisher(natsBroker, cfg.PublishInterval, cfg.PublishEnabled, log)
 	pub.StartControlListener(sigCtx, cfg.NatsURL)
-	pub.Start(sigCtx)
+	go pub.Start(sigCtx)
 
+	<-sigCtx.Done()
+	log.Info("Shutdown signal received; stopping publisher gRPC server gracefully")
+
+	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
+	stopped := make(chan struct{})
+	go func() {
+		grpcSrv.GracefulStop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+		log.Info("Publisher gRPC server stopped gracefully")
+	case <-time.After(cfg.ShutdownTimeout):
+		log.Warn("Publisher gRPC graceful stop timed out; forcing stop")
+		grpcSrv.Stop()
+	}
+
+	natsBroker.Close()
 	log.Info("Publisher service stopped")
 	_ = log.Sync()
 }
