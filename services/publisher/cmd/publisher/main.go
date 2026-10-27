@@ -13,6 +13,7 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/tlscfg"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/generator"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/grpcserver"
 	"go.uber.org/zap"
@@ -60,7 +61,19 @@ func main() {
 		log.Fatal("Failed to listen on gRPC port", zap.Int("port", cfg.PublisherGRPCPort), zap.Error(err))
 	}
 
-	grpcSrv := grpc.NewServer(grpcserver.UnaryInterceptors(log))
+	var serverOpts []grpc.ServerOption
+	serverOpts = append(serverOpts, grpcserver.UnaryInterceptors(log))
+
+	if cfg.MTLSEnabled {
+		creds, err := tlscfg.ServerTransportCredentials(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
+		if err != nil {
+			natsBroker.Close()
+			log.Fatal("Failed to configure publisher mTLS credentials", zap.Error(err))
+		}
+		serverOpts = append(serverOpts, grpc.Creds(creds))
+	}
+
+	grpcSrv := grpc.NewServer(serverOpts...)
 	pubGRPC := grpcserver.NewServer(natsBroker, log)
 	depositv1.RegisterDepositPublisherServiceServer(grpcSrv, pubGRPC)
 
@@ -87,7 +100,10 @@ func main() {
 	}()
 
 	go func() {
-		log.Info("Publisher gRPC server listening", zap.Int("grpc_port", cfg.PublisherGRPCPort))
+		log.Info("Publisher gRPC server listening",
+			zap.Int("grpc_port", cfg.PublisherGRPCPort),
+			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
+		)
 		if err := grpcSrv.Serve(lis); err != nil {
 			log.Error("gRPC server stopped with error", zap.Error(err))
 		}

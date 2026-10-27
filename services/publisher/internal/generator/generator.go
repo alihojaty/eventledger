@@ -105,7 +105,7 @@ func (p *Publisher) publishNextSimulatedEvent(ctx context.Context) {
 	backoff := 200 * time.Millisecond
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		pubCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		pubCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		ack, pubErr := p.broker.PublishDeposit(pubCtx, event.EventID, payload)
 		cancel()
 
