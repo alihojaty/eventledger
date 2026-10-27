@@ -6,38 +6,36 @@ stages:
 before_script:
   - export PATH=$PATH:/usr/local/go/bin:~/go/bin
 
-# ۱. اجرای تست‌های واحد (Unit Tests)
 unit_tests:
   stage: test
   script:
-    - go version
-    - echo "Running tests in pkg..."
-    - cd pkg && go test -v -race ./...
-    - echo "Running tests in gateway..."
-    - cd ../services/gateway && go test -v -race ./...
+    - echo "Running Go Tests..."
+    - cd pkg && go test -v -race ./... && cd ..
+    - cd services/gateway && go test -v -race -coverprofile=coverage.out ./... && cd ../..
+  artifacts:
+    paths:
+      - services/gateway/coverage.out
+    expire_in: 1 hour
 
-# ۲. بررسی کیفیت کد با SonarQube
 sonarqube_check:
   stage: quality
+  needs: ["unit_tests"]
   script:
-    - |
-      docker run --rm \
-        --network host \
-        -v "$(pwd):/usr/src" \
-        sonarsource/sonar-scanner-cli \
-        -Dsonar.host.url="${SONAR_HOST_URL:-http://localhost:9000}" \
-        -Dsonar.token="${SONAR_TOKEN}"
-  allow_failure: true
-  only:
-    - main
+    - docker run --rm
+      --network host
+      -e SONAR_HOST_URL="http://localhost:9000"
+      -e SONAR_TOKEN="${SONAR_TOKEN}"
+      -v "$(pwd):/usr/src"
+      sonarsource/sonar-scanner-cli
 
-# ۳. بیلد همزمان ایمیج‌های داکر
 build_services:
   stage: build
+  needs: ["unit_tests"]
   parallel:
     matrix:
-      - SERVICE: [dashboard, depositor]
+      - SERVICE: [dashboard, depositor, gateway, publisher]
   script:
+    - echo "Generating vendor directory from local Go cache..."
+    - go work vendor
     - echo "Building Docker image for $SERVICE..."
-    - docker build -t my-project/$SERVICE:$CI_COMMIT_SHORT_SHA -f services/$SERVICE/Dockerfile .
-    - docker tag my-project/$SERVICE:$CI_COMMIT_SHORT_SHA my-project/$SERVICE:latest
+    - docker build -t eventledger/$SERVICE:$CI_COMMIT_SHORT_SHA -f services/$SERVICE/Dockerfile .
