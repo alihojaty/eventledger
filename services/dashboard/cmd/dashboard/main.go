@@ -35,11 +35,14 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: DB connection failed: %v", err)
 		} else {
-			defer db.Close()
+			defer func() { _ = db.Close() }()
 		}
 	}
 
-	srv := server.NewDashboardServer(nc, db)
+	gatewayURL := getEnv("GATEWAY_URL", "http://localhost:8081")
+	apiKey := getEnv("API_KEY", "dev-secret-api-key")
+
+	srv := server.NewDashboardServer(nc, db, gatewayURL, apiKey)
 	if err := srv.StartNATSListener(ctx); err != nil {
 		log.Fatalf("Failed to start NATS listener: %v", err)
 	}
