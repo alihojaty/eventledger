@@ -4,5 +4,6 @@ use (
 	./pkg
 	./services/dashboard
 	./services/depositor
+	./services/gateway
 	./services/publisher
 )
