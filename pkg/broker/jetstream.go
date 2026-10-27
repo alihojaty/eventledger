@@ -239,3 +239,6 @@ func (b *NATSBroker) GetQueueStats(ctx context.Context) (QueueStats, error) {
 
 	return stats, nil
 }
+func (b *NATSBroker) IsConnected() bool {
+	return b.nc != nil && b.nc.IsConnected()
+}
