@@ -13,7 +13,9 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/tlscfg"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/handler"
+	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/ratelimit"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,11 +44,39 @@ func main() {
 		zap.String("instance_id", hostname),
 	)
 
+	var gwHandler *handler.GatewayHandler
+
+	dialOpts := []grpc.DialOption{
+		grpc.WithUnaryInterceptor(
+			handler.RetryUnavailableInterceptor(
+				cfg.GRPCMaxAttempts,
+				cfg.GRPCRetryBackoff,
+				func() {
+					if gwHandler != nil {
+						gwHandler.IncGRPCRetry()
+					}
+				},
+				log,
+			),
+		),
+	}
+
+	if cfg.MTLSEnabled {
+		creds, err := tlscfg.ClientTransportCredentials(
+			cfg.TLSCertFile,
+			cfg.TLSKeyFile,
+			cfg.TLSCAFile,
+		)
+		if err != nil {
+			log.Fatal("Failed to configure gateway mTLS credentials", zap.Error(err))
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(creds))
+	} else {
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
 	// Non-blocking gRPC client initialization; reconnects automatically when publisher recovers
-	grpcConn, err := grpc.NewClient(
-		cfg.PublisherGRPCAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	grpcConn, err := grpc.NewClient(cfg.PublisherGRPCAddr, dialOpts...)
 	if err != nil {
 		log.Fatal("Failed to create gRPC client", zap.Error(err))
 	}
@@ -54,13 +84,16 @@ func main() {
 
 	pubClient := depositv1.NewDepositPublisherServiceClient(grpcConn)
 	healthClient := grpc_health_v1.NewHealthClient(grpcConn)
+	limiter := ratelimit.NewKeyRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
-	gwHandler := handler.NewGatewayHandler(
+	gwHandler = handler.NewGatewayHandler(
 		pubClient,
 		healthClient,
 		cfg.APIKey,
 		cfg.RequestTimeout,
 		log,
+		handler.WithRateLimiter(limiter),
+		handler.WithMTLSEnabled(cfg.MTLSEnabled),
 	)
 
 	srv := &http.Server{
@@ -81,6 +114,9 @@ func main() {
 			zap.Int("port", cfg.GatewayPort),
 			zap.String("publisher_grpc_addr", cfg.PublisherGRPCAddr),
 			zap.Duration("request_timeout", cfg.RequestTimeout),
+			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
+			zap.Float64("rate_limit_rps", cfg.RateLimitRPS),
+			zap.Int("rate_limit_burst", cfg.RateLimitBurst),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal("Gateway HTTP server error", zap.Error(err))
