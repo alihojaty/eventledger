@@ -20,7 +20,12 @@ WORKDIR /workspace/services/publisher
 RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -o /app/publisher ./cmd/publisher
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget
 COPY --from=builder /app/publisher /app/publisher
+
+EXPOSE 50051 8090
+
+HEALTHCHECK --interval=2s --timeout=1s --retries=2 --start-period=10s \
+  CMD wget -qO- http://127.0.0.1:8090/livez >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/app/publisher"]

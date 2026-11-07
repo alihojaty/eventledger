@@ -10,6 +10,7 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
+	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/healthmgr"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -22,19 +23,53 @@ const MetadataKeyRequestID = "x-request-id"
 type Server struct {
 	depositv1.UnimplementedDepositPublisherServiceServer
 	broker broker.Broker
+	health *healthmgr.Manager
 	logger *zap.Logger
 }
 
-func NewServer(b broker.Broker, logger *zap.Logger) *Server {
+func NewServer(b broker.Broker, logger *zap.Logger, hm ...*healthmgr.Manager) *Server {
+	var h *healthmgr.Manager
+	if len(hm) > 0 {
+		h = hm[0]
+	}
 	return &Server{
 		broker: b,
+		health: h,
 		logger: logger,
 	}
 }
 
 func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
+	var receivedAt time.Time
+	var draining bool
+	if s.health != nil {
+		receivedAt = s.health.RecordRequestStart()
+		draining = s.health.IsDraining()
+	}
+	succeeded := false
+	defer func() {
+		if s.health != nil {
+			completedAt := s.health.RecordRequestEnd(succeeded)
+			if draining {
+				s.logger.Info("In-flight deposit request completed during drain/shutdown",
+					zap.String("event_id", req.GetEventId()),
+					zap.Time("received_at", receivedAt),
+					zap.Time("completed_at", completedAt),
+					zap.Bool("succeeded", succeeded),
+				)
+			}
+		}
+	}()
+
 	reqID := extractRequestID(ctx)
 	log := s.logger.With(zap.String("request_id", reqID))
+
+	if draining {
+		log.Info("Deposit request arrived during DRAIN_DELAY window; processing normally",
+			zap.String("event_id", req.GetEventId()),
+			zap.Time("received_at", receivedAt),
+		)
+	}
 
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
@@ -83,6 +118,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		return nil, status.Error(codes.Unavailable, "message broker is currently unavailable")
 	}
 
+	succeeded = true
 	log.Info("Deposit event published via gRPC",
 		zap.String("event_id", event.EventID),
 		zap.Int("user_id", event.UserID),
@@ -107,7 +143,6 @@ func extractRequestID(ctx context.Context) string {
 	return "unknown"
 }
 
-// UnaryInterceptors provides panic recovery and structured request logging (Bonus).
 func UnaryInterceptors(logger *zap.Logger) grpc.ServerOption {
 	return grpc.ChainUnaryInterceptor(
 		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {

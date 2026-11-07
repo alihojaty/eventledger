@@ -149,10 +149,20 @@ services:
       PUBLISH_ENABLED: "false"
       PUBLISH_INTERVAL: 1s
       PUBLISHER_GRPC_PORT: "50051"
+      PUBLISHER_HEALTH_PORT: "8090"
+      DRAIN_DELAY: 6s
       SHUTDOWN_TIMEOUT: 10s
+      FORCE_UNHEALTHY: "false"
       LOG_LEVEL: info
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:8090/livez >/dev/null 2>&1 || exit 1" ]
+      interval: 2s
+      timeout: 1s
+      retries: 2
+      start_period: 10s
     deploy:
-      replicas: 1
+      replicas: 3
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
         delay: 3s
@@ -188,6 +198,7 @@ services:
     environment:
       GATEWAY_PORT: "8081"
       PUBLISHER_GRPC_ADDR: publisher:50051
+      DNS_REFRESH_INTERVAL: 2s
       API_KEY_FILE: /run/secrets/api_key
       REQUEST_TIMEOUT: 3s
       SHUTDOWN_TIMEOUT: 10s

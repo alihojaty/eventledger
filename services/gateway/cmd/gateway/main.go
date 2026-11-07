@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,18 +15,30 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/tlscfg"
+	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/discovery"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/handler"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/ratelimit"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/health" // Enables gRPC client-side Health.Watch load balancing
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/resolver"
 )
+
+const grpcServiceConfigJSON = `{
+	"loadBalancingConfig": [{"round_robin": {}}],
+	"healthCheckConfig": {"serviceName": ""}
+}`
 
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Failed to load configuration: %v\n", err)
+		os.Exit(1)
+	}
+	if cfg.APIKey == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "API_KEY or API_KEY_FILE is required and must not be empty")
 		os.Exit(1)
 	}
 
@@ -44,9 +57,12 @@ func main() {
 		zap.String("instance_id", hostname),
 	)
 
+	// Register custom periodic DNS resolver for dynamic publisher scaling & graceful drain
+
 	var gwHandler *handler.GatewayHandler
 
 	dialOpts := []grpc.DialOption{
+		grpc.WithDefaultServiceConfig(grpcServiceConfigJSON),
 		grpc.WithUnaryInterceptor(
 			handler.RetryUnavailableInterceptor(
 				cfg.GRPCMaxAttempts,
@@ -60,6 +76,15 @@ func main() {
 			),
 		),
 	}
+	dnsBuilder := discovery.NewBuilder(cfg.DNSRefreshInterval, log)
+	resolver.Register(dnsBuilder)
+
+	targetAddr := cfg.PublisherGRPCAddr
+	if !strings.Contains(targetAddr, "://") {
+		targetAddr = fmt.Sprintf("%s:///%s", discovery.Scheme, targetAddr)
+	}
+
+	grpcConn, err := grpc.NewClient(targetAddr, dialOpts...)
 
 	if cfg.MTLSEnabled {
 		creds, err := tlscfg.ClientTransportCredentials(
@@ -75,8 +100,12 @@ func main() {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	// Non-blocking gRPC client initialization; reconnects automatically when publisher recovers
-	grpcConn, err := grpc.NewClient(cfg.PublisherGRPCAddr, dialOpts...)
+	targetAddr := cfg.PublisherGRPCAddr
+	if !strings.Contains(targetAddr, "://") {
+		targetAddr = fmt.Sprintf("%s:///%s", discovery.Scheme, targetAddr)
+	}
+
+	grpcConn, err := grpc.NewClient(targetAddr, dialOpts...)
 	if err != nil {
 		log.Fatal("Failed to create gRPC client", zap.Error(err))
 	}
@@ -112,8 +141,10 @@ func main() {
 	go func() {
 		log.Info("Gateway HTTP server started",
 			zap.Int("port", cfg.GatewayPort),
-			zap.String("publisher_grpc_addr", cfg.PublisherGRPCAddr),
+			zap.String("publisher_grpc_target", targetAddr),
+			zap.Duration("dns_refresh_interval", cfg.DNSRefreshInterval),
 			zap.Duration("request_timeout", cfg.RequestTimeout),
+			zap.Int("grpc_max_attempts", cfg.GRPCMaxAttempts),
 			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
 			zap.Float64("rate_limit_rps", cfg.RateLimitRPS),
 			zap.Int("rate_limit_burst", cfg.RateLimitBurst),

@@ -129,3 +129,11 @@ scale:
 
 loadgen:
 	go run ./services/gateway/cmd/loadgen -url http://localhost:8081 -api-key-file $(SECRETS_DIR)/api_key -requests 2000 -concurrency 200
+
+publisher-stats:
+	@echo "==> Querying /stats on all running publisher containers (port 8090):"
+	@for cid in $$(docker ps -qf "name=$(STACK_NAME)_publisher"); do \
+		echo -n "$$cid: "; \
+		docker exec "$$cid" wget -qO- http://127.0.0.1:8090/stats; \
+		echo ""; \
+	done

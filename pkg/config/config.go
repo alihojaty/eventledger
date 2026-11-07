@@ -31,16 +31,20 @@ type Config struct {
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 
 	// Publisher Configuration
-	PublishEnabled  bool          `env:"PUBLISH_ENABLED" envDefault:"false"`
-	PublishInterval time.Duration `env:"PUBLISH_INTERVAL" envDefault:"1s"`
+	PublishEnabled      bool          `env:"PUBLISH_ENABLED" envDefault:"false"`
+	PublishInterval     time.Duration `env:"PUBLISH_INTERVAL" envDefault:"1s"`
+	PublisherGRPCPort   int           `env:"PUBLISHER_GRPC_PORT" envDefault:"50051"`
+	PublisherHealthPort int           `env:"PUBLISHER_HEALTH_PORT" envDefault:"8090"`
+	DrainDelay          time.Duration `env:"DRAIN_DELAY" envDefault:"5s"`
+	ForceUnhealthy      bool          `env:"FORCE_UNHEALTHY" envDefault:"false"`
 
 	// Gateway Configuration (No default APIKey allowed)
-	GatewayPort       int           `env:"GATEWAY_PORT" envDefault:"8081"`
-	PublisherGRPCPort int           `env:"PUBLISHER_GRPC_PORT" envDefault:"50051"`
-	PublisherGRPCAddr string        `env:"PUBLISHER_GRPC_ADDR" envDefault:"localhost:50051"`
-	APIKey            string        `env:"API_KEY"`
-	APIKeyFile        string        `env:"API_KEY_FILE"`
-	RequestTimeout    time.Duration `env:"REQUEST_TIMEOUT" envDefault:"3s"`
+	GatewayPort        int           `env:"GATEWAY_PORT" envDefault:"8081"`
+	PublisherGRPCAddr  string        `env:"PUBLISHER_GRPC_ADDR" envDefault:"localhost:50051"`
+	DNSRefreshInterval time.Duration `env:"DNS_REFRESH_INTERVAL" envDefault:"2s"`
+	APIKey             string        `env:"API_KEY"`
+	APIKeyFile         string        `env:"API_KEY_FILE"`
+	RequestTimeout     time.Duration `env:"REQUEST_TIMEOUT" envDefault:"3s"`
 
 	// Rate Limiting, gRPC Retry & mTLS
 	RateLimitRPS     float64       `env:"RATE_LIMIT_RPS" envDefault:"500"`
@@ -144,6 +148,9 @@ func (c *Config) validate() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return fmt.Errorf("SHUTDOWN_TIMEOUT must be greater than 0, got %v", c.ShutdownTimeout)
+	}
+	if c.DrainDelay < 0 {
+		return fmt.Errorf("DRAIN_DELAY cannot be negative, got %v", c.DrainDelay)
 	}
 	return nil
 }
