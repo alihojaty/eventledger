@@ -137,3 +137,24 @@ publisher-stats:
 		docker exec "$$cid" wget -qO- http://127.0.0.1:8090/stats; \
 		echo ""; \
 	done
+
+build-loadgen:
+	go build -o bin/loadgen ./services/gateway/cmd/loadgen
+
+chaos-500k: build-loadgen
+	@RUN_ID="500k-$$(date -u +%Y%m%d%H%M%S)"; \
+	echo "==> Starting 500,000 request validation run (RUN_ID=$$RUN_ID) with live chaos..."; \
+	./scripts/chaos.sh & \
+	CHAOS_PID=$$!; \
+	./bin/loadgen -url http://localhost:8081 -api-key-file $(SECRETS_DIR)/api_key -run-id "$$RUN_ID" -requests 500000 -concurrency 256; \
+	kill "$$CHAOS_PID" >/dev/null 2>&1 || true; \
+	./scripts/verify_phase3.sh "$$RUN_ID" 500000
+
+chaos-5m: build-loadgen
+	@RUN_ID="5m-$$(date -u +%Y%m%d%H%M%S)"; \
+	echo "==> Starting 5,000,000 request production run (RUN_ID=$$RUN_ID) with live chaos..."; \
+	./scripts/chaos.sh & \
+	CHAOS_PID=$$!; \
+	./bin/loadgen -url http://localhost:8081 -api-key-file $(SECRETS_DIR)/api_key -run-id "$$RUN_ID" -requests 5000000 -concurrency 256; \
+	kill "$$CHAOS_PID" >/dev/null 2>&1 || true; \
+	./scripts/verify_phase3.sh "$$RUN_ID" 5000000

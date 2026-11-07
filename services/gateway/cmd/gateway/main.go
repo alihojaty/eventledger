@@ -58,6 +58,8 @@ func main() {
 	)
 
 	// Register custom periodic DNS resolver for dynamic publisher scaling & graceful drain
+	dnsBuilder := discovery.NewBuilder(cfg.DNSRefreshInterval, log)
+	resolver.Register(dnsBuilder)
 
 	var gwHandler *handler.GatewayHandler
 
@@ -76,15 +78,6 @@ func main() {
 			),
 		),
 	}
-	dnsBuilder := discovery.NewBuilder(cfg.DNSRefreshInterval, log)
-	resolver.Register(dnsBuilder)
-
-	targetAddr := cfg.PublisherGRPCAddr
-	if !strings.Contains(targetAddr, "://") {
-		targetAddr = fmt.Sprintf("%s:///%s", discovery.Scheme, targetAddr)
-	}
-
-	grpcConn, err := grpc.NewClient(targetAddr, dialOpts...)
 
 	if cfg.MTLSEnabled {
 		creds, err := tlscfg.ClientTransportCredentials(
@@ -102,7 +95,7 @@ func main() {
 
 	targetAddr := cfg.PublisherGRPCAddr
 	if !strings.Contains(targetAddr, "://") {
-		targetAddr = fmt.Sprintf("%s:///%s", discovery.Scheme, targetAddr)
+		targetAddr = fmt.Sprintf("swarmdns:%s", targetAddr)
 	}
 
 	grpcConn, err := grpc.NewClient(targetAddr, dialOpts...)

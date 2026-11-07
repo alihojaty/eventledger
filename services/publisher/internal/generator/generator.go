@@ -49,7 +49,12 @@ func (p *Publisher) SetEnabled(enable bool) {
 }
 
 func (p *Publisher) StartControlListener(ctx context.Context, natsURL string) {
-	ctrlConn, err := nats.Connect(natsURL, nats.MaxReconnects(-1))
+	ctrlConn, err := nats.Connect(
+		natsURL,
+		nats.RetryOnFailedConnect(true),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2*time.Second),
+	)
 	if err != nil {
 		p.logger.Warn("Failed to connect control listener to NATS", zap.Error(err))
 		return

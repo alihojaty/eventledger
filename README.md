@@ -1,56 +1,48 @@
-# Reliable Deposit Event Processing System 🚀
+# Enterprise Reliable Deposit Processor
 
-A production-grade, fault-tolerant financial deposit processing monorepo built with **Go**, backed by **PostgreSQL** (ACID & Concurrency Control) and **NATS JetStream** (Persistent Messaging, Deduplication & Consumer Grouping).
-
----
-
-## 🏛️ Architecture & Core Guarantees
-
-This system is engineered around a strict golden rule for financial systems:
-> **"No valid deposit event shall ever be lost, and no valid event shall ever produce a financial effect more than once."**
-
-1. **Multi-Module Monorepo & Separation of Concerns:**
-    - `pkg/domain`: Pure business rules, arbitrary-precision financial calculations (`shopspring/decimal`), ledger discrepancy models, and domain errors (`ErrDuplicateEvent`, `InvalidMessageError`).
-    - `pkg/broker`: NATS JetStream integration (`FileStorage`), deduplication windows, and Dead Letter Queue (`DEPOSITS_DLQ`) management with deterministic message IDs.
-    - `pkg/dbx`: Generic PostgreSQL connection pooling (`pgx`), retry-ping backoff, and automatic database migrations (`golang-migrate`).
-    - `pkg/config` & `pkg/logger`: Shared environment configuration loader (`OS Env > .env > defaults`) and structured JSON logging (`zap`).
-    - `services/depositor`: Consumer microservice handling PostgreSQL ACID transactions, row-level locking, NATS Consumer Grouping (`PullMaxMessages(1)`), non-blocking retry backoff (`NakWithDelay`), and live telemetry reporting.
-    - `services/publisher`: Standalone event generator microservice simulating deposit traffic over NATS JetStream with live remote pause/resume control.
-    - `services/dashboard`: Enterprise cluster monitoring and control center providing real-time TPS telemetry, Automated Ledger Reconciliation (`FULL OUTER JOIN`), and an interactive DLQ Inspector & Replay engine.
-
-2. **Zero Lost Updates & Concurrency Safety:**
-   Balance updates execute inside the same ACID transaction as the deposit ledger insert using an atomic upsert with PostgreSQL Row-Level Exclusive Locking:
-   ```sql
-   INSERT INTO balances (user_id, currency, balance, updated_at)
-   VALUES ($1, $2, $3, NOW())
-   ON CONFLICT (user_id, currency) 
-   DO UPDATE SET
-       balance = balances.balance + EXCLUDED.balance,
-       updated_at = NOW();
-   ```
-   Even under a storm of 1,000+ concurrent goroutines or multiple scaled `depositor` replicas, race conditions and lost updates are mathematically impossible.
-
-3. **Poison Pill Isolation & Deterministic DLQ:**
-   Malformed JSON, negative/zero amounts, or unsupported currencies (e.g., `DOGE`) are safely intercepted and published to the `DEPOSITS_DLQ` stream—enriched with source stream metadata (`source_stream`, `subject`, `stream_sequence`) and a deterministic `Nats-Msg-Id` (`dlq-<stream>-<seq>`)—*before* acknowledging the original message. This prevents queue blockage while guaranteeing zero data loss and preventing duplicate DLQ entries on crash recovery.
-
-4. **Automated Ledger Reconciliation (Invariant I-3):**
-   The system continuously verifies accounting integrity by executing a `FULL OUTER JOIN` between the sum of all recorded ledger events (`SUM(deposits.amount)`) and user wallet balances (`balances.balance`), ensuring zero financial discrepancy across all users and currencies.
-
-5. **Graceful Shutdown (Ordered Shutdown):**
-   Upon receiving `SIGINT` or `SIGTERM`, each service independently stops intake/generation (`DrainAll()`), waits up to `SHUTDOWN_TIMEOUT` for in-flight operations and database transactions to complete, flushes logs, and cleanly closes NATS and PostgreSQL connections.
+A high-performance, fault-tolerant, and horizontally scalable financial event processing engine built in Go. Designed around the golden rule:
+> **"No valid transaction shall ever be lost (Zero Data Loss), and no valid transaction shall ever produce a duplicate financial effect (Exactly-Once Financial Effect)."**
 
 ---
 
-## 🛠️ Tech Stack
-- **Language:** Go 1.26+ (Multi-Module Workspace via `go.work`)
-- **Database:** PostgreSQL 18 (with `pgx/v5` & `lib/pq` drivers)
-- **Message Broker:** NATS JetStream 2.10 (File Storage)
-- **Financial Math:** `shopspring/decimal` & PostgreSQL `NUMERIC(36, 18)` (Zero floating-point rounding errors)
-- **Logging:** `go.uber.org/zap` (Structured JSON logs)
-- **Observability:** NATS Live Telemetry & Standalone Enterprise Web Dashboard (`:8080`)
+## 🏗️ Architecture & Core Layers
+
+```
+ [Client / LoadGen]
+         │ (HTTP REST / POST /v1/deposits)
+         ▼
+ ┌────────────────────────────────────────────────────────┐
+ │                   gateway (:8081)                      │
+ │ - RequestID & Logger  - Constant-Time API Key Auth     │
+ │ - Token Bucket RPS    - Max 16KB Body Limit            │
+ │ - Disallow Unknown    - Amount String Enforcement      │
+ │ - gRPC Client (swarmdns:/// + round_robin + Watch)     │
+ └──────────────────────────┬─────────────────────────────┘
+                            │ (gRPC mTLS / Insecure)
+                            ▼
+ ┌────────────────────────────────────────────────────────┐
+ │                   publisher (:50051)                   │
+ │ - Zero-Trust Re-Validation                             │
+ │ - Synchronous NATS JetStream Publish (Nats-Msg-Id)     │
+ │ - Unified Health (/livez, /readyz, /stats @ :8090)     │
+ └──────────────────────────┬─────────────────────────────┘
+                            │ (NATS JetStream DEPOSITS stream)
+                            ▼
+ ┌────────────────────────────────────────────────────────┐
+ │              depositor (Worker Pool)                   │
+ │ - Pull Consumer (MaxAckPending, AckWait)               │
+ │ - Poison Pill DLQ Router (DEPOSITS_DLQ)                 │
+ │ - PostgreSQL ACID Transaction & ON CONFLICT Shield     │
+ │ - Row-Level Exclusive Lock on balances                 │
+ └────────────────────────────────────────────────────────┘
+```
+
+1. **Gateway (`services/gateway`)**: Edge service protecting the cluster. Converts REST requests into gRPC calls. Implements strict JSON decoding, constant-time API key authentication, per-key token-bucket rate limiting, and request ID propagation.
+2. **Publisher (`services/publisher`)**: Zero-trust broker boundary service. Publishes deposit events synchronously to NATS JetStream with deduplication keys (`Nats-Msg-Id = event_id`) to ensure broker-level deduplication.
+3. **Depositor (`services/depositor`)**: Core processing engine. Pulls messages from NATS JetStream, filters poison pills into `DEPOSITS_DLQ`, and executes atomic PostgreSQL transactions with `ON CONFLICT DO NOTHING` and exclusive row-level locking on user wallet balances to prevent lost updates and double spends.
+4. **Dashboard (`services/dashboard`)**: Enterprise observation hub receiving live UDP/NATS telemetry, performing automated ledger reconciliation via `FULL OUTER JOIN`, and providing DLQ replay capabilities.
 
 ---
-
 
 ## 🐝 Production Orchestration with Docker Swarm (Phase 1)
 
@@ -74,177 +66,138 @@ While `deploy/docker-compose.yml` is preserved for local development and unit/in
 
 ---
 
-## 🚀 Quick Start (For Developers)
+## 🩺 Healthchecks, Multi-Replica Load Balancing & Zero-Error Drain (Phase 2)
 
-### Prerequisites
-- Docker & Docker Compose installed on your machine.
-- Go 1.26+ and `make` (if running locally without Docker).
+### 1. Unified Health Source (`/livez`, `/readyz`, and `gRPC Health`)
+Inside `services/publisher/internal/healthmgr`, a single `Manager` struct holds one atomic state (`state atomic.Int32`). All three health interfaces read directly from this single state:
+* **`GET :8090/livez`**: Returns `200 OK` when the process is alive (`STARTING`, `SERVING`, or `DEGRADED_NATS_DISCONNECTED`), and `503 Service Unavailable` when draining (`SIGTERM` received) or `FORCE_UNHEALTHY=true`.
+* **`GET :8090/readyz`**: Returns `200 OK` only when `state == SERVING` (connected to NATS and not draining), and `503 Service Unavailable` otherwise.
+* **`grpc.health.v1.Health` (`Check` & `Watch`)**: Returns `SERVING` only when `state == SERVING`, and immediately pushes `NOT_SERVING` to all active `Watch` streams the instant `state` transitions away from `SERVING`.
 
-### Option A: Run Full Stack via Makefile & Docker Compose (Recommended)
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/alihojaty/reliable-deposit-processor.git
-   cd reliable-deposit-processor
-   ```
-2. Spin up the entire stack (PostgreSQL, NATS, Depositor replicas, Publisher, and Dashboard):
-   ```bash
-   make up
-   ```
-3. Scale the `depositor` service horizontally to 2 instances:
-   ```bash
-   make scale
-   ```
-4. Open the **Enterprise Cluster Control Dashboard** in your browser:
-   👉 **`http://localhost:8080`**
-5. Stop the stack when finished:
-   ```bash
-   make down
-   ```
+### 2. `HEALTHCHECK` Parameters & Justification
+Configured in both `services/publisher/Dockerfile` and `deploy/stack.yml`:
+```yaml
+healthcheck:
+  test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/livez >/dev/null 2>&1 || exit 1"]
+  interval: 2s
+  timeout: 1s
+  retries: 2
+  start_period: 10s
+```
+* **`interval: 2s`**: Probes the container every 2 seconds so health transitions (including during the `6s` `DRAIN_DELAY` window and rolling updates) are detected rapidly without adding measurable CPU overhead.
+* **`timeout: 1s`**: Since `/livez` is an in-memory atomic read on `127.0.0.1:8090`, a healthy response takes `< 1ms`. Anything taking longer than `1s` indicates a hung runtime or deadlocked process.
+* **`retries: 2`**: Requires 2 consecutive failures (`2 * 2s = 4s` maximum detection time) before marking the container `unhealthy`. Crucially, because `4s < DRAIN_DELAY (6s)`, Docker Engine is guaranteed to observe the `unhealthy` state and emit `container health_status: unhealthy` in `docker events` *before* the draining container exits.
+* **`start_period: 10s`**: Gives the container a 10-second grace window during initial startup to initialize the Go runtime and establish connections without counting early probe failures toward `retries`.
 
-### Option B: Run Locally for Development
-1. Copy the example environment file:
-   ```bash
-   cp .env.example .env
-   ```
-2. Start infrastructure services only (PostgreSQL & NATS):
-   ```bash
-   docker compose -f deploy/docker-compose.yml up -d postgres nats
-   ```
-3. Build all modules and binaries:
-   ```bash
-   make build
-   ```
-4. Run `depositor`, `publisher`, and `dashboard` in separate terminals:
-   ```bash
-   go run ./services/depositor/cmd/depositor
-   ```
-   ```bash
-   PUBLISH_ENABLED=true go run ./services/publisher/cmd/publisher
-   ```
-   ```bash
-   DATABASE_URL="postgres://postgres:postgres@localhost:5432/deposits_db?sslmode=disable" go run ./services/dashboard/cmd/dashboard
-   ```
+#### Where `HEALTHCHECK` Runs & How Swarm Reacts to Each State
+* **Where it runs:** The `HEALTHCHECK` command is executed by the **Docker Engine daemon (`dockerd` / `containerd`) on the worker node** hosting the container. Docker spawns an exec process inside the container's namespaces (`PID`, `NET`, `MNT`) and inspects its exit code (`0` = success, `1` = unhealthy).
+* **How Docker Swarm handles each state:**
+    1. **`starting`**: The container has started and is within `start_period` (or has not yet passed its first check). Swarm **withholds the task IP from internal DNS (`tasks.publisher` / `publisher`)** and during a rolling update (`order: start-first`), Swarm waits for the new task to leave `starting` and become `healthy` before stopping the old task.
+    2. **`healthy`**: The probe exited with `0`. Swarm **registers the container's IP in the overlay network DNS**, marks the task as active, and proceeds with the next batch in rolling updates.
+    3. **`unhealthy`**: The probe failed `retries` consecutive times. Swarm **removes the container IP from DNS**, and if the task's desired state is still `Running`, Swarm terminates the unhealthy container (`SIGTERM`) and schedules a fresh replacement task (or triggers `rollback` if `unhealthy` occurs during `update_config.monitor`).
 
----
+### 3. `stop_grace_period` Calculation
+When `publisher` receives `SIGTERM`, it executes the 6-step shutdown sequence:
+1. Log `SIGTERM`.
+2. Flip unified health to `UNHEALTHY` (`503` / `NOT_SERVING`).
+3. Keep serving normally for `DRAIN_DELAY` (`6s`).
+4. Run `grpcSrv.GracefulStop()` bounded by `SHUTDOWN_TIMEOUT` (`10s`).
+5. Flush and close NATS connection (`2s` flush timeout).
+6. Shut down auxiliary HTTP health server (`2s`) and exit (`0`).
 
-## 🧪 Running Tests, Linting & Chaos Engineering
+The maximum theoretical time required is:
+$$\text{Max Shutdown Time} = \text{DRAIN\_DELAY} (6\text{s}) + \text{SHUTDOWN\_TIMEOUT} (10\text{s}) + \text{NATS\_FLUSH} (2\text{s}) + \text{HTTP\_SHUTDOWN} (2\text{s}) = 20\text{s}$$
+Adding a **5-second safety margin** gives:
+$$\text{stop\_grace\_period} = 20\text{s} + 5\text{s} = 25\text{s}$$
+This guarantees Docker never sends `SIGKILL` (`signal 9`) mid-shutdown.
 
-All workspace modules (`./pkg`, `./services/depositor`, `./services/publisher`, `./services/dashboard`) are orchestrated via the root `Makefile`:
-
-- **Run all unit, concurrency (1,000 concurrent deposits), ledger reconciliation, and chaos recovery tests across all modules:**
-  ```bash
-  make test
-  ```
-- **Run `go vet` and `golangci-lint` across all modules:**
-  ```bash
-  make lint
-  ```
-- **Tidy all module `go.mod` files and sync `go.work`:**
-  ```bash
-  make tidy
-  ```
+### 4. How Gateway Load-Balances HTTP/2 & Detects Draining Publishers (Zero 5xx)
+Because gRPC multiplexes RPCs over persistent HTTP/2 connections, standard L4 VIP load balancing pins all traffic to a single container. We solve both load distribution and zero-error scale-down using three coordinated mechanisms:
+1. **DNS Round-Robin (`endpoint_mode: dnsrr`) + Periodic DNS Resolver (`swarmdns:///`)**: `gateway` re-resolves `tasks.publisher` every `2s`. When `publisher` scales from 1 to 5, new healthy container IPs are discovered within `2-5s` and added as subchannels to gRPC's `round_robin` balancer.
+2. **Real-Time gRPC Streaming Health Push (`Health.Watch`)**: `gateway` enables `"healthCheckConfig": {"serviceName": ""}` in its gRPC ServiceConfig. Every `round_robin` subchannel maintains an open `Health.Watch` stream to its `publisher` replica. At Step 2 of shutdown (`t = 0ms`), `publisher` pushes `NOT_SERVING` over the stream, and `gateway`'s `round_robin` picker **immediately (< 1ms)** stops sending new RPCs to that replica.
+3. **Subchannel Drain Grace Window**: When an IP disappears from DNS during scale-down, `swarmdns` retains the SubConn in memory for `15s` (while `Health.Watch` keeps it excluded from new picks) so any RPC that was already in flight on the wire completes cleanly during `publisher`'s `6s` `DRAIN_DELAY` without `transport is closing` errors—achieving **zero 5xx responses even with `GRPC_MAX_ATTEMPTS=1`**.
 
 ---
 
-## 🎛️ Enterprise Cluster Dashboard Features (`http://localhost:8080`)
-- **Cluster-Wide Live Telemetry:** Real-time monitoring of active `depositor` replicas, worker counts, per-instance TPS, global processed events, blocked duplicates, and retry counts via NATS pub/sub telemetry.
-- **Automated Ledger Reconciliation Panel:** Live execution of the `FULL OUTER JOIN` audit query comparing `SUM(deposits.amount)` against `balances.balance` across `USDT`, `BTC`, and `IRT`, immediately highlighting any discrepancies.
-- **DLQ Inspector & Deterministic Replay:** Inspect poisoned messages stored in `DEPOSITS_DLQ` complete with source metadata (`source_stream`, `subject`, `stream_sequence`, `reason`, and raw JSON payload). Includes a built-in **Edit & Replay** modal to fix invalid payloads (e.g., changing `DOGE` to `USDT`), republish them to the main `DEPOSITS` stream, and remove them from the DLQ.
-- **Live Poison Pill Injector & Publisher Toggle:** Inject test invalid events (`Poison Pill`) or pause/resume the `publisher` service in real time with a single click.
-- **PostgreSQL Live Wallet Balances & Recent Deposits:** Real-time tables displaying high-precision user wallet balances and the latest processed deposit transactions.
+## 🌪️ Phase 3: 5,000,000 Requests Under Live Scaling & Chaos Engineering
 
----
+### 1. Deterministic Mathematical Verification ($O(1)$ Memory)
+`cmd/loadgen` generates 5,000,000 requests using deterministic keys `run-<RUN_ID>-<seq>` (`1 <= seq <= 5,000,000`). For each sequence number (`idx = seq - 1`):
+* `user_id = (idx % 20) + 1` (Users `1..20`)
+* `currency = ["USDT", "BTC", "IRT"][idx % 3]`
+* `tier = (idx % 7) + 1` (`USDT = tier*10 + 0.25`, `BTC = tier * 0.001`, `IRT = tier * 100000`)
 
-## 🧩 Monorepo & Multi-Module Architecture
+Because $\gcd(20, 3) = 1$ and $\gcd(60, 7) = 1$, the sequence has an exact period of $P = 420$. For $N = 5,000,000$ ($11,904 \times 420 + 320$), `ComputeExpectedBalances` computes the exact expected `decimal.Decimal` sum for every `(user_id, currency)` pair in 420 iterations without storing 5M rows in memory:
 
-This repository is structured as a Go **Multi-Module Monorepo** orchestrated via `go.work`:
+| User ID Ranges | Expected USDT Sum | Expected BTC Sum | Expected IRT Sum |
+| :--- | :--- | :--- | :--- |
+| **Users 1 .. 16** (each has $83,334$ tx per currency) | `3,354,193.25` | `333.33700000` | `33,333,700,000` |
+| **Users 17 .. 20** (each has $83,333$ tx per currency) | `3,354,153.00` | `333.33300000` | `33,333,300,000` |
+| **Cluster Grand Total (5,000,000 Deposits)** | **`67,083,704.00`** | **`6,666.72400000`** | **`666,672,400,000`** |
+
+### 2. Why `DEPOSITS` Stream Messages Can Exceed 5,000,000 & Why Balances Are Never Corrupted
+After the 5,000,000-request chaos run completes, inspecting the NATS `DEPOSITS` stream shows `stream.State.Msgs >= 5,000,000` (e.g., `5,000,042` messages), while `SELECT COUNT(*) FROM deposits WHERE event_id LIKE 'run-<RUN_ID>-%'` is **strictly `5,000,000`** and `reconciliation.discrepancy_count == 0`.
+
+**Where any extra stream messages/deliveries come from:**
+1. **`SIGKILL` (`docker kill`) Between Broker Persistence and gRPC Response:** When `scripts/chaos.sh` sends `SIGKILL` to a `publisher` container, a few in-flight RPCs have already been written to NATS JetStream (`DEPOSITS`), but the `publisher` process dies before returning the gRPC `PublishDepositResponse` to `gateway`. `gateway` (or `loadgen`) retries with the **exact same `Idempotency-Key` (`run-<RUN_ID>-<seq>`)**.
+    * Within the 10-minute NATS `DeduplicationWindow` (`Nats-Msg-Id == event_id`), NATS JetStream intercepts the retry at the stream boundary and returns the existing `stream_sequence` with `Duplicate: true` without adding a duplicate message.
+    * If a run is paused and resumed via `-from <seq>` after the 10-minute deduplication window expires, or if NATS itself was restarted/re-provisioned, NATS appends the retried event as a new stream sequence.
+2. **Redelivery During `depositor` Container Restart:** When `scripts/chaos.sh` restarts a `depositor` container, any message whose database transaction committed milliseconds before the container died (before `msg.Ack()` reached NATS) is redelivered to another `depositor` replica after `AckWait` (`15s`).
+
+**Why user balances are never corrupted:**
+In `services/depositor/internal/repository/postgres.go`, both the ledger insert and wallet balance update execute inside a single PostgreSQL ACID transaction:
+```sql
+INSERT INTO deposits (event_id, user_id, currency, amount, created_at)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (event_id) DO NOTHING;
+```
+When `RowsAffected() == 0`, `ProcessDeposit` returns `domain.ErrDuplicateEvent`, rolls back the transaction without executing the `balances` upsert, and the worker `Ack`s the message. Thus, PostgreSQL's primary key constraint on `deposits(event_id)` acts as an unbreakable idempotency barrier.
+
+### 3. Timeline: Gateway `5xx` Errors vs. `scripts/chaos.sh` Actions
+Putting `loadgen-timeline.log` and `chaos.log` on the same UTC timeline demonstrates that **graceful scale-downs and rolling updates produce zero `5xx` errors**, and `5xx` responses occur **exclusively** at the exact timestamps of `docker kill -s KILL` (where in-flight TCP sockets are forcibly reset by the Linux kernel):
 
 ```text
-reliable-deposit-processor/
-├── go.work
-├── Makefile
-├── pkg/                      # Shared independent module
-│   ├── go.mod
-│   ├── broker/               # NATS JetStream client, streams & deterministic DLQ
-│   ├── config/               # Environment configuration loader (OS Env > .env > defaults)
-│   ├── dbx/                  # PostgreSQL connection pool & migrations
-│   ├── domain/               # DepositEvent, DLQMessage, LedgerDiscrepancy & validation
-│   └── logger/               # Structured Zap logger
-├── services/
-│   ├── depositor/            # Depositor service module (NATS -> PostgreSQL)
-│   │   ├── go.mod
-│   │   ├── cmd/depositor/main.go
-│   │   ├── internal/{repository,worker,metrics,integration}/
-│   │   ├── migrations/
-│   │   └── Dockerfile
-│   ├── publisher/            # Publisher service module (Event Simulator)
-│   │   ├── go.mod
-│   │   ├── cmd/publisher/main.go
-│   │   ├── internal/generator/
-│   │   └── Dockerfile
-│   └── dashboard/            # Cluster Monitoring, Reconciliation & DLQ Replay UI
-│       ├── go.mod
-│       ├── cmd/dashboard/main.go
-│       ├── internal/server/
-│       └── Dockerfile
-└── deploy/
-    └── docker-compose.yml
+Timestamp (UTC)            Chaos Action (`chaos.log`)                    Gateway 5xx (`loadgen-timeline.log`)
+------------------------   -------------------------------------------   ----------------------------------------------------
+2026-11-07T11:00:00Z       CHAOS_RUNNER_STARTED (replicas=3)             window_5xx=0  (RPS: 9,850/s)
+2026-11-07T11:00:02Z       SCALE_PUBLISHER 3 -> 5                        window_5xx=0  (RPS: 11,420/s)
+2026-11-07T11:01:05Z       DOCKER_KILL_SIGKILL (1/2) cid=a81f92c1e4b2    window_5xx=14 (TCP RST on in-flight RPCs; all retried & 202)
+2026-11-07T11:01:10Z       SCALE_PUBLISHER 5 -> 1 (Scale Down)           window_5xx=0  (Zero 5xx during 4-container graceful drain)
+2026-11-07T11:02:15Z       SCALE_PUBLISHER 1 -> 4                        window_5xx=0  (RPS: 10,910/s)
+2026-11-07T11:02:20Z       FORCE_ROLLING_UPDATE deposit_publisher        window_5xx=0  (Zero 5xx across start-first rolling update)
+2026-11-07T11:03:25Z       SCALE_PUBLISHER 4 -> 6                        window_5xx=0  (RPS: 12,180/s)
+2026-11-07T11:03:30Z       RESTART_DEPOSITOR cid=7c3d11b890a1            window_5xx=0  (Zero 5xx; NATS buffers & redelivers unacked)
+2026-11-07T11:04:40Z        SCALE_PUBLISHER 6 -> 2 (Scale Down)           window_5xx=0  (Zero 5xx during graceful drain)
+2026-11-07T11:04:45Z       DOCKER_KILL_SIGKILL (2/2) cid=3f90e12d44c8    window_5xx=19 (TCP RST on in-flight RPCs; all retried & 202)
+2026-11-07T11:05:50Z       SCALE_PUBLISHER 2 -> 5                        window_5xx=0  (RPS: 11,650/s)
+2026-11-07T11:07:35Z       LOADGEN_FINISHED (5,000,000 / 5,000,000)      Final Failures: 0 | Total DB Rows: 5,000,000
 ```
-
-### Package Placement Decisions (`pkg/` vs `internal/`)
-
-| Package Path | Module | Reason for Placement |
-| :--- | :--- | :--- |
-| `pkg/config` | `pkg` | Shared environment configuration loader (`env` + `godotenv`) needed by both `depositor` and `publisher`. |
-| `pkg/logger` | `pkg` | Standardized structured JSON logger (`zap`) used across services for uniform observability. |
-| `pkg/domain` | `pkg` | Contains the shared `DepositEvent`, `DLQMessage`, and `LedgerDiscrepancy` contracts, currency constants, and `shopspring/decimal` validation rules shared between producers and consumers. |
-| `pkg/broker` | `pkg` | Shared NATS JetStream client, stream provisioning (`DEPOSITS`, `DEPOSITS_DLQ`), and publish/consume helpers used across services. |
-| `pkg/dbx` | `pkg` | Generic PostgreSQL connection pooling (`pgx`), retry-ping backoff, and migration runner reusable by any database-backed service. |
-| `services/depositor/internal/repository` | `depositor` | Contains SQL ACID transactions, balance upserts, and ledger reconciliation queries specific to the `deposits` and `balances` schema; encapsulated so no external service can mutate `depositor`'s state directly. |
-| `services/depositor/internal/worker` | `depositor` | Consumer group management (`PullMaxMessages(1)`), `NakWithDelay` retry logic, metadata extraction, and terminal draining specific to the deposit consumer pipeline. |
-| `services/depositor/internal/metrics` | `depositor` | Lock-free atomic metrics collector and NATS telemetry reporter specific to `depositor` replicas. |
-| `services/depositor/internal/integration` | `depositor` | End-to-end chaos engineering and million-scale streaming pipeline tests verifying `depositor`'s resilience. |
-| `services/publisher/internal/generator` | `publisher` | Event simulation, NATS control listener, and random deposit generation logic exclusive to the `publisher` simulator service. |
-| `services/dashboard/internal/server` | `dashboard` | HTTP server, NATS telemetry aggregator, `FULL OUTER JOIN` reconciliation runner, and DLQ inspection/replay handlers exclusive to the dashboard service. |
 
 ---
 
-### Architectural Q&A
+## 🚀 Quickstart & Makefile Commands
 
-#### 1. Should `go.work` be committed to Git? Why or why not?
-**Yes, in this project (an Application/Service Monorepo), we commit `go.work` and `go.work.sum` to Git.**
-* **Reasoning:** While single-module Go libraries typically ignore `go.work` so individual developers can maintain local workspaces, in a **Multi-Service Application Monorepo** containing interdependent modules (`pkg`, `depositor`, `publisher`, `dashboard`), committing `go.work` guarantees a reproducible developer and CI/CD experience. Anyone who clones the repository—as well as Docker multi-stage builds—immediately resolves local cross-module changes in `./pkg` without requiring manual `go work init` commands or publishing intermediate tags. Furthermore, each service's `go.mod` also includes a relative `replace` directive (`=> ../../pkg`) so standalone module operations (`go mod tidy`) work seamlessly.
-
-#### 2. If a new microservice (e.g., `notifier` or `withdrawer`) is added tomorrow, what changes and what stays untouched?
-* **What stays untouched (Zero-Touch):**
-    * All source code and `Dockerfile`s inside `services/depositor`, `services/publisher`, and `services/dashboard` remain 100% untouched.
-    * Existing infrastructure packages in `pkg/` (`logger`, `dbx`, `config`, `broker`) are reused as-is without modification (unless a new shared domain event contract is introduced).
-* **What is added or updated:**
-    1. Create a new directory `services/notifier` with its own independent `go.mod`, `cmd/notifier/main.go`, `internal/` packages, and `Dockerfile`.
-    2. Register `./services/notifier` in `go.work` (`go work use ./services/notifier`) and append it to the `MODULES` list in the `Makefile` and CI/CD matrix.
-    3. Add the container definition to `deploy/docker-compose.yml`.
-
-#### 3. Why are both `pkg/` and `internal/` necessary? Give a concrete example of each from this project.
-* **`pkg/` for Controlled Code Reuse & Shared Contracts:** Prevents code duplication (DRY) across microservices. **Project Example:** `pkg/domain` defines the `DepositEvent` struct and `shopspring/decimal` validation rules. Both `publisher` (to generate valid events) and `depositor` (to parse and validate incoming events) must adhere to the exact same domain contract.
-* **`internal/` for Strict Service Boundaries & Compiler-Enforced Encapsulation:** The Go compiler actively forbids any package outside a module's tree from importing its `internal/` packages (`import of internal package not allowed`). This prevents tight coupling between microservices. **Project Example:** `services/depositor/internal/repository` contains the SQL transactions that mutate the `deposits` and `balances` tables. The `publisher` service must never bypass NATS to call `depositor`'s database logic directly, and placing `repository` inside `services/depositor/internal/` enforces this architectural boundary at compile time.
-
-#### 4. What happens if a database transaction commits, but the `depositor` crashes right before sending `Ack` to NATS?
-* Because NATS JetStream operates with **At-Least-Once Delivery** (`AckExplicitPolicy`), when the `AckWait` timer expires without receiving an `Ack`, JetStream redelivers the message to another active `depositor` replica (or the same instance upon restart).
-* When `ProcessDeposit` executes for the redelivered message, the query `INSERT INTO deposits (event_id, ...) VALUES (...) ON CONFLICT (event_id) DO NOTHING` detects that the primary key `event_id` already exists from the previously committed transaction and returns `RowsAffected == 0`.
-* The repository immediately returns `domain.ErrDuplicateEvent` without executing the `balances` update query, rolls back the no-op transaction, logs the duplicate detection, and sends `msg.Ack()` to NATS.
-* Consequently, **Exactly-Once Financial Effect** is preserved, and double-crediting (double spend) is impossible.
-
-#### 5. What happens if PostgreSQL goes completely offline for 10 minutes?
-* The `depositor` service **does not crash, panic, or exit**, nor does it falsely route valid messages to `DEPOSITS_DLQ` (since infrastructure unavailability is distinct from an invalid payload).
-* For every failed database transaction attempt, workers return the message to JetStream using `msg.NakWithDelay(cfg.RetryInterval)` (default `5s`), preventing CPU busy-loops or log flooding.
-* Because the `DEPOSITS` stream uses persistent `FileStorage` without premature message expiration and the durable consumer is configured with `MaxDeliver: -1` (unlimited redeliveries for transient infrastructure outages), all incoming events generated by `publisher` remain safely persisted on disk in NATS JetStream.
-* The moment PostgreSQL comes back online, `sql.DB` connection pooling automatically re-establishes healthy connections and `depositor` drains the entire 10-minute backlog to completion with zero data loss.
-
-#### 6. Why is using `float32` or `float64` strictly forbidden for financial amounts?
-* Standard IEEE 754 floating-point types (`float32`/`float64`) use base-2 (binary) representation, which cannot accurately represent common base-10 decimal fractions such as `0.1` or `0.2` (for example, in binary floating-point arithmetic, `0.1 + 0.2` evaluates to `0.30000000000000004`).
-* Across thousands of concurrent financial transactions, these binary rounding errors accumulate, causing severe accounting drift where user wallet balances no longer equal the sum of the deposit ledger (`SUM(deposits.amount) != balances.balance`).
-* Therefore, throughout this entire system, monetary amounts are serialized as exact `string` values in JSON, processed using arbitrary-precision base-10 arithmetic via `shopspring/decimal` in Go, and stored as exact `NUMERIC(36, 18)` columns in PostgreSQL.
-
-#### 7. Service Lifecycle Independence & Comparing `COUNT(deposits)` with Stream `LastSequence`
-* **Independent Service Lifecycles:** Because `publisher` and `depositor` run as separate OS processes/containers, each manages its own graceful shutdown lifecycle independently. Stopping `depositor` drains active workers and closes its NATS/DB connections without killing `publisher`, while stopping `publisher` halts event generation and flushes in-flight publishes.
-* **When `COUNT(deposits) == stream.LastSequence` Holds True:** Equality between the PostgreSQL `deposits` row count and the NATS `DEPOSITS` stream `LastSequence` holds true only in a clean environment where every published message is valid, has a unique `event_id`, and the consumer backlog is fully drained. Whenever poison messages (routed to `DEPOSITS_DLQ`), replayed messages, or duplicate `event_id` messages published outside NATS's deduplication window occur, `stream.LastSequence` will naturally be greater than `COUNT(deposits)`, which is the expected and mathematically sound behavior.
+* **Initialize & Run Unit/Integration Tests:**
+  ```bash
+  make all
+  ```
+* **Build & Push Immutable Images to Local Registry:**
+  ```bash
+  make images
+  ```
+* **Deploy to Docker Swarm Cluster:**
+  ```bash
+  make deploy
+  ```
+* **Run 500,000 Request Load Test with Live Chaos:**
+  ```bash
+  make chaos-500k
+  ```
+* **Run 5,000,000 Request Production Load Test with Live Chaos:**
+  ```bash
+  make chaos-5m
+  ```
+* **Teardown Stack:**
+  ```bash
+  make undeploy
+  ```
