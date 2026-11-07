@@ -21,3 +21,6 @@ dist/
 
 # Coverage
 coverage.out
+vendor/
+**/vendor/
+project_all.txt

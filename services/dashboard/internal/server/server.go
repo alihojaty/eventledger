@@ -131,7 +131,7 @@ type DashboardServer struct {
 func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardServer {
 	js, _ := jetstream.New(nc)
 	gwURL := "http://localhost:8081"
-	key := "dev-secret-api-key"
+	key := ""
 	if len(extra) > 0 && extra[0] != "" {
 		gwURL = extra[0]
 	} else if env := os.Getenv("GATEWAY_URL"); env != "" {

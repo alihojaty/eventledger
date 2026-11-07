@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
@@ -39,6 +40,12 @@ type NATSBroker struct {
 	nc     *nats.Conn
 	js     jetstream.JetStream
 	logger *zap.Logger
+
+	mu                 sync.Mutex
+	onReconnectHooks   []func(ctx context.Context)
+	hasConsumerConfig  bool
+	savedMaxAckPending int
+	savedAckWait       time.Duration
 }
 
 func NewNATSBroker(ctx context.Context, natsURL string, logger *zap.Logger) (*NATSBroker, error) {
@@ -46,48 +53,106 @@ func NewNATSBroker(ctx context.Context, natsURL string, logger *zap.Logger) (*NA
 		logger: logger,
 	}
 
-	nc, err := nats.Connect(
-		natsURL,
-		nats.Name("reliable-deposit-processor"),
-		nats.Timeout(5*time.Second),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(500*time.Millisecond),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			logger.Warn("Temporary failure",
-				zap.String("component", "nats_broker"),
-				zap.String("event", "disconnected from NATS"),
-				zap.Error(err),
-			)
-		}),
-		nats.ReconnectHandler(func(nc *nats.Conn) {
-			logger.Info("Reconnected to Message Broker", zap.String("url", nc.ConnectedUrl()))
-			reconnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := b.setupStreams(reconnCtx); err != nil {
-				logger.Error("Failed to verify streams after NATS reconnect", zap.Error(err))
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		nc, err := nats.Connect(
+			natsURL,
+			nats.Name("reliable-deposit-processor"),
+			nats.Timeout(5*time.Second),
+			nats.MaxReconnects(-1),
+			nats.ReconnectWait(1*time.Second),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				logger.Warn("Temporary failure",
+					zap.String("component", "nats_broker"),
+					zap.String("event", "disconnected from NATS"),
+					zap.Error(err),
+				)
+			}),
+			nats.ReconnectHandler(func(nc *nats.Conn) {
+				logger.Info("Reconnected to Message Broker", zap.String("url", nc.ConnectedUrl()))
+				go b.handleReconnected()
+			}),
+		)
+		if err == nil {
+			js, jsErr := jetstream.New(nc, jetstream.WithPublishAsyncMaxPending(65536))
+			if jsErr == nil {
+				b.nc = nc
+				b.js = js
+				setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				streamErr := b.setupStreams(setupCtx)
+				cancel()
+				if streamErr == nil {
+					logger.Info("Connected to Message Broker")
+					return b, nil
+				}
+				err = streamErr
+			} else {
+				err = jsErr
 			}
-		}),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to NATS server: %w", err)
+			nc.Close()
+		}
+
+		logger.Warn("Waiting for NATS JetStream broker to become ready",
+			zap.String("nats_url", natsURL),
+			zap.Int("attempt", attempt),
+			zap.Duration("retry_in", backoff),
+			zap.Error(err),
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("failed to connect to NATS server before context canceled: %w", err)
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
 	}
+}
 
-	js, err := jetstream.New(nc, jetstream.WithPublishAsyncMaxPending(65536))
-	if err != nil {
-		nc.Close()
-		return nil, fmt.Errorf("failed to initialize JetStream context: %w", err)
+func (b *NATSBroker) OnReconnect(fn func(ctx context.Context)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onReconnectHooks = append(b.onReconnectHooks, fn)
+}
+
+func (b *NATSBroker) handleReconnected() {
+	b.mu.Lock()
+	hasConsumer := b.hasConsumerConfig
+	maxAck := b.savedMaxAckPending
+	ackWait := b.savedAckWait
+	hooks := append([]func(ctx context.Context){}, b.onReconnectHooks...)
+	b.mu.Unlock()
+
+	for attempt := 1; attempt <= 10; attempt++ {
+		if !b.IsConnected() {
+			return
+		}
+		reconnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := b.setupStreams(reconnCtx)
+		if err == nil && hasConsumer {
+			_, err = b.CreateOrUpdateDepositConsumerWithAckWait(reconnCtx, maxAck, ackWait)
+		}
+		cancel()
+
+		if err == nil {
+			for _, hook := range hooks {
+				hookCtx, hCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				hook(hookCtx)
+				hCancel()
+			}
+			return
+		}
+
+		b.logger.Warn("Retrying stream/consumer provisioning after NATS reconnect",
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		time.Sleep(500 * time.Millisecond)
 	}
-
-	b.nc = nc
-	b.js = js
-
-	if err := b.setupStreams(ctx); err != nil {
-		nc.Close()
-		return nil, err
-	}
-
-	logger.Info("Connected to Message Broker")
-	return b, nil
 }
 
 func (b *NATSBroker) setupStreams(ctx context.Context) error {
@@ -129,6 +194,12 @@ func (b *NATSBroker) CreateOrUpdateDepositConsumerWithAckWait(
 	if ackWait <= 0 {
 		ackWait = DefaultAckWait
 	}
+
+	b.mu.Lock()
+	b.hasConsumerConfig = true
+	b.savedMaxAckPending = maxAckPending
+	b.savedAckWait = ackWait
+	b.mu.Unlock()
 
 	consumer, err := b.js.CreateOrUpdateConsumer(ctx, StreamDeposits, jetstream.ConsumerConfig{
 		Durable:       ConsumerDurableName,
@@ -239,6 +310,7 @@ func (b *NATSBroker) GetQueueStats(ctx context.Context) (QueueStats, error) {
 
 	return stats, nil
 }
+
 func (b *NATSBroker) IsConnected() bool {
 	return b.nc != nil && b.nc.IsConnected()
 }

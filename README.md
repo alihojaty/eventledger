@@ -51,6 +51,29 @@ This system is engineered around a strict golden rule for financial systems:
 
 ---
 
+
+## 🐝 Production Orchestration with Docker Swarm (Phase 1)
+
+While `deploy/docker-compose.yml` is preserved for local development and unit/integration testing, production deployment is orchestrated via **Docker Swarm** using `deploy/stack.yml`.
+
+### Compose Keys Ignored by `docker stack deploy` & Their Swarm Replacements
+
+`docker stack deploy` operates on pre-built cluster images and Swarm services rather than local container composition. The following keys present in `deploy/docker-compose.yml` are ignored or unsupported by `docker stack deploy` and have been replaced in `deploy/stack.yml`:
+
+| Ignored Compose Key | Why Swarm Ignores It | What Replaced It in `deploy/stack.yml` & Code |
+| :--- | :--- | :--- |
+| **`build:`** (`context`, `dockerfile`) | Swarm nodes pull immutable images from a registry; the orchestrator does not build source code on worker nodes. | Replaced with **`image: 127.0.0.1:5000/reliable-deposit-<svc>:${IMAGE_TAG}`** where `IMAGE_TAG` is the immutable Git commit SHA (`git rev-parse --short=12 HEAD`), built and pushed to a local `registry:2` via `make images`. |
+| **`depends_on:`** (`condition: service_healthy` / `service_started`) | Swarm schedules tasks asynchronously across the cluster and does not support startup ordering or health-gated dependency DAGs in stack files. | Replaced with **application-level startup backoff loops** (`pkg/dbx.ConnectAndMigrate`, `pkg/broker.NewNATSBroker`, `nats.RetryOnFailedConnect(true)`), **runtime NATS stream/consumer auto-reprovisioning (`OnReconnect`)**, and **`deploy.restart_policy`**. |
+| **`restart: unless-stopped`** | Container-level restart policies belong to standalone Docker Engine (`docker run`/`docker compose`), not Swarm's service scheduler. | Replaced with **`deploy.restart_policy`** (`condition: any`, `delay: 3s`, `max_attempts: 0`, `window: 60s`) managed by the Swarm raft orchestrator. |
+| **Plaintext Secret Env Vars** (`API_KEY`, `POSTGRES_PASSWORD`) | Passing sensitive credentials as plain environment variables exposes them in `docker service inspect` and process tables. | Replaced with **Docker Swarm `secrets:`** (`deposit_api_key`, `deposit_postgres_password`) mounted in-memory (`tmpfs`) at `/run/secrets/*` and loaded via `API_KEY_FILE` and `POSTGRES_PASSWORD_FILE` with **zero default fallback values** in code or stack config. |
+| **Host Port Bindings on Internal Services** (`5432:5432`, `4222:4222`, `8222:8222`) | Exposing database and broker ports on the host routing mesh violates network isolation. | Removed `ports:` from `postgres`, `nats`, `publisher`, and `depositor`. All services communicate over an isolated **`overlay` network (`deposit_overlay`)**; only `gateway` (`:8081`) and `dashboard` (`:8080`) publish ports on the host. |
+
+### Stateful Pinning & Update/Rollback Policies
+* **Stateful Placement Constraints:** `postgres` and `nats` persist data to named volumes (`postgres_data`, `nats_data`) and are pinned to a fixed node via `deploy.placement.constraints: [node.role == manager, node.labels.stateful == true]` with `update_config.order: stop-first` to prevent concurrent volume lock corruption.
+* **Stateless Zero-Downtime Rollouts:** `gateway`, `publisher`, `depositor`, and `dashboard` use `update_config.order: start-first` with `failure_action: rollback`, ensuring new tasks start before old tasks are terminated and automatically rolling back failed deployments.
+
+---
+
 ## 🚀 Quick Start (For Developers)
 
 ### Prerequisites

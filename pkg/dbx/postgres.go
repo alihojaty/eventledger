@@ -29,19 +29,22 @@ func ConnectAndMigrate(ctx context.Context, databaseURL, migrationsPath string, 
 	db.SetConnMaxLifetime(30 * time.Minute)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 
-	var pingErr error
-	for attempt := 1; attempt <= 10; attempt++ {
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	for attempt := 1; ; attempt++ {
 		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		pingErr = db.PingContext(pingCtx)
+		pingErr := db.PingContext(pingCtx)
 		cancel()
 
 		if pingErr == nil {
 			break
 		}
 
-		logger.Warn("Temporary failure",
+		logger.Warn("Waiting for PostgreSQL database to become reachable",
 			zap.String("component", "dbx_postgres"),
 			zap.Int("attempt", attempt),
+			zap.Duration("retry_in", backoff),
 			zap.Error(pingErr),
 		)
 
@@ -49,19 +52,18 @@ func ConnectAndMigrate(ctx context.Context, databaseURL, migrationsPath string, 
 		case <-ctx.Done():
 			_ = db.Close()
 			return nil, fmt.Errorf("context canceled while waiting for database: %w", ctx.Err())
-		case <-time.After(1 * time.Second):
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 		}
-	}
-
-	if pingErr != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to ping database after retries: %w", pingErr)
 	}
 
 	logger.Info("Connected to Database")
 
 	if migrationsPath != "" {
-		if err := RunMigrations(databaseURL, migrationsPath, logger); err != nil {
+		if err := RunMigrations(ctx, databaseURL, migrationsPath, logger); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to run database migrations: %w", err)
 		}
@@ -70,30 +72,37 @@ func ConnectAndMigrate(ctx context.Context, databaseURL, migrationsPath string, 
 	return db, nil
 }
 
-func RunMigrations(databaseURL, migrationsPath string, logger *zap.Logger) error {
+func RunMigrations(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) error {
 	var lastErr error
-	for attempt := 1; attempt <= 5; attempt++ {
+	for attempt := 1; attempt <= 15; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		m, err := migrate.New(migrationsPath, databaseURL)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to create migrate instance: %w", err)
-			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-			continue
+		} else {
+			err = m.Up()
+			_, _ = m.Close()
+
+			if err == nil || errors.Is(err, migrate.ErrNoChange) {
+				logger.Debug("Database migrations applied successfully")
+				return nil
+			}
+			lastErr = fmt.Errorf("failed to apply up migrations: %w", err)
 		}
 
-		err = m.Up()
-		_, _ = m.Close()
-
-		if err == nil || errors.Is(err, migrate.ErrNoChange) {
-			logger.Debug("Database migrations applied successfully")
-			return nil
-		}
-
-		lastErr = fmt.Errorf("failed to apply up migrations: %w", err)
 		logger.Warn("Migration lock contention or temporary failure; retrying",
 			zap.Int("attempt", attempt),
-			zap.Error(err),
+			zap.Error(lastErr),
 		)
-		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(min(attempt, 5)) * 500 * time.Millisecond):
+		}
 	}
 
 	return lastErr

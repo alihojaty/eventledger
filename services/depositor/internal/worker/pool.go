@@ -65,6 +65,32 @@ func (cg *ConsumerGroup) Start() error {
 	return nil
 }
 
+func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+
+	cg.consumer = newConsumer
+	for id, oldCtx := range cg.members {
+		workerID := id
+		oldCtx.Stop()
+		consumeCtx, err := cg.consumer.Consume(
+			func(msg jetstream.Msg) {
+				cg.processor.HandleMessage(workerID, msg)
+			},
+			jetstream.PullMaxMessages(1),
+		)
+		if err != nil {
+			cg.logger.Error("Failed to rebind worker after NATS reconnect",
+				zap.Int("worker_id", workerID),
+				zap.Error(err),
+			)
+			continue
+		}
+		cg.members[workerID] = consumeCtx
+		cg.logger.Info("Worker rebound to NATS consumer after reconnect", zap.Int("worker_id", workerID))
+	}
+}
+
 func (cg *ConsumerGroup) StopWorker(workerID int) error {
 	if workerID < 1 || workerID > cg.workerCount {
 		return fmt.Errorf("%w: must be between 1 and %d", ErrInvalidWorkerID, cg.workerCount)

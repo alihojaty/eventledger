@@ -40,7 +40,7 @@ func main() {
 		zap.String("instance_id", hostname),
 	)
 
-	log.Info("Depositor service started",
+	log.Info("Depositor service starting",
 		zap.Int("worker_count", cfg.WorkerCount),
 		zap.Duration("retry_interval", cfg.RetryInterval),
 		zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
@@ -53,21 +53,18 @@ func main() {
 	workCtx, workCancel := context.WithCancel(context.Background())
 	defer workCancel()
 
-	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer initCancel()
-
-	repo, err := repository.NewPostgresRepository(initCtx, cfg.DatabaseURL, cfg.MigrationsPath, log)
+	repo, err := repository.NewPostgresRepository(sigCtx, cfg.DatabaseURL, cfg.MigrationsPath, log)
 	if err != nil {
 		log.Fatal("Failed to initialize PostgreSQL repository", zap.Error(err))
 	}
 
-	natsBroker, err := broker.NewNATSBroker(initCtx, cfg.NatsURL, log)
+	natsBroker, err := broker.NewNATSBroker(sigCtx, cfg.NatsURL, log)
 	if err != nil {
 		_ = repo.Close()
 		log.Fatal("Failed to initialize NATS JetStream broker", zap.Error(err))
 	}
 
-	consumer, err := natsBroker.CreateOrUpdateDepositConsumer(initCtx, cfg.WorkerCount*2)
+	consumer, err := natsBroker.CreateOrUpdateDepositConsumer(sigCtx, cfg.WorkerCount*2)
 	if err != nil {
 		natsBroker.Close()
 		_ = repo.Close()
@@ -75,8 +72,8 @@ func main() {
 	}
 
 	metricsCollector := metrics.NewCollector()
-	prevProcessed, _ := repo.GetTotalProcessedCount(initCtx)
-	qStats, _ := natsBroker.GetQueueStats(initCtx)
+	prevProcessed, _ := repo.GetTotalProcessedCount(sigCtx)
+	qStats, _ := natsBroker.GetQueueStats(sigCtx)
 	metricsCollector.RestoreState(prevProcessed, qStats.DLQTotalMsgs)
 
 	var inFlightWg sync.WaitGroup
@@ -96,6 +93,15 @@ func main() {
 		_ = repo.Close()
 		log.Fatal("Failed to start worker consumer group", zap.Error(err))
 	}
+
+	natsBroker.OnReconnect(func(reconnCtx context.Context) {
+		newConsumer, err := natsBroker.CreateOrUpdateDepositConsumer(reconnCtx, cfg.WorkerCount*2)
+		if err != nil {
+			log.Error("Failed to recreate consumer after NATS reconnect", zap.Error(err))
+			return
+		}
+		consumerGroup.RebindConsumer(newConsumer)
+	})
 
 	metrics.StartTelemetryReporter(sigCtx, cfg.NatsURL, cfg.WorkerCount, metricsCollector.GetSnapshot)
 

@@ -31,7 +31,12 @@ func StartTelemetryReporter(
 	}
 
 	go func() {
-		nc, err := nats.Connect(natsURL, nats.MaxReconnects(-1), nats.ReconnectWait(2*time.Second))
+		nc, err := nats.Connect(
+			natsURL,
+			nats.RetryOnFailedConnect(true),
+			nats.MaxReconnects(-1),
+			nats.ReconnectWait(2*time.Second),
+		)
 		if err != nil {
 			return
 		}
@@ -82,7 +87,7 @@ func StartTelemetryReporter(
 				}
 
 				data, err := json.Marshal(payload)
-				if err == nil {
+				if err == nil && nc.IsConnected() {
 					_ = nc.Publish("telemetry.depositor", data)
 				}
 			}
