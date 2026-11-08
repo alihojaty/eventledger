@@ -57,7 +57,6 @@ func main() {
 		zap.String("instance_id", hostname),
 	)
 
-	// Register custom periodic DNS resolver for dynamic publisher scaling & graceful drain
 	dnsBuilder := discovery.NewBuilder(cfg.DNSRefreshInterval, log)
 	resolver.Register(dnsBuilder)
 
@@ -95,7 +94,7 @@ func main() {
 
 	targetAddr := cfg.PublisherGRPCAddr
 	if !strings.Contains(targetAddr, "://") {
-		targetAddr = fmt.Sprintf("swarmdns:%s", targetAddr)
+		targetAddr = fmt.Sprintf("swarmdns:///%s", targetAddr)
 	}
 
 	grpcConn, err := grpc.NewClient(targetAddr, dialOpts...)

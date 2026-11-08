@@ -40,6 +40,9 @@ func (b *Builder) Build(target resolver.Target, cc resolver.ClientConn, _ resolv
 	if endpoint == "" {
 		endpoint = target.URL.Host
 	}
+	if endpoint == "" {
+		endpoint = strings.TrimPrefix(target.URL.Opaque, "//")
+	}
 
 	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -47,9 +50,15 @@ func (b *Builder) Build(target resolver.Target, cc resolver.ClientConn, _ resolv
 		port = "50051"
 	}
 
+	tlsServerName := strings.TrimPrefix(host, "tasks.")
+	if tlsServerName == "" {
+		tlsServerName = host
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &swarmDNSResolver{
 		host:            host,
+		tlsServerName:   tlsServerName,
 		port:            port,
 		cc:              cc,
 		refreshInterval: b.refreshInterval,
@@ -68,6 +77,7 @@ func (b *Builder) Build(target resolver.Target, cc resolver.ClientConn, _ resolv
 
 type swarmDNSResolver struct {
 	host            string
+	tlsServerName   string
 	port            string
 	cc              resolver.ClientConn
 	refreshInterval time.Duration
@@ -80,7 +90,7 @@ type swarmDNSResolver struct {
 	wg           sync.WaitGroup
 
 	mu       sync.Mutex
-	knownIPs map[string]time.Time // ip -> lastSeen timestamp
+	knownIPs map[string]time.Time
 }
 
 func (r *swarmDNSResolver) ResolveNow(_ resolver.ResolveNowOptions) {
@@ -119,8 +129,6 @@ func (r *swarmDNSResolver) lookupCandidateIPs() ([]string, error) {
 	lookupCtx, cancel := context.WithTimeout(r.ctx, 1500*time.Millisecond)
 	defer cancel()
 
-	// If host is not already prefixed with "tasks." and is a service name (not IP/localhost),
-	// try "tasks.<host>" first to bypass VIP and get all task A-records in Swarm.
 	if !strings.HasPrefix(r.host, "tasks.") && r.host != "localhost" && net.ParseIP(r.host) == nil {
 		if ips, err := net.DefaultResolver.LookupHost(lookupCtx, "tasks."+r.host); err == nil && len(ips) > 0 {
 			return ips, nil
@@ -141,10 +149,6 @@ func (r *swarmDNSResolver) resolve() {
 		}
 	}
 
-	// Expire IPs that have been absent from DNS longer than retireGrace.
-	// Keeping recently-removed IPs for retireGrace prevents tearing down the client SubConn
-	// while in-flight RPCs complete during DRAIN_DELAY; meanwhile gRPC's Health.Watch
-	// immediately marks draining replicas NOT_SERVING so no NEW RPCs are sent to them.
 	for ip, lastSeen := range r.knownIPs {
 		if now.Sub(lastSeen) > r.retireGrace {
 			delete(r.knownIPs, ip)
@@ -165,14 +169,13 @@ func (r *swarmDNSResolver) resolve() {
 		for _, ip := range activeIPs {
 			addrs = append(addrs, resolver.Address{
 				Addr:       net.JoinHostPort(ip, r.port),
-				ServerName: r.host,
+				ServerName: r.tlsServerName,
 			})
 		}
 	} else {
-		// Fallback to raw host:port if DNS hasn't populated yet
 		addrs = []resolver.Address{{
 			Addr:       net.JoinHostPort(r.host, r.port),
-			ServerName: r.host,
+			ServerName: r.tlsServerName,
 		}}
 	}
 

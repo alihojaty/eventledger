@@ -6,8 +6,11 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,11 +28,13 @@ import (
 )
 
 const (
-	MaxBodyBytes         = 16 * 1024 // 16 KB
-	HeaderAPIKey         = "X-API-Key"
-	HeaderIdempotencyKey = "Idempotency-Key"
-	HeaderRequestID      = "X-Request-ID"
-	MetadataKeyRequestID = "x-request-id"
+	MaxBodyBytes           = 16 * 1024 // 16 KB
+	HeaderAPIKey           = "X-API-Key"
+	HeaderIdempotencyKey   = "Idempotency-Key"
+	HeaderRequestID        = "X-Request-ID"
+	MetadataKeyRequestID   = "x-request-id"
+	idemShards             = 32
+	maxIdemEntriesPerShard = 4096
 )
 
 type ErrorBody struct {
@@ -70,6 +75,54 @@ type GatewayStatsSnapshot struct {
 	GRPCRetries      uint64  `json:"grpc_retries"`
 }
 
+type idemShard struct {
+	mu      sync.Mutex
+	entries map[string]string
+}
+
+type idempotencyPayloadGuard struct {
+	shards [idemShards]idemShard
+}
+
+func newIdempotencyPayloadGuard() *idempotencyPayloadGuard {
+	g := &idempotencyPayloadGuard{}
+	for i := 0; i < idemShards; i++ {
+		g.shards[i].entries = make(map[string]string, 256)
+	}
+	return g
+}
+
+func (g *idempotencyPayloadGuard) checkOrRemember(eventID, fingerprint string) bool {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(eventID))
+	shard := &g.shards[h.Sum32()%idemShards]
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, ok := shard.entries[eventID]; ok {
+		return existing == fingerprint
+	}
+	if len(shard.entries) >= maxIdemEntriesPerShard {
+		for k := range shard.entries {
+			delete(shard.entries, k)
+			break
+		}
+	}
+	shard.entries[eventID] = fingerprint
+	return true
+}
+
+func (g *idempotencyPayloadGuard) forget(eventID string) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(eventID))
+	shard := &g.shards[h.Sum32()%idemShards]
+
+	shard.mu.Lock()
+	delete(shard.entries, eventID)
+	shard.mu.Unlock()
+}
+
 type GatewayOption func(*GatewayHandler)
 
 func WithRateLimiter(limiter *ratelimit.KeyRateLimiter) GatewayOption {
@@ -90,6 +143,7 @@ type GatewayHandler struct {
 	apiKey       string
 	reqTimeout   time.Duration
 	limiter      *ratelimit.KeyRateLimiter
+	idemGuard    *idempotencyPayloadGuard
 	mtlsEnabled  bool
 	logger       *zap.Logger
 
@@ -117,6 +171,7 @@ func NewGatewayHandler(
 		healthClient: healthClient,
 		apiKey:       apiKey,
 		reqTimeout:   reqTimeout,
+		idemGuard:    newIdempotencyPayloadGuard(),
 		logger:       logger,
 	}
 	for _, opt := range opts {
@@ -327,6 +382,13 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
+	fingerprint := fmt.Sprintf("%d:%s:%s", validatedEvent.UserID, validatedEvent.Currency, validatedEvent.Amount.String())
+	if !h.idemGuard.checkOrRemember(validatedEvent.EventID, fingerprint) {
+		h.badRequest400.Add(1)
+		respondError(c, http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", "Idempotency-Key was already used with different deposit parameters")
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), h.reqTimeout)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs(MetadataKeyRequestID, reqID))
@@ -341,8 +403,9 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	if err != nil {
 		httpStatus, code, msg := mapGRPCErrorToHTTP(err)
 		if httpStatus >= 500 {
+			h.idemGuard.forget(validatedEvent.EventID)
 			h.upstreamError5xx.Add(1)
-		} else if httpStatus == http.StatusBadRequest {
+		} else if httpStatus == http.StatusBadRequest || httpStatus == http.StatusConflict {
 			h.badRequest400.Add(1)
 		}
 		log.Warn("gRPC call to publisher failed",
@@ -386,6 +449,8 @@ func mapGRPCErrorToHTTP(err error) (int, string, string) {
 	switch st.Code() {
 	case codes.InvalidArgument:
 		return http.StatusBadRequest, "VALIDATION_ERROR", st.Message()
+	case codes.AlreadyExists:
+		return http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", st.Message()
 	case codes.DeadlineExceeded:
 		return http.StatusGatewayTimeout, "GATEWAY_TIMEOUT", "request timed out waiting for publisher"
 	case codes.Unavailable, codes.Canceled:

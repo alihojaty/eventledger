@@ -1,21 +1,28 @@
 package ratelimit
 
 import (
+	"hash/fnv"
 	"sync"
 	"time"
 )
+
+const numLimiterShards = 32
 
 type bucket struct {
 	tokens     float64
 	lastRefill time.Time
 }
 
-type KeyRateLimiter struct {
+type limiterShard struct {
 	mu          sync.Mutex
-	rps         float64
-	burst       float64
 	buckets     map[string]*bucket
 	lastCleanup time.Time
+}
+
+type KeyRateLimiter struct {
+	rps    float64
+	burst  float64
+	shards [numLimiterShards]limiterShard
 }
 
 func NewKeyRateLimiter(rps float64, burst int) *KeyRateLimiter {
@@ -25,12 +32,22 @@ func NewKeyRateLimiter(rps float64, burst int) *KeyRateLimiter {
 	if burst <= 0 {
 		burst = 100
 	}
-	return &KeyRateLimiter{
-		rps:         rps,
-		burst:       float64(burst),
-		buckets:     make(map[string]*bucket),
-		lastCleanup: time.Now(),
+	now := time.Now()
+	l := &KeyRateLimiter{
+		rps:   rps,
+		burst: float64(burst),
 	}
+	for i := 0; i < numLimiterShards; i++ {
+		l.shards[i].buckets = make(map[string]*bucket)
+		l.shards[i].lastCleanup = now
+	}
+	return l
+}
+
+func (l *KeyRateLimiter) shardFor(key string) *limiterShard {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return &l.shards[h.Sum32()%numLimiterShards]
 }
 
 func (l *KeyRateLimiter) Allow(apiKey string) bool {
@@ -39,23 +56,23 @@ func (l *KeyRateLimiter) Allow(apiKey string) bool {
 
 func (l *KeyRateLimiter) AllowWithCustomLimit(bucketKey string, rps, burst float64) bool {
 	now := time.Now()
+	shard := l.shardFor(bucketKey)
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	// پاک‌سازی دوره‌ای باکت‌های غیرفعال هر ۵ دقیقه برای جلوگیری از Memory Leak
-	if now.Sub(l.lastCleanup) > 5*time.Minute {
-		for k, v := range l.buckets {
+	if now.Sub(shard.lastCleanup) > 5*time.Minute {
+		for k, v := range shard.buckets {
 			if now.Sub(v.lastRefill) > 10*time.Minute {
-				delete(l.buckets, k)
+				delete(shard.buckets, k)
 			}
 		}
-		l.lastCleanup = now
+		shard.lastCleanup = now
 	}
 
-	b, exists := l.buckets[bucketKey]
+	b, exists := shard.buckets[bucketKey]
 	if !exists {
-		l.buckets[bucketKey] = &bucket{
+		shard.buckets[bucketKey] = &bucket{
 			tokens:     burst - 1,
 			lastRefill: now,
 		}

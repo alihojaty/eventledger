@@ -3,7 +3,7 @@ package generator
 import (
 	"context"
 	"encoding/json"
-	"math/rand"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +23,9 @@ type Publisher struct {
 }
 
 func NewPublisher(b broker.Broker, interval time.Duration, enabled bool, logger *zap.Logger) *Publisher {
+	if interval <= 0 {
+		interval = time.Second
+	}
 	p := &Publisher{
 		broker:   b,
 		interval: interval,
@@ -51,6 +54,7 @@ func (p *Publisher) SetEnabled(enable bool) {
 func (p *Publisher) StartControlListener(ctx context.Context, natsURL string) {
 	ctrlConn, err := nats.Connect(
 		natsURL,
+		nats.Name("reliable-deposit-publisher-control"),
 		nats.RetryOnFailedConnect(true),
 		nats.MaxReconnects(-1),
 		nats.ReconnectWait(2*time.Second),
@@ -60,7 +64,7 @@ func (p *Publisher) StartControlListener(ctx context.Context, natsURL string) {
 		return
 	}
 
-	_, _ = ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
+	sub, err := ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
 		var cmd struct {
 			PublishEnabled bool `json:"publish_enabled"`
 		}
@@ -68,9 +72,15 @@ func (p *Publisher) StartControlListener(ctx context.Context, natsURL string) {
 			p.SetEnabled(cmd.PublishEnabled)
 		}
 	})
+	if err != nil {
+		p.logger.Warn("Failed to subscribe to control.publisher subject", zap.Error(err))
+		ctrlConn.Close()
+		return
+	}
 
 	go func() {
 		<-ctx.Done()
+		_ = sub.Unsubscribe()
 		ctrlConn.Close()
 	}()
 }
@@ -147,18 +157,18 @@ func (p *Publisher) publishNextSimulatedEvent(ctx context.Context) {
 
 func (p *Publisher) generateValidEvent() domain.DepositEvent {
 	currencies := []string{domain.CurrencyUSDT, domain.CurrencyBTC, domain.CurrencyIRT}
-	currency := currencies[rand.Intn(len(currencies))]
-	userID := rand.Intn(domain.MaxUserID-domain.MinUserID+1) + domain.MinUserID
+	currency := currencies[rand.IntN(len(currencies))]
+	userID := rand.IntN(domain.MaxUserID-domain.MinUserID+1) + domain.MinUserID
 
 	var amount decimal.Decimal
 	switch currency {
 	case domain.CurrencyUSDT:
-		amount = decimal.NewFromInt(int64(rand.Intn(500) + 10)).Add(decimal.RequireFromString("0.50"))
+		amount = decimal.NewFromInt(int64(rand.IntN(500) + 10)).Add(decimal.RequireFromString("0.50"))
 	case domain.CurrencyBTC:
-		sats := rand.Intn(50) + 1
+		sats := rand.IntN(50) + 1
 		amount = decimal.NewFromInt(int64(sats)).Div(decimal.NewFromInt(1000))
 	case domain.CurrencyIRT:
-		amount = decimal.NewFromInt(int64(rand.Intn(10)+1) * 1_000_000)
+		amount = decimal.NewFromInt(int64(rand.IntN(10)+1) * 1_000_000)
 	}
 
 	return domain.DepositEvent{

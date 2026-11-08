@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"math/rand/v2"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -10,8 +12,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// RetryUnavailableInterceptor automatically retries unary RPCs that fail with codes.Unavailable.
-// Safe because PublishDeposit is strictly idempotent via event_id = Idempotency-Key.
+const maxRetryBackoff = 1 * time.Second
+
+// RetryUnavailableInterceptor automatically retries unary business RPCs that fail with codes.Unavailable.
+// Health probes (/grpc.health.v1.Health/*) are excluded so they fail fast and do not pollute retry metrics.
 func RetryUnavailableInterceptor(
 	maxAttempts int,
 	initialBackoff time.Duration,
@@ -33,6 +37,10 @@ func RetryUnavailableInterceptor(
 		invoker grpc.UnaryInvoker,
 		opts ...grpc.CallOption,
 	) error {
+		if strings.HasPrefix(method, "/grpc.health.v1.Health/") {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+
 		backoff := initialBackoff
 		var lastErr error
 
@@ -49,11 +57,15 @@ func RetryUnavailableInterceptor(
 			if onRetry != nil {
 				onRetry()
 			}
+
+			jitterMax := max(backoff/2, time.Millisecond)
+			sleepDur := backoff + time.Duration(rand.Int64N(int64(jitterMax)))
+
 			if logger != nil {
 				logger.Warn("Transient gRPC Unavailable error; retrying idempotent request",
 					zap.String("method", method),
 					zap.Int("attempt", attempt),
-					zap.Duration("backoff", backoff),
+					zap.Duration("backoff", sleepDur),
 					zap.Error(lastErr),
 				)
 			}
@@ -61,8 +73,11 @@ func RetryUnavailableInterceptor(
 			select {
 			case <-ctx.Done():
 				return status.FromContextError(ctx.Err()).Err()
-			case <-time.After(backoff):
+			case <-time.After(sleepDur):
 				backoff *= 2
+				if backoff > maxRetryBackoff {
+					backoff = maxRetryBackoff
+				}
 			}
 		}
 

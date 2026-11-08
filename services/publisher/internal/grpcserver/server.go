@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"hash/fnv"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
@@ -18,13 +21,23 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const MetadataKeyRequestID = "x-request-id"
+const (
+	MetadataKeyRequestID = "x-request-id"
+	pubIdemShards        = 32
+	pubMaxIdemPerShard   = 4096
+)
+
+type pubIdemShard struct {
+	mu      sync.Mutex
+	entries map[string]string
+}
 
 type Server struct {
 	depositv1.UnimplementedDepositPublisherServiceServer
-	broker broker.Broker
-	health *healthmgr.Manager
-	logger *zap.Logger
+	broker     broker.Broker
+	health     *healthmgr.Manager
+	logger     *zap.Logger
+	idemShards [pubIdemShards]pubIdemShard
 }
 
 func NewServer(b broker.Broker, logger *zap.Logger, hm ...*healthmgr.Manager) *Server {
@@ -32,11 +45,46 @@ func NewServer(b broker.Broker, logger *zap.Logger, hm ...*healthmgr.Manager) *S
 	if len(hm) > 0 {
 		h = hm[0]
 	}
-	return &Server{
+	s := &Server{
 		broker: b,
 		health: h,
 		logger: logger,
 	}
+	for i := 0; i < pubIdemShards; i++ {
+		s.idemShards[i].entries = make(map[string]string, 256)
+	}
+	return s
+}
+
+func (s *Server) checkOrRememberPayload(eventID, fingerprint string) bool {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(eventID))
+	shard := &s.idemShards[h.Sum32()%pubIdemShards]
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, ok := shard.entries[eventID]; ok {
+		return existing == fingerprint
+	}
+	if len(shard.entries) >= pubMaxIdemPerShard {
+		for k := range shard.entries {
+			delete(shard.entries, k)
+			break
+		}
+	}
+	shard.entries[eventID] = fingerprint
+	return true
+}
+
+func (s *Server) forgetPayload(eventID string) {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(eventID))
+	shard := &s.idemShards[h.Sum32()%pubIdemShards]
+
+	shard.mu.Lock()
+	delete(shard.entries, eventID)
+	shard.mu.Unlock()
 }
 
 func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
@@ -80,7 +128,6 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		createdAt = req.GetCreatedAt().AsTime()
 	}
 
-	// Zero-trust re-validation inside publisher using shared domain rules
 	event, err := domain.NewValidatedDepositEvent(
 		req.GetEventId(),
 		int(req.GetUserId()),
@@ -96,15 +143,24 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	fingerprint := fmt.Sprintf("%d:%s:%s", event.UserID, event.Currency, event.Amount.String())
+	if !s.checkOrRememberPayload(event.EventID, fingerprint) {
+		log.Warn("Rejected conflicting idempotency key with different deposit parameters",
+			zap.String("event_id", event.EventID),
+		)
+		return nil, status.Error(codes.AlreadyExists, "event_id was already used with different deposit parameters")
+	}
+
 	payload, err := json.Marshal(event)
 	if err != nil {
+		s.forgetPayload(event.EventID)
 		log.Error("Failed to marshal validated deposit event", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to serialize deposit event")
 	}
 
-	// Publish to NATS JetStream with Nats-Msg-Id = event_id and wait for PubAck
 	ack, err := s.broker.PublishDeposit(ctx, event.EventID, payload)
 	if err != nil {
+		s.forgetPayload(event.EventID)
 		log.Error("Failed to publish deposit event to NATS JetStream",
 			zap.String("event_id", event.EventID),
 			zap.Error(err),
