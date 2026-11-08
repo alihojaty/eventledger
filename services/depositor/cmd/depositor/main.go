@@ -103,7 +103,13 @@ func main() {
 		consumerGroup.RebindConsumer(newConsumer)
 	})
 
-	metrics.StartTelemetryReporter(sigCtx, cfg.NatsURL, cfg.WorkerCount, metricsCollector.GetSnapshot)
+	metrics.StartTelemetryReporter(
+		sigCtx,
+		cfg.NatsURL,
+		cfg.WorkerCount,
+		metricsCollector.GetSnapshot,
+		consumerGroup.ActiveWorkerCount,
+	)
 
 	termCtrl := worker.NewTerminalController(consumerGroup, os.Stdin, os.Stdout, log)
 	go termCtrl.Start(sigCtx)

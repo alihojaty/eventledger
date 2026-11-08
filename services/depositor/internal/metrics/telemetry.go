@@ -24,15 +24,22 @@ func StartTelemetryReporter(
 	natsURL string,
 	workerCount int,
 	getSnapshot func() Snapshot,
+	activeWorkersFn ...func() int,
 ) {
 	instanceID, err := os.Hostname()
 	if err != nil || instanceID == "" {
 		instanceID = "depositor-unknown"
 	}
 
+	var getActiveWorkers func() int
+	if len(activeWorkersFn) > 0 && activeWorkersFn[0] != nil {
+		getActiveWorkers = activeWorkersFn[0]
+	}
+
 	go func() {
 		nc, err := nats.Connect(
 			natsURL,
+			nats.Name("reliable-deposit-telemetry-"+instanceID),
 			nats.RetryOnFailedConnect(true),
 			nats.MaxReconnects(-1),
 			nats.ReconnectWait(2*time.Second),
@@ -76,9 +83,14 @@ func StartTelemetryReporter(
 				}
 				lastProcessed = proc
 
+				currentWorkers := workerCount
+				if getActiveWorkers != nil {
+					currentWorkers = getActiveWorkers()
+				}
+
 				payload := DepositorTelemetry{
 					InstanceID:      instanceID,
-					WorkerCount:     workerCount,
+					WorkerCount:     currentWorkers,
 					ProcessedTotal:  proc,
 					FailedTotal:     fail,
 					DuplicatesTotal: dup,

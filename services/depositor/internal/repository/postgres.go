@@ -186,20 +186,27 @@ func (r *PostgresRepository) GetTotalProcessedCount(ctx context.Context) (uint64
 
 func (r *PostgresRepository) GetRecentProcessedDeposits(ctx context.Context, limit int) ([]ProcessedDepositItem, error) {
 	const query = `
-		WITH numbered AS (
-			SELECT 
-				ROW_NUMBER() OVER (ORDER BY processed_at ASC, event_id ASC) AS order_num,
+		WITH recent AS (
+			SELECT
 				event_id,
 				user_id,
 				currency,
 				ROUND(amount, 4)::TEXT AS amount,
-				TO_CHAR(processed_at, 'HH24:MI:SS.MS') AS processed_at
+				TO_CHAR(processed_at, 'HH24:MI:SS.MS') AS processed_at,
+				processed_at AS raw_processed_at
 			FROM deposits
+			ORDER BY processed_at DESC, event_id DESC
+			LIMIT $1
 		)
-		SELECT order_num, event_id, user_id, currency, amount, processed_at
-		FROM numbered
-		ORDER BY order_num DESC
-		LIMIT $1
+		SELECT
+			ROW_NUMBER() OVER (ORDER BY raw_processed_at DESC, event_id DESC)::INT AS order_num,
+			event_id,
+			user_id,
+			currency,
+			amount,
+			processed_at
+		FROM recent
+		ORDER BY order_num ASC
 	`
 
 	rows, err := r.db.QueryContext(ctx, query, limit)

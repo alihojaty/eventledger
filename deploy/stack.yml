@@ -19,7 +19,22 @@ secrets:
 services:
   postgres:
     image: postgres:18-alpine
-    command: ["postgres", "-c", "synchronous_commit=off", "-c", "max_connections=300", "-c", "shared_buffers=256MB"]
+    command:
+      - "postgres"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "commit_delay=100"
+      - "-c"
+      - "commit_siblings=5"
+      - "-c"
+      - "max_connections=300"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "wal_buffers=16MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
     networks:
       - deposit_overlay
     volumes:

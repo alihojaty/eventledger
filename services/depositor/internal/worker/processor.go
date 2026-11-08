@@ -69,6 +69,9 @@ func NewProcessor(
 	if inFlightWg == nil {
 		inFlightWg = &sync.WaitGroup{}
 	}
+	if retryInterval <= 0 {
+		retryInterval = 5 * time.Second
+	}
 
 	return &Processor{
 		workCtx:       workCtx,
@@ -156,6 +159,10 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 		return
 	}
 
+	// Record processed metric immediately upon DB commit so redeliveries caused by
+	// a subsequent NATS ACK network blip do not lose the processed counter.
+	p.metrics.IncProcessed()
+
 	if err := msg.Ack(); err != nil {
 		p.logger.Error("Failed to ACK processed message",
 			zap.Int("worker_id", workerID),
@@ -165,7 +172,6 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 		return
 	}
 
-	p.metrics.IncProcessed()
 	p.logger.Info("Message processed",
 		zap.Int("worker_id", workerID),
 		zap.String("event_id", event.EventID),

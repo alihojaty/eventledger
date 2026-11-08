@@ -72,7 +72,6 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 	cg.consumer = newConsumer
 	for id, oldCtx := range cg.members {
 		workerID := id
-		oldCtx.Stop()
 		consumeCtx, err := cg.consumer.Consume(
 			func(msg jetstream.Msg) {
 				cg.processor.HandleMessage(workerID, msg)
@@ -86,6 +85,7 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 			)
 			continue
 		}
+		oldCtx.Stop()
 		cg.members[workerID] = consumeCtx
 		cg.logger.Info("Worker rebound to NATS consumer after reconnect", zap.Int("worker_id", workerID))
 	}
@@ -128,6 +128,12 @@ func (cg *ConsumerGroup) DrainAll() {
 
 func (cg *ConsumerGroup) WorkerCount() int {
 	return cg.workerCount
+}
+
+func (cg *ConsumerGroup) ActiveWorkerCount() int {
+	cg.mu.Lock()
+	defer cg.mu.Unlock()
+	return len(cg.members)
 }
 
 func (cg *ConsumerGroup) StatusMap() map[int]bool {
