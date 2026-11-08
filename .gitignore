@@ -1,26 +1,23 @@
-# Binaries
+# Binaries and build artifacts
 bin/
 dist/
 *.exe
 *.out
-*.test
-/processor
-/depositor
-/publisher
+coverage.out
 
-# Environment variables
-.env
-.env.local
-.env.*.local
+# Go workspace vendor directory (generated in CI via `go work vendor`)
+vendor/
+
+# Local secrets and certificates
+.secrets/
+*.pem
+*.key
+*.crt
+
+# Runtime & loadgen logs
+*.log
 
 # IDE & OS files
 .idea/
 .vscode/
 .DS_Store
-*.swp
-
-# Coverage
-coverage.out
-vendor/
-**/vendor/
-project_all.txt

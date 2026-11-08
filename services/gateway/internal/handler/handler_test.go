@@ -76,7 +76,7 @@ func setupBufconnGateway(
 }
 
 func TestGateway_ValidDeposit_Returns202(t *testing.T) {
-	router := setupBufconnGateway(t, func(_ context.Context, req *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
+	router := setupBufconnGateway(t, func(_ context.Context, _ *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
 		return &depositv1.PublishDepositResponse{StreamSequence: 101, Duplicate: false}, nil
 	})
 
@@ -99,6 +99,45 @@ func TestGateway_ValidDeposit_Returns202(t *testing.T) {
 	}
 	if resp.EventID != "idem-key-001" || resp.StreamSequence != 101 || resp.Duplicate {
 		t.Errorf("unexpected response payload: %+v", resp)
+	}
+}
+
+func TestGateway_IdempotencyKeyConflict_409(t *testing.T) {
+	router := setupBufconnGateway(t, func(_ context.Context, _ *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
+		return &depositv1.PublishDepositResponse{StreamSequence: 102, Duplicate: false}, nil
+	})
+
+	// 1. First request with idem-conflict-1 -> 202 Accepted
+	body1 := `{"user_id": 7, "currency": "USDT", "amount": "100.00"}`
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/deposits", strings.NewReader(body1))
+	req1.Header.Set(HeaderAPIKey, "secret-test-key")
+	req1.Header.Set(HeaderIdempotencyKey, "idem-conflict-1")
+	w1 := httptest.NewRecorder()
+	router.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 on first request, got %d", w1.Code)
+	}
+
+	// 2. Retry with identical payload -> 202 Accepted
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/deposits", strings.NewReader(body1))
+	req2.Header.Set(HeaderAPIKey, "secret-test-key")
+	req2.Header.Set(HeaderIdempotencyKey, "idem-conflict-1")
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 on identical retry, got %d", w2.Code)
+	}
+
+	// 3. Reuse same Idempotency-Key with different amount -> 409 Conflict
+	bodyDiff := `{"user_id": 7, "currency": "USDT", "amount": "999.00"}`
+	req3 := httptest.NewRequest(http.MethodPost, "/v1/deposits", strings.NewReader(bodyDiff))
+	req3.Header.Set(HeaderAPIKey, "secret-test-key")
+	req3.Header.Set(HeaderIdempotencyKey, "idem-conflict-1")
+	w3 := httptest.NewRecorder()
+	router.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when reusing Idempotency-Key with different amount, got %d: %s",
+			w3.Code, w3.Body.String())
 	}
 }
 
@@ -167,7 +206,6 @@ func TestGateway_ValidationErrors_400(t *testing.T) {
 }
 
 func TestGateway_GRPCErrorMapping_503And504(t *testing.T) {
-	// Test Unavailable -> 503
 	router503 := setupBufconnGateway(t, func(_ context.Context, _ *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
 		return nil, status.Error(codes.Unavailable, "nats down")
 	})
@@ -183,7 +221,6 @@ func TestGateway_GRPCErrorMapping_503And504(t *testing.T) {
 		t.Fatalf("expected 503 Service Unavailable, got %d", w1.Code)
 	}
 
-	// Test DeadlineExceeded -> 504
 	router504 := setupBufconnGateway(t, func(_ context.Context, _ *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
 		return nil, status.Error(codes.DeadlineExceeded, "timeout")
 	})

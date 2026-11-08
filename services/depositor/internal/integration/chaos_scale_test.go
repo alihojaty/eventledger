@@ -261,10 +261,14 @@ func TestChaos_NATSConnectionKilledAfterDBCommit_NoDoubleSpend(t *testing.T) {
 	}
 }
 
+const shardRingCapacity = 4096
+
 type highSpeedShardedRepo struct {
 	shards [32]struct {
 		mu      sync.Mutex
 		seenIDs map[string]struct{}
+		ring    [shardRingCapacity]string
+		cursor  int
 	}
 	balancesMu sync.Mutex
 	balances   map[string]decimal.Decimal
@@ -275,7 +279,7 @@ func newHighSpeedShardedRepo() *highSpeedShardedRepo {
 		balances: make(map[string]decimal.Decimal),
 	}
 	for i := 0; i < 32; i++ {
-		r.shards[i].seenIDs = make(map[string]struct{}, 35000)
+		r.shards[i].seenIDs = make(map[string]struct{}, shardRingCapacity)
 	}
 	return r
 }
@@ -289,6 +293,11 @@ func (r *highSpeedShardedRepo) ProcessDeposit(_ context.Context, event *domain.D
 		shard.mu.Unlock()
 		return domain.ErrDuplicateEvent
 	}
+	if oldID := shard.ring[shard.cursor]; oldID != "" {
+		delete(shard.seenIDs, oldID)
+	}
+	shard.ring[shard.cursor] = event.EventID
+	shard.cursor = (shard.cursor + 1) % shardRingCapacity
 	shard.seenIDs[event.EventID] = struct{}{}
 	shard.mu.Unlock()
 
@@ -337,6 +346,7 @@ func (m rawSliceMsg) NakWithDelay(_ time.Duration) error { return nil }
 func TestScale_1MillionEvents_StreamingPipelineAndMemoryBound(t *testing.T) {
 	const totalEvents = 5_000_000
 	const workerGoroutines = 32
+	const maxAllowedHeapGrowthMB = 64.0
 
 	repo := newHighSpeedShardedRepo()
 	collector := metrics.NewCollector()
@@ -414,6 +424,20 @@ func TestScale_1MillionEvents_StreamingPipelineAndMemoryBound(t *testing.T) {
 
 	elapsed := time.Since(startTime)
 
+	runtime.GC()
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+
+	var heapGrowthBytes uint64
+	if memAfter.HeapAlloc > memBefore.HeapAlloc {
+		heapGrowthBytes = memAfter.HeapAlloc - memBefore.HeapAlloc
+	}
+	heapGrowthMB := float64(heapGrowthBytes) / (1024 * 1024)
+	if heapGrowthMB > maxAllowedHeapGrowthMB {
+		t.Fatalf("MEMORY BOUND VIOLATED! Heap grew by %.2f MB (max allowed %.2f MB)",
+			heapGrowthMB, maxAllowedHeapGrowthMB)
+	}
+
 	snap := collector.GetSnapshot()
 	if snap.MessagesReceived != totalEvents {
 		t.Fatalf("expected %d received messages, got %d", totalEvents, snap.MessagesReceived)
@@ -441,8 +465,8 @@ func TestScale_1MillionEvents_StreamingPipelineAndMemoryBound(t *testing.T) {
 	}
 
 	throughput := float64(totalEvents) / elapsed.Seconds()
-	t.Logf("MILLION-SCALE SUCCESS: Processed %d events in %v (%.0f events/sec) | Total Valid Balance: %s USDT",
-		totalEvents, elapsed.Round(time.Millisecond), throughput, totalSystemBalance.String())
+	t.Logf("MILLION-SCALE SUCCESS: Processed %d events in %v (%.0f events/sec) | Heap Delta: %.2f MB | Total Valid Balance: %s USDT",
+		totalEvents, elapsed.Round(time.Millisecond), throughput, heapGrowthMB, totalSystemBalance.String())
 }
 
 func TestScale_EndToEnd_HighVolume_PostgresAndNATS(t *testing.T) {

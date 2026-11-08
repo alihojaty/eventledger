@@ -9,12 +9,19 @@ before_script:
 unit_tests:
   stage: test
   script:
-    - echo "Running Go Tests..."
-    - cd pkg && go test -v -race ./... && cd ..
+    - echo "Running Go Unit Tests with Race Detector across all workspace modules..."
+    - cd pkg && go test -v -race -coverprofile=coverage.out ./... && cd ..
     - cd services/gateway && go test -v -race -coverprofile=coverage.out ./... && cd ../..
+    - cd services/publisher && go test -v -race -coverprofile=coverage.out ./internal/generator ./internal/healthmgr && cd ../..
+    - cd services/depositor && go test -v -race -coverprofile=coverage.out ./internal/worker && cd ../..
+    - cd services/dashboard && go test -v -race -coverprofile=coverage.out ./... && cd ../..
   artifacts:
     paths:
+      - pkg/coverage.out
       - services/gateway/coverage.out
+      - services/publisher/coverage.out
+      - services/depositor/coverage.out
+      - services/dashboard/coverage.out
     expire_in: 1 hour
 
 sonarqube_check:
