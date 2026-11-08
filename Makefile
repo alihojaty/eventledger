@@ -17,6 +17,7 @@ build:
 	go build -o bin/depositor ./services/depositor/cmd/depositor
 	go build -o bin/publisher ./services/publisher/cmd/publisher
 	go build -o bin/gateway ./services/gateway/cmd/gateway
+	go build -o bin/dashboard ./services/dashboard/cmd/dashboard
 
 proto:
 	@echo "==> Generating Protobuf code..."
@@ -95,27 +96,26 @@ test:
 lint:
 	@echo "==> Vet & Linting all modules..."
 	@for mod in $(MODULES); do \
-	   echo "--- Vetting $$mod ---"; \
-	   (cd $$mod && go vet ./...) || exit 1; \
+	  echo "--- Vetting $$mod ---"; \
+	  (cd $$mod && go vet ./...) || exit 1; \
 	done
 	@if command -v golangci-lint >/dev/null 2>&1; then \
-	   for mod in $(MODULES); do \
-	      if [ "$$mod" = "./pkg" ]; then continue; fi; \
-	      echo "--- Linting $$mod ---"; \
-	      (cd $$mod && golangci-lint run --modules-download-mode=vendor ./...) || exit 1; \
-	   done; \
-	   echo "==> All linters passed successfully!"; \
+	  for mod in $(MODULES); do \
+	    echo "--- Linting $$mod ---"; \
+	    (cd $$mod && golangci-lint run --modules-download-mode=vendor ./...) || exit 1; \
+	  done; \
+	  echo "==> All linters passed successfully!"; \
 	fi
 
 tidy:
 	@for mod in $(MODULES); do \
-	   (cd $$mod && go mod tidy) || exit 1; \
+	  (cd $$mod && go mod tidy) || exit 1; \
 	done
 	go work sync
 	go work vendor
 	@for mod in $(MODULES); do \
-	   rm -rf $$mod/vendor; \
-	   ln -s ../vendor $$mod/vendor; \
+	  rm -rf $$mod/vendor; \
+	  ln -s "$(CURDIR)/vendor" $$mod/vendor; \
 	done
 
 up:

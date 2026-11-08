@@ -1,6 +1,20 @@
 services:
   postgres:
     image: postgres:18-alpine
+    command:
+      - "postgres"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "commit_delay=100"
+      - "-c"
+      - "commit_siblings=5"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "wal_buffers=32MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -61,12 +75,14 @@ services:
     depends_on:
       nats:
         condition: service_healthy
-    stop_grace_period: 15s
+    stop_grace_period: 25s
     environment:
       NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
       PUBLISH_ENABLED: ${PUBLISH_ENABLED:-false}
       PUBLISH_INTERVAL: ${PUBLISH_INTERVAL:-1s}
       PUBLISHER_GRPC_PORT: 50051
+      PUBLISHER_HEALTH_PORT: 8090
+      DRAIN_DELAY: ${DRAIN_DELAY:-6s}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     restart: unless-stopped

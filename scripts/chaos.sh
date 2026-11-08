@@ -33,6 +33,13 @@ random_scale_publisher() {
 
 kill_one_publisher() {
     local label="$1"
+    local running_count
+    running_count="$(docker ps -qf "name=${PUB_SERVICE}" | wc -l | tr -d ' ')"
+    if (( running_count < 2 )); then
+        log_event "PRE_KILL_SCALE ensuring at least 2 publisher replicas before SIGKILL (${label})"
+        docker service scale "${PUB_SERVICE}=2" >/dev/null
+        sleep 5
+    fi
     local cid
     cid="$(docker ps -qf "name=${PUB_SERVICE}" | head -n 1)"
     if [[ -n "$cid" ]]; then

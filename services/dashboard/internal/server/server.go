@@ -16,8 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -142,7 +142,10 @@ type DashboardServer struct {
 }
 
 func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardServer {
-	js, _ := jetstream.New(nc)
+	var js jetstream.JetStream
+	if nc != nil {
+		js, _ = jetstream.New(nc)
+	}
 	gwURL := "http://localhost:8081"
 	key := ""
 	if len(extra) > 0 && extra[0] != "" {
@@ -580,7 +583,7 @@ func validateReplayPayload(rawPayload string) (string, []byte, error) {
 		return "", nil, fmt.Errorf("payload cannot be empty")
 	}
 
-	var event struct {
+	var raw struct {
 		EventID   string          `json:"event_id"`
 		UserID    int             `json:"user_id"`
 		Currency  string          `json:"currency"`
@@ -590,46 +593,38 @@ func validateReplayPayload(rawPayload string) (string, []byte, error) {
 
 	dec := json.NewDecoder(strings.NewReader(trimmed))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&event); err != nil {
+	if err := dec.Decode(&raw); err != nil {
 		return "", nil, fmt.Errorf("malformed JSON or unknown fields: %w", err)
 	}
 	if dec.More() || dec.Decode(&struct{}{}) != io.EOF {
 		return "", nil, fmt.Errorf("unexpected trailing data after JSON object")
 	}
 
-	eventID := strings.TrimSpace(event.EventID)
-	if eventID == "" || len(eventID) > 128 {
-		return "", nil, fmt.Errorf("event_id must be between 1 and 128 characters")
-	}
-	for _, r := range eventID {
-		if unicode.IsSpace(r) || r < 33 || r > 126 {
-			return "", nil, fmt.Errorf("event_id must contain only printable ASCII characters without spaces")
-		}
-	}
-
-	if event.UserID < 1 || event.UserID > 20 {
-		return "", nil, fmt.Errorf("user_id must be between 1 and 20")
-	}
-
-	switch event.Currency {
-	case "USDT", "BTC", "IRT":
-	default:
-		return "", nil, fmt.Errorf("unsupported currency %q (must be USDT, BTC, or IRT)", event.Currency)
-	}
-
 	var amountStr string
-	if err := json.Unmarshal(event.Amount, &amountStr); err != nil {
+	if err := json.Unmarshal(raw.Amount, &amountStr); err != nil {
 		return "", nil, fmt.Errorf("amount must be a JSON string")
 	}
-	if err := validatePositiveDecimalString(amountStr); err != nil {
-		return "", nil, err
+
+	var createdAt time.Time
+	if strings.TrimSpace(raw.CreatedAt) == "" {
+		createdAt = time.Now().UTC()
+	} else {
+		parsedTime, err := time.Parse(time.RFC3339, strings.TrimSpace(raw.CreatedAt))
+		if err != nil {
+			return "", nil, fmt.Errorf("created_at must be a valid RFC3339 timestamp")
+		}
+		createdAt = parsedTime.UTC()
 	}
 
-	createdAt := strings.TrimSpace(event.CreatedAt)
-	if createdAt == "" {
-		createdAt = time.Now().UTC().Format(time.RFC3339)
-	} else if _, err := time.Parse(time.RFC3339, createdAt); err != nil {
-		return "", nil, fmt.Errorf("created_at must be a valid RFC3339 timestamp")
+	validated, err := domain.NewValidatedDepositEvent(
+		strings.TrimSpace(raw.EventID),
+		raw.UserID,
+		raw.Currency,
+		amountStr,
+		createdAt,
+	)
+	if err != nil {
+		return "", nil, err
 	}
 
 	normalized, err := json.Marshal(struct {
@@ -639,53 +634,17 @@ func validateReplayPayload(rawPayload string) (string, []byte, error) {
 		Amount    string `json:"amount"`
 		CreatedAt string `json:"created_at"`
 	}{
-		EventID:   eventID,
-		UserID:    event.UserID,
-		Currency:  event.Currency,
-		Amount:    strings.TrimSpace(amountStr),
-		CreatedAt: createdAt,
+		EventID:   validated.EventID,
+		UserID:    validated.UserID,
+		Currency:  validated.Currency,
+		Amount:    validated.Amount.String(),
+		CreatedAt: validated.CreatedAt.Format(time.RFC3339),
 	})
 	if err != nil {
 		return "", nil, err
 	}
 
-	return eventID, normalized, nil
-}
-
-func validatePositiveDecimalString(s string) error {
-	s = strings.TrimSpace(s)
-	if s == "" || strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
-		return fmt.Errorf("amount must be a positive decimal string")
-	}
-	parts := strings.Split(s, ".")
-	if len(parts) > 2 {
-		return fmt.Errorf("amount is not a valid decimal number")
-	}
-	intPart := parts[0]
-	fracPart := ""
-	if len(parts) == 2 {
-		fracPart = parts[1]
-	}
-	if intPart == "" || len(intPart) > 18 {
-		return fmt.Errorf("amount integer part must be between 1 and 18 digits")
-	}
-	if len(parts) == 2 && (fracPart == "" || len(fracPart) > 18) {
-		return fmt.Errorf("amount fractional part cannot exceed 18 decimal places")
-	}
-
-	nonZero := false
-	for _, ch := range intPart + fracPart {
-		if ch < '0' || ch > '9' {
-			return fmt.Errorf("amount must contain only digits")
-		}
-		if ch != '0' {
-			nonZero = true
-		}
-	}
-	if !nonZero {
-		return fmt.Errorf("amount must be greater than zero")
-	}
-	return nil
+	return validated.EventID, normalized, nil
 }
 
 func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request) {

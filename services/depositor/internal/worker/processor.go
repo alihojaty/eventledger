@@ -120,6 +120,15 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 
 	err = p.repo.ProcessDeposit(dbCtx, event)
 	if err != nil {
+		// اگر کانتکست به دلیل اتمام مهلت SHUTDOWN_TIMEOUT لغو شده است، نه Ack بفرست و نه Nak
+		if p.workCtx.Err() != nil {
+			p.logger.Warn("Skipping ACK/NAK because shutdown timeout expired",
+				zap.Int("worker_id", workerID),
+				zap.String("event_id", event.EventID),
+			)
+			return
+		}
+
 		if errors.Is(err, domain.ErrDuplicateEvent) {
 			p.metrics.IncDuplicate()
 			p.logger.Warn("Duplicate message detected",
@@ -156,6 +165,15 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 				zap.Error(nakErr),
 			)
 		}
+		return
+	}
+
+	// اگر در حین Commit مهلت SHUTDOWN_TIMEOUT تمام شده باشد، طبق تسک ۳ نباید ACK ارسال شود
+	if p.workCtx.Err() != nil {
+		p.logger.Warn("Shutdown timeout expired before ACK; leaving message unacknowledged for redelivery",
+			zap.Int("worker_id", workerID),
+			zap.String("event_id", event.EventID),
+		)
 		return
 	}
 

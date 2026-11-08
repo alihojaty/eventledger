@@ -60,7 +60,7 @@ func ValidateEventID(eventID string) error {
 		return fmt.Errorf("event_id length must be between %d and %d characters", MinEventIDLen, MaxEventIDLen)
 	}
 	if !eventIDRegex.MatchString(eventID) {
-		return fmt.Errorf("event_id contains invalid characters; allowed: a-z, A-Z, 0-9, and -_:.")
+		return fmt.Errorf("event_id contains invalid characters (must be alphanumeric or -_.)")
 	}
 	return nil
 }
