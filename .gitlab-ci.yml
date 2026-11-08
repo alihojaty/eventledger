@@ -5,6 +5,13 @@ stages:
 
 before_script:
   - export PATH=$PATH:/usr/local/go/bin:~/go/bin
+  - docker compose -f deploy/docker-compose.yml up -d postgres nats
+  - sleep 3
+
+test_job:
+  stage: test
+  script:
+    - make test
 
 unit_tests:
   stage: test
@@ -28,12 +35,7 @@ sonarqube_check:
   stage: quality
   needs: ["unit_tests"]
   script:
-    - docker run --rm
-      --network host
-      -e SONAR_HOST_URL="http://localhost:9000"
-      -e SONAR_TOKEN="${SONAR_TOKEN}"
-      -v "$(pwd):/usr/src"
-      sonarsource/sonar-scanner-cli
+    - docker run --rm --network host -e SONAR_HOST_URL="http://localhost:9000" -e SONAR_TOKEN="${SONAR_TOKEN}" -v "$(pwd):/usr/src" sonarsource/sonar-scanner-cli
 
 build_services:
   stage: build
