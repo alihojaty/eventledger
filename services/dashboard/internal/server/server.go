@@ -1,17 +1,22 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -21,6 +26,7 @@ const (
 	streamDeposits       = "DEPOSITS"
 	subjectDepositEvents = "deposits.events"
 	streamDepositsDLQ    = "DEPOSITS_DLQ"
+	maxDashboardBodySize = 32 * 1024 // 32 KB
 )
 
 type DepositorTelemetry struct {
@@ -126,6 +132,13 @@ type DashboardServer struct {
 	apiKey         string
 	httpClient     *http.Client
 	publishEnabled atomic.Bool
+	loadgenRunning atomic.Bool
+
+	reconMu       sync.Mutex
+	cachedRecon   LedgerReconciliationReport
+	cachedDBCount int64
+	lastReconAt   time.Time
+	lastReconProc uint64
 }
 
 func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardServer {
@@ -151,6 +164,14 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 		gatewayURL: strings.TrimRight(gwURL, "/"),
 		apiKey:     key,
 		httpClient: &http.Client{Timeout: 3 * time.Second},
+		cachedRecon: LedgerReconciliationReport{
+			IsBalanced:      true,
+			TotalLedgerUSDT: "0",
+			TotalLedgerBTC:  "0",
+			TotalLedgerIRT:  "0",
+			CheckedAt:       time.Now().Format("15:04:05"),
+			Discrepancies:   []LedgerDiscrepancyItem{},
+		},
 	}
 	initialPub := strings.EqualFold(os.Getenv("PUBLISH_ENABLED"), "true")
 	s.publishEnabled.Store(initialPub)
@@ -160,11 +181,40 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 func (s *DashboardServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", s.handleUI)
 	mux.HandleFunc("/api/stats", s.handleStats)
-	mux.HandleFunc("/api/publisher/toggle", s.handleTogglePublisher)
-	mux.HandleFunc("/api/dlq/replay", s.handleReplayDLQ)
-	mux.HandleFunc("/api/dlq/inject", s.handleInjectInvalidEvent)
-	mux.HandleFunc("/api/gateway/send", s.handleGatewaySendSingle)
-	mux.HandleFunc("/api/gateway/loadgen", s.handleGatewayLoadGen)
+	mux.HandleFunc("/api/publisher/toggle", s.guardPost(s.handleTogglePublisher))
+	mux.HandleFunc("/api/dlq/replay", s.guardPost(s.handleReplayDLQ))
+	mux.HandleFunc("/api/dlq/inject", s.guardPost(s.handleInjectInvalidEvent))
+	mux.HandleFunc("/api/gateway/send", s.guardPost(s.handleGatewaySendSingle))
+	mux.HandleFunc("/api/gateway/loadgen", s.guardPost(s.handleGatewayLoadGen))
+}
+
+func (s *DashboardServer) guardPost(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+				http.Error(w, "cross-origin request forbidden", http.StatusForbidden)
+				return
+			}
+		}
+		if providedKey := r.Header.Get("X-API-Key"); providedKey != "" && s.apiKey != "" {
+			if subtle.ConstantTimeCompare([]byte(providedKey), []byte(s.apiKey)) != 1 {
+				http.Error(w, "invalid X-API-Key", http.StatusUnauthorized)
+				return
+			}
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodySize)
+		next(w, r)
+	}
+}
+
+func (s *DashboardServer) invalidateReconCache() {
+	s.reconMu.Lock()
+	s.lastReconAt = time.Time{}
+	s.reconMu.Unlock()
 }
 
 func (s *DashboardServer) StartNATSListener(ctx context.Context) error {
@@ -262,12 +312,21 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.db != nil {
-		_ = s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM deposits").Scan(&dbCount)
-
 		rows, err := s.db.QueryContext(r.Context(), `
-          SELECT ROW_NUMBER() OVER (ORDER BY processed_at DESC) as rn, event_id, user_id, currency, ROUND(amount, 8)::TEXT, TO_CHAR(processed_at, 'YYYY-MM-DD HH24:MI:SS') 
-          FROM deposits ORDER BY processed_at DESC LIMIT 15
-       `)
+			SELECT
+				ROW_NUMBER() OVER (ORDER BY sub.processed_at DESC, sub.event_id DESC) AS rn,
+				sub.event_id,
+				sub.user_id,
+				sub.currency,
+				ROUND(sub.amount, 8)::TEXT,
+				TO_CHAR(sub.processed_at, 'YYYY-MM-DD HH24:MI:SS')
+			FROM (
+				SELECT event_id, user_id, currency, amount, processed_at
+				FROM deposits
+				ORDER BY processed_at DESC
+				LIMIT 15
+			) sub
+		`)
 		if err == nil {
 			defer func() { _ = rows.Close() }()
 			for rows.Next() {
@@ -278,13 +337,15 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 
 		balRows, err := s.db.QueryContext(r.Context(), `
-          SELECT user_id, 
-                 COALESCE(MAX(CASE WHEN currency='USDT' THEN balance END), 0)::TEXT,
-                 COALESCE(MAX(CASE WHEN currency='BTC' THEN balance END), 0)::TEXT,
-                 COALESCE(MAX(CASE WHEN currency='IRT' THEN balance END), 0)::TEXT,
-                 TO_CHAR(MAX(updated_at), 'HH24:MI:SS')
-          FROM balances GROUP BY user_id ORDER BY user_id ASC
-       `)
+			SELECT user_id,
+			       COALESCE(MAX(CASE WHEN currency='USDT' THEN balance END), 0)::TEXT,
+			       COALESCE(MAX(CASE WHEN currency='BTC' THEN balance END), 0)::TEXT,
+			       COALESCE(MAX(CASE WHEN currency='IRT' THEN balance END), 0)::TEXT,
+			       TO_CHAR(MAX(updated_at), 'HH24:MI:SS')
+			FROM balances
+			GROUP BY user_id
+			ORDER BY user_id ASC
+		`)
 		if err == nil {
 			defer func() { _ = balRows.Close() }()
 			for balRows.Next() {
@@ -294,7 +355,10 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		reconReport = s.runLedgerReconciliation(r.Context())
+		dbCount, reconReport = s.getReconciliationAndCount(r.Context(), globalProc)
+		if dbCount > 0 && uint64(dbCount) > globalProc {
+			globalProc = uint64(dbCount)
+		}
 	}
 
 	dlqTotal, dlqItems := s.fetchDLQMessages(r.Context(), 15)
@@ -330,7 +394,29 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *DashboardServer) runLedgerReconciliation(ctx context.Context) LedgerReconciliationReport {
+func (s *DashboardServer) getReconciliationAndCount(ctx context.Context, currentGlobalProc uint64) (int64, LedgerReconciliationReport) {
+	s.reconMu.Lock()
+	defer s.reconMu.Unlock()
+
+	if !s.lastReconAt.IsZero() {
+		elapsed := time.Since(s.lastReconAt)
+		if currentGlobalProc == s.lastReconProc && elapsed < 3*time.Second {
+			return s.cachedDBCount, s.cachedRecon
+		}
+		if s.cachedDBCount >= 50_000 && elapsed < 2*time.Second {
+			return s.cachedDBCount, s.cachedRecon
+		}
+	}
+
+	dbCount, report := s.runLedgerReconciliationSinglePass(ctx)
+	s.cachedDBCount = dbCount
+	s.cachedRecon = report
+	s.lastReconAt = time.Now()
+	s.lastReconProc = currentGlobalProc
+	return dbCount, report
+}
+
+func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context) (int64, LedgerReconciliationReport) {
 	report := LedgerReconciliationReport{
 		IsBalanced:      true,
 		TotalLedgerUSDT: "0",
@@ -339,50 +425,93 @@ func (s *DashboardServer) runLedgerReconciliation(ctx context.Context) LedgerRec
 		CheckedAt:       time.Now().Format("15:04:05"),
 		Discrepancies:   []LedgerDiscrepancyItem{},
 	}
+	var totalCount int64
 
-	_ = s.db.QueryRowContext(ctx, `
-       SELECT 
-          COALESCE(SUM(CASE WHEN currency='USDT' THEN amount END), 0)::TEXT,
-          COALESCE(SUM(CASE WHEN currency='BTC'  THEN amount END), 0)::TEXT,
-          COALESCE(SUM(CASE WHEN currency='IRT'  THEN amount END), 0)::TEXT
-       FROM deposits
-    `).Scan(&report.TotalLedgerUSDT, &report.TotalLedgerBTC, &report.TotalLedgerIRT)
+	const unifiedReconQuery = `
+		WITH expected AS (
+			SELECT
+				user_id,
+				currency,
+				COUNT(*) AS tx_count,
+				SUM(amount) AS expected_amount
+			FROM deposits
+			GROUP BY user_id, currency
+		),
+		summary AS (
+			SELECT
+				COALESCE(SUM(tx_count), 0)::BIGINT AS total_count,
+				COALESCE(SUM(CASE WHEN currency = 'USDT' THEN expected_amount END), 0)::TEXT AS total_usdt,
+				COALESCE(SUM(CASE WHEN currency = 'BTC'  THEN expected_amount END), 0)::TEXT AS total_btc,
+				COALESCE(SUM(CASE WHEN currency = 'IRT'  THEN expected_amount END), 0)::TEXT AS total_irt
+			FROM expected
+		),
+		discrepancies AS (
+			SELECT
+				COALESCE(e.user_id, b.user_id) AS user_id,
+				COALESCE(e.currency, b.currency) AS currency,
+				COALESCE(e.expected_amount, 0)::TEXT AS expected_balance,
+				COALESCE(b.balance, 0)::TEXT AS actual_balance,
+				(COALESCE(b.balance, 0) - COALESCE(e.expected_amount, 0))::TEXT AS difference
+			FROM expected e
+			FULL OUTER JOIN balances b
+				ON b.user_id = e.user_id AND b.currency = e.currency
+			WHERE COALESCE(e.expected_amount, 0) IS DISTINCT FROM COALESCE(b.balance, 0)
+			ORDER BY user_id ASC, currency ASC
+		)
+		SELECT
+			s.total_count,
+			s.total_usdt,
+			s.total_btc,
+			s.total_irt,
+			d.user_id,
+			d.currency,
+			d.expected_balance,
+			d.actual_balance,
+			d.difference
+		FROM summary s
+		LEFT JOIN discrepancies d ON TRUE
+	`
 
-	const reconQuery = `
-       WITH expected AS (
-          SELECT user_id, currency, SUM(amount) AS expected_amount
-          FROM deposits
-          GROUP BY user_id, currency
-       )
-       SELECT
-          COALESCE(e.user_id, b.user_id) AS user_id,
-          COALESCE(e.currency, b.currency) AS currency,
-          COALESCE(e.expected_amount, 0)::TEXT AS expected_balance,
-          COALESCE(b.balance, 0)::TEXT AS actual_balance,
-          (COALESCE(b.balance, 0) - COALESCE(e.expected_amount, 0))::TEXT AS difference
-       FROM expected e
-       FULL OUTER JOIN balances b
-          ON b.user_id = e.user_id AND b.currency = e.currency
-       WHERE COALESCE(e.expected_amount, 0) IS DISTINCT FROM COALESCE(b.balance, 0)
-       ORDER BY user_id ASC, currency ASC
-    `
-
-	rows, err := s.db.QueryContext(ctx, reconQuery)
+	rows, err := s.db.QueryContext(ctx, unifiedReconQuery)
 	if err != nil {
-		return report
+		return 0, report
 	}
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		var item LedgerDiscrepancyItem
-		if err := rows.Scan(&item.UserID, &item.Currency, &item.ExpectedBalance, &item.ActualBalance, &item.Difference); err == nil {
-			report.Discrepancies = append(report.Discrepancies, item)
+		var (
+			uid    sql.NullInt64
+			cur    sql.NullString
+			expBal sql.NullString
+			actBal sql.NullString
+			diff   sql.NullString
+		)
+		if err := rows.Scan(
+			&totalCount,
+			&report.TotalLedgerUSDT,
+			&report.TotalLedgerBTC,
+			&report.TotalLedgerIRT,
+			&uid,
+			&cur,
+			&expBal,
+			&actBal,
+			&diff,
+		); err == nil {
+			if uid.Valid && cur.Valid {
+				report.Discrepancies = append(report.Discrepancies, LedgerDiscrepancyItem{
+					UserID:          int(uid.Int64),
+					Currency:        cur.String,
+					ExpectedBalance: expBal.String,
+					ActualBalance:   actBal.String,
+					Difference:      diff.String,
+				})
+			}
 		}
 	}
 
 	report.DiscrepancyCount = len(report.Discrepancies)
 	report.IsBalanced = report.DiscrepancyCount == 0
-	return report
+	return totalCount, report
 }
 
 func (s *DashboardServer) fetchDLQMessages(ctx context.Context, limit int) (uint64, []DLQInspectorItem) {
@@ -445,12 +574,121 @@ func (s *DashboardServer) fetchDLQMessages(ctx context.Context, limit int) (uint
 	return totalMsgs, items
 }
 
-func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+func validateReplayPayload(rawPayload string) (string, []byte, error) {
+	trimmed := strings.TrimSpace(rawPayload)
+	if trimmed == "" {
+		return "", nil, fmt.Errorf("payload cannot be empty")
 	}
 
+	var event struct {
+		EventID   string          `json:"event_id"`
+		UserID    int             `json:"user_id"`
+		Currency  string          `json:"currency"`
+		Amount    json.RawMessage `json:"amount"`
+		CreatedAt string          `json:"created_at"`
+	}
+
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&event); err != nil {
+		return "", nil, fmt.Errorf("malformed JSON or unknown fields: %w", err)
+	}
+	if dec.More() || dec.Decode(&struct{}{}) != io.EOF {
+		return "", nil, fmt.Errorf("unexpected trailing data after JSON object")
+	}
+
+	eventID := strings.TrimSpace(event.EventID)
+	if eventID == "" || len(eventID) > 128 {
+		return "", nil, fmt.Errorf("event_id must be between 1 and 128 characters")
+	}
+	for _, r := range eventID {
+		if unicode.IsSpace(r) || r < 33 || r > 126 {
+			return "", nil, fmt.Errorf("event_id must contain only printable ASCII characters without spaces")
+		}
+	}
+
+	if event.UserID < 1 || event.UserID > 20 {
+		return "", nil, fmt.Errorf("user_id must be between 1 and 20")
+	}
+
+	switch event.Currency {
+	case "USDT", "BTC", "IRT":
+	default:
+		return "", nil, fmt.Errorf("unsupported currency %q (must be USDT, BTC, or IRT)", event.Currency)
+	}
+
+	var amountStr string
+	if err := json.Unmarshal(event.Amount, &amountStr); err != nil {
+		return "", nil, fmt.Errorf("amount must be a JSON string")
+	}
+	if err := validatePositiveDecimalString(amountStr); err != nil {
+		return "", nil, err
+	}
+
+	createdAt := strings.TrimSpace(event.CreatedAt)
+	if createdAt == "" {
+		createdAt = time.Now().UTC().Format(time.RFC3339)
+	} else if _, err := time.Parse(time.RFC3339, createdAt); err != nil {
+		return "", nil, fmt.Errorf("created_at must be a valid RFC3339 timestamp")
+	}
+
+	normalized, err := json.Marshal(struct {
+		EventID   string `json:"event_id"`
+		UserID    int    `json:"user_id"`
+		Currency  string `json:"currency"`
+		Amount    string `json:"amount"`
+		CreatedAt string `json:"created_at"`
+	}{
+		EventID:   eventID,
+		UserID:    event.UserID,
+		Currency:  event.Currency,
+		Amount:    strings.TrimSpace(amountStr),
+		CreatedAt: createdAt,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+
+	return eventID, normalized, nil
+}
+
+func validatePositiveDecimalString(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+		return fmt.Errorf("amount must be a positive decimal string")
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) > 2 {
+		return fmt.Errorf("amount is not a valid decimal number")
+	}
+	intPart := parts[0]
+	fracPart := ""
+	if len(parts) == 2 {
+		fracPart = parts[1]
+	}
+	if intPart == "" || len(intPart) > 18 {
+		return fmt.Errorf("amount integer part must be between 1 and 18 digits")
+	}
+	if len(parts) == 2 && (fracPart == "" || len(fracPart) > 18) {
+		return fmt.Errorf("amount fractional part cannot exceed 18 decimal places")
+	}
+
+	nonZero := false
+	for _, ch := range intPart + fracPart {
+		if ch < '0' || ch > '9' {
+			return fmt.Errorf("amount must contain only digits")
+		}
+		if ch != '0' {
+			nonZero = true
+		}
+	}
+	if !nonZero {
+		return fmt.Errorf("amount must be greater than zero")
+	}
+	return nil
+}
+
+func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		DLQSequence uint64 `json:"dlq_sequence"`
 		NewPayload  string `json:"new_payload"`
@@ -465,12 +703,23 @@ func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	replayMsgID := fmt.Sprintf("replay-dlq-%d-%d", req.DLQSequence, time.Now().UnixNano())
+	eventID, normalizedPayload, err := validateReplayPayload(req.NewPayload)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"replayed": false,
+			"error":    err.Error(),
+		})
+		return
+	}
+
+	replayMsgID := fmt.Sprintf("replay-dlq-%d-%s", req.DLQSequence, eventID)
 
 	ack, err := s.js.Publish(
 		r.Context(),
 		subjectDepositEvents,
-		[]byte(req.NewPayload),
+		normalizedPayload,
 		jetstream.WithMsgID(replayMsgID),
 	)
 	if err != nil {
@@ -478,25 +727,27 @@ func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	var deleteWarning string
 	if req.DLQSequence > 0 {
 		if dlqStream, err := s.js.Stream(r.Context(), streamDepositsDLQ); err == nil {
-			_ = dlqStream.DeleteMsg(r.Context(), req.DLQSequence)
+			if delErr := dlqStream.DeleteMsg(r.Context(), req.DLQSequence); delErr != nil {
+				deleteWarning = delErr.Error()
+			}
 		}
 	}
+
+	s.invalidateReconCache()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"replayed":       true,
 		"dlq_sequence":   req.DLQSequence,
 		"new_stream_seq": ack.Sequence,
+		"delete_warning": deleteWarning,
 	})
 }
 
 func (s *DashboardServer) handleInjectInvalidEvent(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if s.js == nil {
 		http.Error(w, "jetstream not available", http.StatusServiceUnavailable)
 		return
@@ -519,11 +770,7 @@ func (s *DashboardServer) handleInjectInvalidEvent(w http.ResponseWriter, r *htt
 	_ = json.NewEncoder(w).Encode(map[string]string{"injected_event_id": badEventID})
 }
 
-func (s *DashboardServer) handleTogglePublisher(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *DashboardServer) handleTogglePublisher(w http.ResponseWriter, _ *http.Request) {
 	newState := !s.publishEnabled.Load()
 	s.publishEnabled.Store(newState)
 
@@ -535,10 +782,6 @@ func (s *DashboardServer) handleTogglePublisher(w http.ResponseWriter, r *http.R
 }
 
 func (s *DashboardServer) handleGatewaySendSingle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	var input struct {
 		UserID         int    `json:"user_id"`
 		Currency       string `json:"currency"`
@@ -577,6 +820,8 @@ func (s *DashboardServer) handleGatewaySendSingle(w http.ResponseWriter, r *http
 	var rawBody any
 	_ = json.NewDecoder(resp.Body).Decode(&rawBody)
 
+	s.invalidateReconCache()
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"http_status": resp.StatusCode,
@@ -585,10 +830,12 @@ func (s *DashboardServer) handleGatewaySendSingle(w http.ResponseWriter, r *http
 }
 
 func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !s.loadgenRunning.CompareAndSwap(false, true) {
+		http.Error(w, "a loadgen job is already in progress", http.StatusConflict)
 		return
 	}
+	defer s.loadgenRunning.Store(false)
+
 	var cfg struct {
 		Requests    int    `json:"requests"`
 		Concurrency int    `json:"concurrency"`
@@ -605,7 +852,8 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 		cfg.Concurrency = 50
 	}
 
-	sharedKey := fmt.Sprintf("storm-key-%d", time.Now().UnixNano())
+	runPrefix := time.Now().UnixNano()
+	sharedKey := fmt.Sprintf("storm-key-%d", runPrefix)
 	jobs := make(chan int, cfg.Requests)
 	for i := 1; i <= cfg.Requests; i++ {
 		jobs <- i
@@ -627,13 +875,16 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
+	defer client.CloseIdleConnections()
+
+	targetURL := s.gatewayURL + "/v1/deposits"
 
 	for i := 0; i < cfg.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for seq := range jobs {
-				idemKey := fmt.Sprintf("ui-loadgen-%d-%d", time.Now().UnixNano(), seq)
+				idemKey := fmt.Sprintf("ui-loadgen-%d-%d", runPrefix, seq)
 				userID := (seq % 20) + 1
 				cur := currencies[seq%len(currencies)]
 				amt := amounts[cur]
@@ -645,8 +896,8 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 					amt = "125.50"
 				}
 
-				bodyStr := fmt.Sprintf(`{"user_id":%d,"currency":%q,"amount":%q}`, userID, cur, amt)
-				req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.gatewayURL+"/v1/deposits", strings.NewReader(bodyStr))
+				bodyBytes := []byte(fmt.Sprintf(`{"user_id":%d,"currency":%q,"amount":%q}`, userID, cur, amt))
+				req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
 				if err != nil {
 					s5xx.Add(1)
 					continue
@@ -664,6 +915,7 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 					Duplicate bool `json:"duplicate"`
 				}
 				_ = json.NewDecoder(resp.Body).Decode(&parsed)
+				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
 
 				switch resp.StatusCode {
@@ -684,6 +936,8 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 	}
 
 	wg.Wait()
+	s.invalidateReconCache()
+
 	elapsed := time.Since(start)
 	elapsedSec := elapsed.Seconds()
 	if elapsedSec <= 0 {
@@ -703,7 +957,7 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 	})
 }
 
-func (s *DashboardServer) handleUI(w http.ResponseWriter, r *http.Request) {
+func (s *DashboardServer) handleUI(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(dashboardHTML))
 }
@@ -1277,6 +1531,16 @@ let lastGlobalProc = null;
 let lastTick = Date.now();
 let dlqCache = {};
 
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 const ctx = document.getElementById('clusterChart').getContext('2d');
 const chartGradient = ctx.createLinearGradient(0, 0, 0, 240);
 chartGradient.addColorStop(0, 'rgba(79, 70, 229, 0.24)');
@@ -1346,13 +1610,15 @@ function formatDec(str) {
 }
 
 function getCurrencyBadge(cur, amount) {
+    const safeCur = escapeHtml(cur);
+    const safeAmt = escapeHtml(amount);
     if (cur === 'USDT') {
-        return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200/70 ltr-num font-bold">' + amount + ' USDT</span>';
+        return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200/70 ltr-num font-bold">' + safeAmt + ' USDT</span>';
     }
     if (cur === 'BTC') {
-        return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 border border-amber-200/70 ltr-num font-bold">' + amount + ' BTC</span>';
+        return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-700 border border-amber-200/70 ltr-num font-bold">' + safeAmt + ' BTC</span>';
     }
-    return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-50 text-sky-700 border border-sky-200/70 ltr-num font-bold">' + amount + ' ' + cur + '</span>';
+    return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-50 text-sky-700 border border-sky-200/70 ltr-num font-bold">' + safeAmt + ' ' + safeCur + '</span>';
 }
 
 async function refresh() {
@@ -1368,7 +1634,6 @@ async function refresh() {
     document.getElementById('dlqCount').innerText = d.dlq_total_count.toLocaleString();
     document.getElementById('dbTotal').innerText = d.db_total_deposits.toLocaleString();
 
-    // Gateway stats
     if (d.gateway) {
         document.getElementById('gwTotal').innerText = d.gateway.total_requests.toLocaleString();
         document.getElementById('gw202').innerText = d.gateway.accepted_202.toLocaleString();
@@ -1416,8 +1681,8 @@ async function refresh() {
             discContainer.classList.remove('hidden');
             discRows.innerHTML = d.reconciliation.discrepancies.map(function(item) {
                 return '<tr class="hover:bg-rose-50/40 transition">' +
-                '<td class="py-2.5 px-4 font-bold text-slate-800">کاربر #' + item.user_id + '</td>' +
-                '<td class="py-2.5 px-4 font-bold text-amber-700">' + item.currency + '</td>' +
+                '<td class="py-2.5 px-4 font-bold text-slate-800">کاربر #' + Number(item.user_id) + '</td>' +
+                '<td class="py-2.5 px-4 font-bold text-amber-700">' + escapeHtml(item.currency) + '</td>' +
                 '<td class="py-2.5 px-4 ltr-num text-emerald-700 font-semibold">' + formatDec(item.expected_balance) + '</td>' +
                 '<td class="py-2.5 px-4 ltr-num text-rose-700 font-semibold">' + formatDec(item.actual_balance) + '</td>' +
                 '<td class="py-2.5 px-4 ltr-num font-extrabold text-rose-600">' + formatDec(item.difference) + '</td>' +
@@ -1432,16 +1697,17 @@ async function refresh() {
     } else {
         dlqCache = {};
         dlqTbody.innerHTML = d.dlq_messages.map(function(m) {
-            dlqCache[m.dlq_sequence] = m.original_event;
-            const srcMeta = (m.source_stream || 'DEPOSITS') + ' #' + m.stream_sequence;
+            const seq = Number(m.dlq_sequence);
+            dlqCache[seq] = m.original_event;
+            const srcMeta = escapeHtml(m.source_stream || 'DEPOSITS') + ' #' + Number(m.stream_sequence);
             return '<tr class="hover:bg-slate-50/90 transition">' +
-                '<td class="py-3 px-4 ltr-num font-extrabold text-rose-600"><span class="bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-lg">#' + m.dlq_sequence + '</span></td>' +
+                '<td class="py-3 px-4 ltr-num font-extrabold text-rose-600"><span class="bg-rose-50 border border-rose-200 px-2 py-0.5 rounded-lg">#' + seq + '</span></td>' +
                 '<td class="py-3 px-4 ltr-num text-sky-700 text-[11px] font-semibold">' + srcMeta + '</td>' +
-                '<td class="py-3 px-4 ltr-num text-indigo-700 font-semibold">' + (m.event_id || 'N/A') + '</td>' +
-                '<td class="py-3 px-4"><span class="px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200/70 text-amber-800 font-semibold">' + m.reason + '</span></td>' +
-                '<td class="py-3 px-4 ltr-num text-slate-600 max-w-xs truncate font-mono bg-slate-50/70 rounded">' + m.original_event + '</td>' +
+                '<td class="py-3 px-4 ltr-num text-indigo-700 font-semibold">' + escapeHtml(m.event_id || 'N/A') + '</td>' +
+                '<td class="py-3 px-4"><span class="px-2.5 py-1 rounded-lg bg-amber-50 border border-amber-200/70 text-amber-800 font-semibold">' + escapeHtml(m.reason) + '</span></td>' +
+                '<td class="py-3 px-4 ltr-num text-slate-600 max-w-xs truncate font-mono bg-slate-50/70 rounded">' + escapeHtml(m.original_event) + '</td>' +
                 '<td class="py-3 px-4 text-left">' +
-                '<button onclick="openReplayModal(' + m.dlq_sequence + ')" class="px-3.5 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-[11px] shadow-sm transition cursor-pointer">اصلاح و بازپخش</button>' +
+                '<button onclick="openReplayModal(' + seq + ')" class="px-3.5 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white font-bold text-[11px] shadow-sm transition cursor-pointer">اصلاح و بازپخش</button>' +
                 '</td>' +
                 '</tr>';
         }).join('');
@@ -1462,12 +1728,12 @@ async function refresh() {
     } else {
         tbody.innerHTML = d.replicas.map(function(r) { 
           return '<tr class="hover:bg-slate-50/90 transition">' +
-'<td class="py-3.5 px-4 font-mono text-sky-800 font-bold">' + r.instance_id + '</td>' +
-          '<td class="py-3.5 px-4 text-slate-700 font-bold">' + r.worker_count + ' Workers</td>' +
-          '<td class="py-3.5 px-4 text-emerald-600 font-extrabold ltr-num">' + r.current_tps.toFixed(1) + ' /s</td>' +
-          '<td class="py-3.5 px-4 text-slate-900 font-bold ltr-num">' + r.processed_total.toLocaleString() + '</td>' +
-          '<td class="py-3.5 px-4 text-amber-600 font-bold ltr-num">' + r.duplicates_total.toLocaleString() + '</td>' +
-          '<td class="py-3.5 px-4 text-rose-600 font-bold ltr-num">' + r.failed_total.toLocaleString() + '</td>' +
+          '<td class="py-3.5 px-4 font-mono text-sky-800 font-bold">' + escapeHtml(r.instance_id) + '</td>' +
+          '<td class="py-3.5 px-4 text-slate-700 font-bold">' + Number(r.worker_count) + ' Workers</td>' +
+          '<td class="py-3.5 px-4 text-emerald-600 font-extrabold ltr-num">' + Number(r.current_tps).toFixed(1) + ' /s</td>' +
+          '<td class="py-3.5 px-4 text-slate-900 font-bold ltr-num">' + Number(r.processed_total).toLocaleString() + '</td>' +
+          '<td class="py-3.5 px-4 text-amber-600 font-bold ltr-num">' + Number(r.duplicates_total).toLocaleString() + '</td>' +
+          '<td class="py-3.5 px-4 text-rose-600 font-bold ltr-num">' + Number(r.failed_total).toLocaleString() + '</td>' +
           '</tr>';
         }).join('');
     }
@@ -1477,11 +1743,12 @@ async function refresh() {
         recTbody.innerHTML = '<tr><td colspan="4" class="py-8 text-center text-slate-400 font-medium">هنوز تراکنشی ثبت نشده...</td></tr>';
     } else {
         recTbody.innerHTML = d.recent_deposits.map(function(item) { 
+            const shortID = escapeHtml((item.event_id || '').substring(0, 12));
             return '<tr class="hover:bg-slate-50/90 transition">' +
-            '<td class="py-2.5 px-3.5 font-mono text-indigo-600 font-semibold ltr-num">' + item.event_id.substring(0, 12) + '...</td>' +
-            '<td class="py-2.5 px-3.5 text-slate-700 font-bold">#' + item.user_id + '</td>' +
+            '<td class="py-2.5 px-3.5 font-mono text-indigo-600 font-semibold ltr-num">' + shortID + '...</td>' +
+            '<td class="py-2.5 px-3.5 text-slate-700 font-bold">#' + Number(item.user_id) + '</td>' +
             '<td class="py-2.5 px-3.5">' + getCurrencyBadge(item.currency, item.amount) + '</td>' +
-            '<td class="py-2.5 px-3.5 text-slate-400 ltr-num text-[11px] font-medium">' + item.processed_at + '</td>' +
+            '<td class="py-2.5 px-3.5 text-slate-400 ltr-num text-[11px] font-medium">' + escapeHtml(item.processed_at) + '</td>' +
             '</tr>';
         }).join('');
     }
@@ -1492,11 +1759,11 @@ async function refresh() {
     } else {
         balTbody.innerHTML = d.balances.map(function(b) { 
             return '<tr class="hover:bg-slate-50/90 transition">' +
-            '<td class="py-3.5 px-4 font-extrabold text-slate-800">کاربر #' + b.user_id + '</td>' +
+            '<td class="py-3.5 px-4 font-extrabold text-slate-800">کاربر #' + Number(b.user_id) + '</td>' +
             '<td class="py-3.5 px-4"><span class="text-emerald-700 font-bold text-xs ltr-num">' + formatDec(b.usdt) + ' USDT</span></td>' +
             '<td class="py-3.5 px-4"><span class="text-amber-700 font-bold text-xs ltr-num">' + formatDec(b.btc) + ' BTC</span></td>' +
             '<td class="py-3.5 px-4"><span class="text-sky-700 font-bold text-xs ltr-num">' + formatDec(b.irt) + ' IRT</span></td>' +
-            '<td class="py-3.5 px-4 text-slate-400 text-xs ltr-num font-medium">' + b.updated_at + '</td>' +
+            '<td class="py-3.5 px-4 text-slate-400 text-xs ltr-num font-medium">' + escapeHtml(b.updated_at) + '</td>' +
             '</tr>';
         }).join('');
     }
@@ -1551,14 +1818,23 @@ function closeReplayModal() {
 async function submitReplay() {
   const seq = Number(document.getElementById('replaySeq').value);
   const payload = document.getElementById('replayPayload').value;
-  await fetch('/api/dlq/replay', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dlq_sequence: seq, new_payload: payload })
-  });
-  closeReplayModal();
-  showToast('پیام بازپخش و از DLQ حذف شد', 'info');
-  setTimeout(refresh, 400);
+  try {
+    const res = await fetch('/api/dlq/replay', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dlq_sequence: seq, new_payload: payload })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.replayed) {
+      showToast('خطای اعتبارسنجی: ' + (data.error || 'فرمت پیام نامعتبر است'), 'warn');
+      return;
+    }
+    closeReplayModal();
+    showToast('پیام معتبر بازپخش و از DLQ حذف شد', 'info');
+    setTimeout(refresh, 400);
+  } catch (e) {
+    showToast('خطا در بازپخش پیام DLQ', 'warn');
+  }
 }
 
 async function runGatewayLoadgen(requests, concurrency, mode) {
@@ -1569,6 +1845,10 @@ async function runGatewayLoadgen(requests, concurrency, mode) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ requests: requests, concurrency: concurrency, mode: mode })
     });
+    if (res.status === 409) {
+      showToast('یک تست بار در حال حاضر در حال اجراست', 'warn');
+      return;
+    }
     const data = await res.json();
     const banner = document.getElementById('loadgenResultBanner');
     banner.classList.remove('hidden');

@@ -47,6 +47,8 @@ func main() {
 		} else {
 			db.SetMaxOpenConns(15)
 			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+			db.SetConnMaxIdleTime(2 * time.Minute)
 			defer func() { _ = db.Close() }()
 		}
 	}
@@ -62,8 +64,13 @@ func main() {
 	srv.RegisterRoutes(mux)
 
 	httpServer := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
