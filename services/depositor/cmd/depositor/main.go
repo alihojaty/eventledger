@@ -64,7 +64,7 @@ func main() {
 		log.Fatal("Failed to initialize NATS JetStream broker", zap.Error(err))
 	}
 
-	consumer, err := natsBroker.CreateOrUpdateDepositConsumer(sigCtx, cfg.WorkerCount*2)
+	consumer, err := natsBroker.CreateOrUpdateDepositConsumer(sigCtx, cfg.WorkerCount*32)
 	if err != nil {
 		natsBroker.Close()
 		_ = repo.Close()
@@ -95,7 +95,7 @@ func main() {
 	}
 
 	natsBroker.OnReconnect(func(reconnCtx context.Context) {
-		newConsumer, err := natsBroker.CreateOrUpdateDepositConsumer(reconnCtx, cfg.WorkerCount*2)
+		newConsumer, err := natsBroker.CreateOrUpdateDepositConsumer(reconnCtx, cfg.WorkerCount*32)
 		if err != nil {
 			log.Error("Failed to recreate consumer after NATS reconnect", zap.Error(err))
 			return

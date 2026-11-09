@@ -182,6 +182,10 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 }
 
 func (s *DashboardServer) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
 	mux.HandleFunc("/", s.handleUI)
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/publisher/toggle", s.guardPost(s.handleTogglePublisher))
@@ -406,7 +410,7 @@ func (s *DashboardServer) getReconciliationAndCount(ctx context.Context, current
 		if currentGlobalProc == s.lastReconProc && elapsed < 3*time.Second {
 			return s.cachedDBCount, s.cachedRecon
 		}
-		if s.cachedDBCount >= 50_000 && elapsed < 2*time.Second {
+		if s.cachedDBCount >= 50_000 && currentGlobalProc != s.lastReconProc && elapsed < 10*time.Second {
 			return s.cachedDBCount, s.cachedRecon
 		}
 	}

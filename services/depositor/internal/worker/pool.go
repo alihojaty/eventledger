@@ -48,7 +48,7 @@ func (cg *ConsumerGroup) Start() error {
 			func(msg jetstream.Msg) {
 				cg.processor.HandleMessage(workerID, msg)
 			},
-			jetstream.PullMaxMessages(1),
+			jetstream.PullMaxMessages(32),
 		)
 		if err != nil {
 			for _, activeCtx := range cg.members {
@@ -76,7 +76,7 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 			func(msg jetstream.Msg) {
 				cg.processor.HandleMessage(workerID, msg)
 			},
-			jetstream.PullMaxMessages(1),
+			jetstream.PullMaxMessages(32),
 		)
 		if err != nil {
 			cg.logger.Error("Failed to rebind worker after NATS reconnect",

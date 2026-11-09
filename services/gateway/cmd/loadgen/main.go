@@ -217,6 +217,13 @@ func main() {
 	_, _ = fmt.Fprintf(tlWriter, "[%s] LOADGEN_START run_id=%s from=%d to=%d total_to_send=%d concurrency=%d\n",
 		start.UTC().Format(time.RFC3339), *runID, *fromSeq, *totalReqs, expectedToExecute, *concurrency)
 
+	// پیش‌محاسبهٔ کل ۴۲۰ حالت قطعی بدنهٔ درخواست در حافظه (O(420))
+	var prebuiltBodies [cyclePeriod][]byte
+	for i := int64(0); i < cyclePeriod; i++ {
+		u, cur, amt, _ := DeterministicDeposit(i + 1)
+		prebuiltBodies[i] = []byte(fmt.Sprintf(`{"user_id":%d,"currency":%q,"amount":%q}`, u, cur, amt))
+	}
+	sameKeyBody := []byte(`{"user_id":7,"currency":"USDT","amount":"125.50"}`)
 	// Background time-series logger (every 5 seconds) for RPS & 5xx correlation with chaos.sh
 	doneMonitor := make(chan struct{})
 	go func() {
@@ -268,17 +275,14 @@ func main() {
 					return
 				}
 
-				userID, cur, amt, _ := DeterministicDeposit(seq)
 				idemKey := fmt.Sprintf("run-%s-%d", *runID, seq)
+				bodyBytes := prebuiltBodies[(seq-1)%cyclePeriod]
 
 				if *sameKey {
 					idemKey = sharedKey
-					userID = 7
-					cur = "USDT"
-					amt = "125.50"
+					bodyBytes = sameKeyBody
 				}
 
-				bodyBytes := []byte(fmt.Sprintf(`{"user_id":%d,"currency":%q,"amount":%q}`, userID, cur, amt))
 				backoff := *initialBackoff
 
 				for attempt := 1; ; attempt++ {

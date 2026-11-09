@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS deposits (
-                                        event_id     VARCHAR(255) PRIMARY KEY,
+                                        event_id     VARCHAR(255) COLLATE "C" PRIMARY KEY,
     user_id      INTEGER NOT NULL CHECK (user_id > 0),
     currency     VARCHAR(10) NOT NULL CHECK (currency IN ('USDT', 'BTC', 'IRT')),
     amount       NUMERIC(36, 18) NOT NULL CHECK (amount > 0),
@@ -7,7 +7,6 @@ CREATE TABLE IF NOT EXISTS deposits (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-CREATE INDEX IF NOT EXISTS idx_deposits_user_id ON deposits(user_id);
 CREATE INDEX IF NOT EXISTS idx_deposits_processed_at_desc ON deposits(processed_at DESC);
 
 CREATE TABLE IF NOT EXISTS balances (

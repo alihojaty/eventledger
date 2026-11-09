@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
@@ -24,8 +23,6 @@ const (
 	MaxDecimalScale     = 18
 	MaxDecimalPrecision = 36
 )
-
-var eventIDRegex = regexp.MustCompile(`^[a-zA-Z0-9\-_:.]{1,128}$`)
 
 type DepositEvent struct {
 	EventID   string          `json:"event_id"`
@@ -55,11 +52,20 @@ type LedgerDiscrepancy struct {
 }
 
 // ValidateEventID checks length (1..128) and allowed characters (alphanumeric and -_:. ).
+// ValidateEventID checks length (1..128) and allowed characters (alphanumeric and -_:. ).
 func ValidateEventID(eventID string) error {
-	if len(eventID) < MinEventIDLen || len(eventID) > MaxEventIDLen {
+	n := len(eventID)
+	if n < MinEventIDLen || n > MaxEventIDLen {
 		return fmt.Errorf("event_id length must be between %d and %d characters", MinEventIDLen, MaxEventIDLen)
 	}
-	if !eventIDRegex.MatchString(eventID) {
+	for i := 0; i < n; i++ {
+		c := eventID[i]
+		if (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == ':' || c == '.' {
+			continue
+		}
 		return fmt.Errorf("event_id contains invalid characters (must be alphanumeric or -_.)")
 	}
 	return nil

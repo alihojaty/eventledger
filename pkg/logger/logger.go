@@ -17,6 +17,10 @@ func New(level string) (*zap.Logger, error) {
 
 	cfg := zap.NewProductionConfig()
 	cfg.Level = zap.NewAtomicLevelAt(zapLevel)
+	cfg.Sampling = &zap.SamplingConfig{
+		Initial:    20,
+		Thereafter: 5000,
+	}
 
 	cfg.EncoderConfig.TimeKey = "timestamp"
 	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder

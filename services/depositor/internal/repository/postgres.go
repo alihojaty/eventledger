@@ -5,11 +5,19 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/dbx"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
+)
+
+const (
+	maxBatchSize   = 64
+	batchWaitDelay = 200 * time.Microsecond
+	batchFlushers  = 4
 )
 
 type DepositRepository interface {
@@ -18,9 +26,18 @@ type DepositRepository interface {
 	Close() error
 }
 
+type batchRequest struct {
+	event *domain.DepositEvent
+	errCh chan error
+}
+
 type PostgresRepository struct {
-	db     *sql.DB
-	logger *zap.Logger
+	db       *sql.DB
+	logger   *zap.Logger
+	batchCh  chan *batchRequest
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) (*PostgresRepository, error) {
@@ -28,75 +45,215 @@ func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath stri
 	if err != nil {
 		return nil, err
 	}
-	return &PostgresRepository{
-		db:     db,
-		logger: logger,
-	}, nil
+	r := &PostgresRepository{
+		db:      db,
+		logger:  logger,
+		batchCh: make(chan *batchRequest, 1024),
+		stopCh:  make(chan struct{}),
+	}
+	for i := 0; i < batchFlushers; i++ {
+		r.wg.Add(1)
+		go r.batchFlusherLoop()
+	}
+	return r, nil
 }
 
 func (r *PostgresRepository) ProcessDeposit(ctx context.Context, event *domain.DepositEvent) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
-	defer func() {
-		_ = tx.Rollback()
-	}()
+	req := &batchRequest{
+		event: event,
+		errCh: make(chan error, 1),
+	}
 
-	const insertDepositQuery = `
-		INSERT INTO deposits (event_id, user_id, currency, amount, created_at)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (event_id) DO NOTHING
+	select {
+	case r.batchCh <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.stopCh:
+		return errors.New("repository is closing")
+	}
+
+	select {
+	case err := <-req.errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *PostgresRepository) batchFlusherLoop() {
+	defer r.wg.Done()
+
+	batch := make([]*batchRequest, 0, maxBatchSize)
+	timer := time.NewTimer(batchWaitDelay)
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+
+	for {
+		select {
+		case <-r.stopCh:
+			for {
+				select {
+				case req := <-r.batchCh:
+					batch = append(batch, req)
+					if len(batch) >= maxBatchSize {
+						r.executeBatch(batch)
+						batch = batch[:0]
+					}
+				default:
+					if len(batch) > 0 {
+						r.executeBatch(batch)
+					}
+					return
+				}
+			}
+		case first := <-r.batchCh:
+			batch = append(batch[:0], first)
+
+		drainFast:
+			for len(batch) < maxBatchSize {
+				select {
+				case next := <-r.batchCh:
+					batch = append(batch, next)
+				default:
+					break drainFast
+				}
+			}
+
+			if len(batch) < 8 {
+				timer.Reset(batchWaitDelay)
+			waitMore:
+				for len(batch) < maxBatchSize {
+					select {
+					case next := <-r.batchCh:
+						batch = append(batch, next)
+					case <-timer.C:
+						break waitMore
+					case <-r.stopCh:
+						break waitMore
+					}
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+
+			r.executeBatch(batch)
+		}
+	}
+}
+
+func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
+	n := len(batch)
+	if n == 0 {
+		return
+	}
+
+	// Deduplicate identical event_ids within the same in-memory micro-batch
+	uniqueEventIDs := make([]string, 0, n)
+	userIDs := make([]int64, 0, n)
+	currencies := make([]string, 0, n)
+	amounts := make([]string, 0, n)
+	createdAts := make([]time.Time, 0, n)
+
+	seenInBatch := make(map[string]int, n)
+	duplicateInBatch := make([]bool, n)
+
+	for i, req := range batch {
+		ev := req.event
+		if _, exists := seenInBatch[ev.EventID]; exists {
+			duplicateInBatch[i] = true
+			continue
+		}
+		seenInBatch[ev.EventID] = i
+		uniqueEventIDs = append(uniqueEventIDs, ev.EventID)
+		userIDs = append(userIDs, int64(ev.UserID))
+		currencies = append(currencies, ev.Currency)
+		amounts = append(amounts, ev.Amount.String())
+		createdAts = append(createdAts, ev.CreatedAt)
+	}
+
+	const batchCTE = `
+		WITH input_rows AS (
+			SELECT
+				UNNEST($1::text[]) AS event_id,
+				UNNEST($2::int8[])::int4 AS user_id,
+				UNNEST($3::text[]) AS currency,
+				UNNEST($4::text[])::numeric(36, 18) AS amount,
+				UNNEST($5::timestamptz[]) AS created_at
+		),
+		ins AS (
+			INSERT INTO deposits (event_id, user_id, currency, amount, created_at)
+			SELECT event_id, user_id, currency, amount, created_at
+			FROM input_rows
+			ON CONFLICT (event_id) DO NOTHING
+			RETURNING event_id, user_id, currency, amount
+		),
+		agg_balances AS (
+			SELECT user_id, currency, SUM(amount) AS total_amount
+			FROM ins
+			GROUP BY user_id, currency
+			ORDER BY user_id, currency
+		),
+		upd AS (
+			INSERT INTO balances (user_id, currency, balance, updated_at)
+			SELECT user_id, currency, total_amount, NOW()
+			FROM agg_balances
+			ON CONFLICT (user_id, currency)
+			DO UPDATE SET
+				balance = balances.balance + EXCLUDED.balance,
+				updated_at = NOW()
+		)
+		SELECT event_id FROM ins
 	`
 
-	res, err := tx.ExecContext(
-		ctx,
-		insertDepositQuery,
-		event.EventID,
-		event.UserID,
-		event.Currency,
-		event.Amount,
-		event.CreatedAt,
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	rows, err := r.db.QueryContext(ctx, batchCTE, uniqueEventIDs, userIDs, currencies, amounts, createdAts)
 	if err != nil {
-		return fmt.Errorf("failed to insert deposit event %s: %w", event.EventID, err)
+		for _, req := range batch {
+			req.errCh <- fmt.Errorf("failed to execute atomic deposit transaction: %w", err)
+		}
+		return
+	}
+	defer func() { _ = rows.Close() }()
+
+	insertedSet := make(map[string]struct{}, len(uniqueEventIDs))
+	for rows.Next() {
+		var id string
+		if scanErr := rows.Scan(&id); scanErr == nil {
+			insertedSet[id] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		for _, req := range batch {
+			req.errCh <- fmt.Errorf("error reading batch transaction result: %w", err)
+		}
+		return
 	}
 
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected for event %s: %w", event.EventID, err)
+	for i, req := range batch {
+		if duplicateInBatch[i] {
+			req.errCh <- domain.ErrDuplicateEvent
+			continue
+		}
+		if _, inserted := insertedSet[req.event.EventID]; inserted {
+			req.errCh <- nil
+		} else {
+			req.errCh <- domain.ErrDuplicateEvent
+		}
 	}
-
-	if rowsAffected == 0 {
-		return domain.ErrDuplicateEvent
-	}
-
-	const upsertBalanceQuery = `
-		INSERT INTO balances (user_id, currency, balance, updated_at)
-		VALUES ($1, $2, $3, NOW())
-		ON CONFLICT (user_id, currency)
-		DO UPDATE SET
-			balance = balances.balance + EXCLUDED.balance,
-			updated_at = NOW()
-	`
-
-	_, err = tx.ExecContext(
-		ctx,
-		upsertBalanceQuery,
-		event.UserID,
-		event.Currency,
-		event.Amount,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to update balance for user %d (%s): %w", event.UserID, event.Currency, err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction for event %s: %w", event.EventID, err)
-	}
-
-	return nil
 }
 
 func (r *PostgresRepository) GetBalance(ctx context.Context, userID int, currency string) (decimal.Decimal, error) {
@@ -123,6 +280,11 @@ func (r *PostgresRepository) DB() *sql.DB {
 }
 
 func (r *PostgresRepository) Close() error {
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+	})
+	r.wg.Wait()
+
 	if r.db != nil {
 		err := r.db.Close()
 		r.logger.Info("Database connection closed")

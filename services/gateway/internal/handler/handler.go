@@ -76,8 +76,9 @@ type GatewayStatsSnapshot struct {
 }
 
 type idemShard struct {
-	mu      sync.Mutex
-	entries map[string]string
+	mu       sync.Mutex
+	current  map[string]string
+	previous map[string]string
 }
 
 type idempotencyPayloadGuard struct {
@@ -87,7 +88,7 @@ type idempotencyPayloadGuard struct {
 func newIdempotencyPayloadGuard() *idempotencyPayloadGuard {
 	g := &idempotencyPayloadGuard{}
 	for i := 0; i < idemShards; i++ {
-		g.shards[i].entries = make(map[string]string, 256)
+		g.shards[i].current = make(map[string]string, 256)
 	}
 	return g
 }
@@ -100,16 +101,19 @@ func (g *idempotencyPayloadGuard) checkOrRemember(eventID, fingerprint string) b
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if existing, ok := shard.entries[eventID]; ok {
+	if existing, ok := shard.current[eventID]; ok {
 		return existing == fingerprint
 	}
-	if len(shard.entries) >= maxIdemEntriesPerShard {
-		for k := range shard.entries {
-			delete(shard.entries, k)
-			break
+	if shard.previous != nil {
+		if existing, ok := shard.previous[eventID]; ok {
+			return existing == fingerprint
 		}
 	}
-	shard.entries[eventID] = fingerprint
+	if len(shard.current) >= maxIdemEntriesPerShard {
+		shard.previous = shard.current
+		shard.current = make(map[string]string, maxIdemEntriesPerShard)
+	}
+	shard.current[eventID] = fingerprint
 	return true
 }
 
@@ -119,7 +123,10 @@ func (g *idempotencyPayloadGuard) forget(eventID string) {
 	shard := &g.shards[h.Sum32()%idemShards]
 
 	shard.mu.Lock()
-	delete(shard.entries, eventID)
+	delete(shard.current, eventID)
+	if shard.previous != nil {
+		delete(shard.previous, eventID)
+	}
 	shard.mu.Unlock()
 }
 

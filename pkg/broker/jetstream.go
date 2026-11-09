@@ -222,12 +222,19 @@ func (b *NATSBroker) PublishDeposit(ctx context.Context, eventID string, payload
 		opts = append(opts, jetstream.WithMsgID(eventID))
 	}
 
-	ack, err := b.js.Publish(ctx, SubjectDepositEvents, payload, opts...)
+	future, err := b.js.PublishAsync(SubjectDepositEvents, payload, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, err)
 	}
 
-	return ack, nil
+	select {
+	case ack := <-future.Ok():
+		return ack, nil
+	case pubErr := <-future.Err():
+		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, pubErr)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (b *NATSBroker) PublishDepositAsync(eventID string, payload []byte) (jetstream.PubAckFuture, error) {

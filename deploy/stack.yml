@@ -24,15 +24,13 @@ services:
       - "-c"
       - "synchronous_commit=on"
       - "-c"
-      - "commit_delay=100"
-      - "-c"
-      - "commit_siblings=5"
-      - "-c"
       - "max_connections=300"
       - "-c"
-      - "shared_buffers=256MB"
+      - "shared_buffers=512MB"
       - "-c"
-      - "wal_buffers=16MB"
+      - "wal_buffers=32MB"
+      - "-c"
+      - "max_wal_size=2GB"
       - "-c"
       - "checkpoint_completion_target=0.9"
     networks:
@@ -279,7 +277,7 @@ services:
       API_KEY_FILE: /run/secrets/api_key
       PORT: "8080"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/stats >/dev/null || exit 1"]
+      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1" ]
       interval: 5s
       timeout: 3s
       retries: 3

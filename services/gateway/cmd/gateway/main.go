@@ -64,6 +64,10 @@ func main() {
 
 	dialOpts := []grpc.DialOption{
 		grpc.WithDefaultServiceConfig(grpcServiceConfigJSON),
+		grpc.WithInitialWindowSize(4 * 1024 * 1024),
+		grpc.WithInitialConnWindowSize(16 * 1024 * 1024),
+		grpc.WithWriteBufferSize(256 * 1024),
+		grpc.WithReadBufferSize(256 * 1024),
 		grpc.WithUnaryInterceptor(
 			handler.RetryUnavailableInterceptor(
 				cfg.GRPCMaxAttempts,

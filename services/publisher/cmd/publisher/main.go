@@ -79,7 +79,14 @@ func main() {
 	}
 
 	var serverOpts []grpc.ServerOption
-	serverOpts = append(serverOpts, grpcserver.UnaryInterceptors(log))
+	serverOpts = append(serverOpts,
+		grpcserver.UnaryInterceptors(log),
+		grpc.InitialWindowSize(4*1024*1024),
+		grpc.InitialConnWindowSize(16*1024*1024),
+		grpc.WriteBufferSize(256*1024),
+		grpc.ReadBufferSize(256*1024),
+		grpc.MaxConcurrentStreams(4096),
+	)
 
 	if cfg.MTLSEnabled {
 		creds, err := tlscfg.ServerTransportCredentials(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
