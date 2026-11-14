@@ -7,10 +7,6 @@ CREATE TABLE IF NOT EXISTS deposits (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-CREATE INDEX IF NOT EXISTS idx_deposits_processed_at_desc
-    ON deposits (processed_at DESC)
-    WITH (fillfactor = 95);
-
 CREATE TABLE IF NOT EXISTS balances (
                                         user_id    INTEGER NOT NULL CHECK (user_id > 0),
     currency   VARCHAR(10) NOT NULL CHECK (currency IN ('USDT', 'BTC', 'IRT')),

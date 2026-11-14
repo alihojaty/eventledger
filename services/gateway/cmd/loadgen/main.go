@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,7 +81,6 @@ func (h *LatencyHistogram) AvgMs() float64 {
 	return float64(h.sumMicro.Load()) / float64(tot) / 1000.0
 }
 
-// DeterministicDeposit derives (userID, currency, amountStr, amountDec) purely from seq (1-based).
 func DeterministicDeposit(seq int64) (int, string, string, decimal.Decimal) {
 	idx := seq - 1
 	userID := int(idx%numUsers) + 1
@@ -100,15 +100,11 @@ func DeterministicDeposit(seq int64) (int, string, string, decimal.Decimal) {
 	return userID, cur, amountStr, decimal.RequireFromString(amountStr)
 }
 
-// ComputeExpectedBalances calculates the exact expected balance per user and currency
-// for sequences 1..totalReqs in O(420) constant time and O(1) memory.
 func ComputeExpectedBalances(totalReqs int64) map[int]map[string]decimal.Decimal {
 	res, _ := ComputeExpectedBalancesAndCounts(1, totalReqs)
 	return res
 }
 
-// ComputeExpectedBalancesAndCounts calculates both exact expected balance delta and transaction count
-// per user and currency for sequences fromSeq..toSeq in O(420) constant time.
 func ComputeExpectedBalancesAndCounts(fromSeq, toSeq int64) (map[int]map[string]decimal.Decimal, map[int]map[string]int64) {
 	balances := make(map[int]map[string]decimal.Decimal, numUsers)
 	counts := make(map[int]map[string]int64, numUsers)
@@ -167,7 +163,7 @@ func main() {
 	runID := flag.String("run-id", getEnv("RUN_ID", fmt.Sprintf("%d", time.Now().UTC().Unix())), "Unique RUN_ID for event_id prefix run-<RUN_ID>-<seq>")
 	totalReqs := flag.Int64("requests", 5_000_000, "Total number of deposit requests (target sequence N)")
 	fromSeq := flag.Int64("from", 1, "Starting sequence number (for resuming an interrupted run)")
-	concurrency := flag.Int("concurrency", 256, "Number of concurrent HTTP worker goroutines")
+	concurrency := flag.Int("concurrency", 512, "Number of concurrent HTTP worker goroutines")
 	sameKey := flag.Bool("same-key", false, "Use identical Idempotency-Key for all requests (idempotency storm test)")
 	timeout := flag.Duration("timeout", 2*time.Hour, "Overall load test timeout")
 	reqTimeout := flag.Duration("req-timeout", 5*time.Second, "Per-HTTP-request timeout")
@@ -234,6 +230,7 @@ func main() {
 	sharedKey := "loadgen-shared-" + uuid.NewString()
 	targetURL := strings.TrimRight(*gatewayURL, "/") + "/v1/deposits"
 	expectedToExecute := *totalReqs - *fromSeq + 1
+	runPrefixBytes := []byte("run-" + *runID + "-")
 
 	start := time.Now()
 	_, _ = fmt.Fprintf(tlWriter, "[%s] LOADGEN_START run_id=%s from=%d to=%d total_to_send=%d concurrency=%d\n",
@@ -283,12 +280,19 @@ func main() {
 		}
 	}()
 
+	baseReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Invalid target URL %q: %v\n", targetURL, err)
+		os.Exit(1)
+	}
+
 	var wg sync.WaitGroup
 	for w := 0; w < *concurrency; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)*7919))
+			keyBuf := make([]byte, 0, 64)
 
 			for {
 				seq := nextSeq.Add(1)
@@ -296,12 +300,16 @@ func main() {
 					return
 				}
 
-				idemKey := fmt.Sprintf("run-%s-%d", *runID, seq)
+				var idemKey string
 				bodyBytes := prebuiltBodies[(seq-1)%cyclePeriod]
 
 				if *sameKey {
 					idemKey = sharedKey
 					bodyBytes = sameKeyBody
+				} else {
+					keyBuf = append(keyBuf[:0], runPrefixBytes...)
+					keyBuf = strconv.AppendInt(keyBuf, seq, 10)
+					idemKey = string(keyBuf)
 				}
 
 				backoff := *initialBackoff
@@ -314,15 +322,14 @@ func main() {
 						return
 					}
 
-					req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
-					if err != nil {
-						hist.Record(time.Since(e2eStart))
-						finalFailures.Add(1)
-						break
+					req := baseReq.Clone(ctx)
+					req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					req.ContentLength = int64(len(bodyBytes))
+					req.Header = http.Header{
+						"Content-Type":    {"application/json"},
+						"X-Api-Key":       {*apiKey},
+						"Idempotency-Key": {idemKey},
 					}
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set("X-API-Key", *apiKey)
-					req.Header.Set("Idempotency-Key", idemKey)
 
 					resp, err := client.Do(req)
 					if err != nil {

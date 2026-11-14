@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,10 +27,27 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-const grpcServiceConfigJSON = `{
+const (
+	grpcServiceConfigJSON = `{
 	"loadBalancingConfig": [{"round_robin": {}}],
 	"healthCheckConfig": {"serviceName": ""}
 }`
+	grpcClientPoolSize = 4
+)
+
+type multiPublisherClient struct {
+	clients []depositv1.DepositPublisherServiceClient
+	idx     atomic.Uint64
+}
+
+func (m *multiPublisherClient) PublishDeposit(
+	ctx context.Context,
+	in *depositv1.PublishDepositRequest,
+	opts ...grpc.CallOption,
+) (*depositv1.PublishDepositResponse, error) {
+	n := m.idx.Add(1)
+	return m.clients[n%uint64(len(m.clients))].PublishDeposit(ctx, in, opts...)
+}
 
 func main() {
 	cfg, err := config.Load()
@@ -101,14 +119,28 @@ func main() {
 		targetAddr = fmt.Sprintf("swarmdns:///%s", targetAddr)
 	}
 
-	grpcConn, err := grpc.NewClient(targetAddr, dialOpts...)
-	if err != nil {
-		log.Fatal("Failed to create gRPC client", zap.Error(err))
-	}
-	defer func() { _ = grpcConn.Close() }()
+	conns := make([]*grpc.ClientConn, 0, grpcClientPoolSize)
+	pubClients := make([]depositv1.DepositPublisherServiceClient, 0, grpcClientPoolSize)
 
-	pubClient := depositv1.NewDepositPublisherServiceClient(grpcConn)
-	healthClient := grpc_health_v1.NewHealthClient(grpcConn)
+	for i := 0; i < grpcClientPoolSize; i++ {
+		c, err := grpc.NewClient(targetAddr, dialOpts...)
+		if err != nil {
+			for _, existing := range conns {
+				_ = existing.Close()
+			}
+			log.Fatal("Failed to create gRPC client connection", zap.Int("conn_idx", i), zap.Error(err))
+		}
+		conns = append(conns, c)
+		pubClients = append(pubClients, depositv1.NewDepositPublisherServiceClient(c))
+	}
+	defer func() {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	}()
+
+	pubClient := &multiPublisherClient{clients: pubClients}
+	healthClient := grpc_health_v1.NewHealthClient(conns[0])
 	limiter := ratelimit.NewKeyRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	gwHandler = handler.NewGatewayHandler(
@@ -138,6 +170,7 @@ func main() {
 		log.Info("Gateway HTTP server started",
 			zap.Int("port", cfg.GatewayPort),
 			zap.String("publisher_grpc_target", targetAddr),
+			zap.Int("grpc_client_pool_size", grpcClientPoolSize),
 			zap.Duration("dns_refresh_interval", cfg.DNSRefreshInterval),
 			zap.Duration("request_timeout", cfg.RequestTimeout),
 			zap.Int("grpc_max_attempts", cfg.GRPCMaxAttempts),

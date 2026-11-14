@@ -436,9 +436,6 @@ func (s *DashboardServer) fetchPublisherTelemetry(ctx context.Context) []Publish
 	return results
 }
 
-// fetchGatewayTelemetry discovers all Gateway replicas via Swarm DNS (tasks.gateway)
-// and aggregates their counters while retaining a short grace cache per replica IP so
-// transient scrape hiccups under heavy load never cause counter oscillation.
 func (s *DashboardServer) fetchGatewayTelemetry(ctx context.Context) GatewayTelemetry {
 	lookupCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
 	defer cancel()
@@ -578,7 +575,6 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		return replicasList[i].InstanceID < replicasList[j].InstanceID
 	})
 
-	// Fetch Gateway and Publisher telemetry concurrently with database/NATS queries
 	var (
 		gwTelemetry    GatewayTelemetry
 		publishersList []PublisherTelemetry
@@ -733,17 +729,29 @@ func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context)
 	}
 	var totalCount int64
 
+	// Uses the 60-row pre-aggregated ledger_settled_summary table + Index-Only Scan
+	// on idx_deposits_unsettled_pending (WHERE is_settled = FALSE) for O(1) sub-millisecond reconciliation.
 	const unifiedReconQuery = `
-		WITH all_deposits AS (
+		WITH pending_by_user AS (
 			SELECT
 				user_id,
 				currency,
-				COUNT(*) AS tx_count,
-				COUNT(*) FILTER (WHERE is_settled = TRUE) AS settled_tx_count,
-				COUNT(*) FILTER (WHERE is_settled = FALSE) AS pending_tx_count,
-				COALESCE(SUM(amount) FILTER (WHERE is_settled = TRUE), 0) AS settled_amount
+				COUNT(*)::BIGINT AS pending_tx_count
 			FROM deposits
+			WHERE is_settled = FALSE
 			GROUP BY user_id, currency
+		),
+		all_deposits AS (
+			SELECT
+				COALESCE(s.user_id, p.user_id) AS user_id,
+				COALESCE(s.currency, p.currency) AS currency,
+				(COALESCE(s.settled_count, 0) + COALESCE(p.pending_tx_count, 0))::BIGINT AS tx_count,
+				COALESCE(s.settled_count, 0)::BIGINT AS settled_tx_count,
+				COALESCE(p.pending_tx_count, 0)::BIGINT AS pending_tx_count,
+				COALESCE(s.settled_amount, 0) AS settled_amount
+			FROM ledger_settled_summary s
+			FULL OUTER JOIN pending_by_user p
+				ON p.user_id = s.user_id AND p.currency = s.currency
 		),
 		summary AS (
 			SELECT
@@ -2004,7 +2012,6 @@ function showToast(message, type) {
     }, 2600);
 }
 
-// String-based decimal formatter: preserves exact up-to-18 fractional digits without IEEE-754 float64 rounding
 function formatDec(str) {
     if (str === null || str === undefined) return '0';
     let s = String(str).trim();

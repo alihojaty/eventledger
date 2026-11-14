@@ -3,8 +3,10 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"hash/fnv"
@@ -19,8 +21,8 @@ import (
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/ratelimit"
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
@@ -39,10 +41,27 @@ const (
 	readyCacheTTL          = 1 * time.Second
 )
 
-var bodyBufferPool = sync.Pool{
-	New: func() any {
-		return bytes.NewBuffer(make([]byte, 0, 256))
-	},
+var (
+	bodyBufferPool = sync.Pool{
+		New: func() any {
+			return bytes.NewBuffer(make([]byte, 0, 256))
+		},
+	}
+	reqIDPrefix string
+	reqIDSeq    atomic.Uint64
+)
+
+func init() {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	reqIDPrefix = "req-" + hex.EncodeToString(b[:]) + "-"
+}
+
+func nextFastRequestID() string {
+	var buf [32]byte
+	b := append(buf[:0], reqIDPrefix...)
+	b = strconv.AppendUint(b, reqIDSeq.Add(1), 36)
+	return string(b)
 }
 
 type ErrorBody struct {
@@ -289,8 +308,13 @@ func (h *GatewayHandler) NewRouter() *gin.Engine {
 
 func (h *GatewayHandler) requestIDAndLoggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		start := time.Now()
-		reqID := uuid.NewString()
+		infoEnabled := h.logger.Core().Enabled(zapcore.InfoLevel)
+		var start time.Time
+		if infoEnabled {
+			start = time.Now()
+		}
+
+		reqID := nextFastRequestID()
 		c.Set("request_id", reqID)
 		c.Header(HeaderRequestID, reqID)
 
@@ -300,13 +324,15 @@ func (h *GatewayHandler) requestIDAndLoggerMiddleware() gin.HandlerFunc {
 
 		c.Next()
 
-		h.logger.Info("HTTP request processed",
-			zap.String("request_id", reqID),
-			zap.String("method", c.Request.Method),
-			zap.String("path", c.Request.URL.Path),
-			zap.Int("status", c.Writer.Status()),
-			zap.Duration("duration", time.Since(start)),
-		)
+		if infoEnabled {
+			h.logger.Info("HTTP request processed",
+				zap.String("request_id", reqID),
+				zap.String("method", c.Request.Method),
+				zap.String("path", c.Request.URL.Path),
+				zap.Int("status", c.Writer.Status()),
+				zap.Duration("duration", time.Since(start)),
+			)
+		}
 	}
 }
 
@@ -435,7 +461,6 @@ func (h *GatewayHandler) handleStats(c *gin.Context) {
 
 func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	reqID := c.GetString("request_id")
-	log := h.logger.With(zap.String("request_id", reqID))
 
 	idempotencyKey := c.GetHeader(HeaderIdempotencyKey)
 	if err := domain.ValidateEventID(idempotencyKey); err != nil {
@@ -535,7 +560,8 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 			h.idemGuard.forgetIfUncommitted(validatedEvent.EventID)
 			h.badRequest400.Add(1)
 		}
-		log.Warn("gRPC call to publisher failed",
+		h.logger.Warn("gRPC call to publisher failed",
+			zap.String("request_id", reqID),
 			zap.String("event_id", validatedEvent.EventID),
 			zap.Int("http_status", httpStatus),
 			zap.String("error_code", code),
@@ -551,11 +577,14 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		h.duplicates.Add(1)
 	}
 
-	log.Info("Deposit accepted by publisher",
-		zap.String("event_id", validatedEvent.EventID),
-		zap.Uint64("stream_sequence", grpcResp.GetStreamSequence()),
-		zap.Bool("duplicate", grpcResp.GetDuplicate()),
-	)
+	if h.logger.Core().Enabled(zapcore.InfoLevel) {
+		h.logger.Info("Deposit accepted by publisher",
+			zap.String("request_id", reqID),
+			zap.String("event_id", validatedEvent.EventID),
+			zap.Uint64("stream_sequence", grpcResp.GetStreamSequence()),
+			zap.Bool("duplicate", grpcResp.GetDuplicate()),
+		)
+	}
 
 	c.JSON(http.StatusAccepted, CreateDepositResponse{
 		EventID:        validatedEvent.EventID,

@@ -16,7 +16,7 @@ import (
 
 const (
 	maxBatchSize         = 256
-	batchWaitDelay       = 300 * time.Microsecond
+	batchWaitDelay       = 250 * time.Microsecond
 	batchFlushers        = 4
 	batchQueryTimeout    = 10 * time.Second
 	settlementBatchLimit = 100_000
@@ -34,8 +34,6 @@ type batchRequest struct {
 	errCh chan error
 }
 
-// flusherWorkspace holds pre-allocated buffers for a single batchFlusherLoop goroutine
-// so executeBatch performs zero slice/map allocations on the hot path.
 type flusherWorkspace struct {
 	activeBatch      []*batchRequest
 	uniqueEventIDs   []string
@@ -76,12 +74,13 @@ func (w *flusherWorkspace) reset() {
 }
 
 type PostgresRepository struct {
-	db       *sql.DB
-	logger   *zap.Logger
-	batchCh  chan *batchRequest
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	db        *sql.DB
+	logger    *zap.Logger
+	batchCh   chan *batchRequest
+	collectMu sync.Mutex
+	stopCh    chan struct{}
+	stopOnce  sync.Once
+	wg        sync.WaitGroup
 }
 
 func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) (*PostgresRepository, error) {
@@ -112,12 +111,14 @@ func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
 		ALTER TABLE deposits
 			ADD COLUMN IF NOT EXISTS is_settled BOOLEAN NOT NULL DEFAULT FALSE;
 
+		DROP INDEX IF EXISTS idx_deposits_processed_at_desc;
+
 		ALTER TABLE deposits SET (
-			fillfactor = 85,
-			autovacuum_vacuum_scale_factor = 0.02,
-			autovacuum_vacuum_threshold = 1000,
-			autovacuum_vacuum_cost_delay = 2,
-			autovacuum_vacuum_cost_limit = 2000,
+			fillfactor = 75,
+			autovacuum_vacuum_scale_factor = 0.01,
+			autovacuum_vacuum_threshold = 2000,
+			autovacuum_vacuum_cost_delay = 0,
+			autovacuum_vacuum_cost_limit = 5000,
 			autovacuum_analyze_scale_factor = 0.02
 		);
 
@@ -128,10 +129,69 @@ func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
 			autovacuum_vacuum_cost_delay = 0
 		);
 
+		CREATE TABLE IF NOT EXISTS ledger_settled_summary (
+			user_id        INTEGER NOT NULL,
+			currency       VARCHAR(10) NOT NULL,
+			settled_count  BIGINT NOT NULL DEFAULT 0,
+			settled_amount NUMERIC(36, 18) NOT NULL DEFAULT 0,
+			PRIMARY KEY (user_id, currency)
+		) WITH (fillfactor = 70);
+
+		DO $$
+		BEGIN
+			PERFORM pg_advisory_xact_lock(778899);
+			IF NOT EXISTS (SELECT 1 FROM ledger_settled_summary LIMIT 1) THEN
+				INSERT INTO ledger_settled_summary (user_id, currency, settled_count, settled_amount)
+				SELECT
+					user_id,
+					currency,
+					COUNT(*)::BIGINT,
+					COALESCE(SUM(amount), 0)
+				FROM deposits
+				WHERE is_settled = TRUE
+				GROUP BY user_id, currency
+				ON CONFLICT (user_id, currency) DO UPDATE SET
+					settled_count  = EXCLUDED.settled_count,
+					settled_amount = EXCLUDED.settled_amount;
+			END IF;
+		END;
+		$$;
+
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM pg_indexes
+				WHERE schemaname = 'public'
+				  AND tablename = 'deposits'
+				  AND indexname = 'idx_deposits_unsettled_pending'
+				  AND (indexdef ILIKE '%processed_at%' OR indexdef ILIKE '%INCLUDE%')
+			) THEN
+				DROP INDEX idx_deposits_unsettled_pending;
+			END IF;
+		END;
+		$$;
+
 		CREATE INDEX IF NOT EXISTS idx_deposits_unsettled_pending
-			ON deposits (processed_at ASC)
+			ON deposits (user_id, currency)
 			WITH (fillfactor = 90)
 			WHERE is_settled = FALSE;
+
+		CREATE OR REPLACE FUNCTION trg_truncate_ledger_summary()
+		RETURNS TRIGGER
+		LANGUAGE plpgsql
+		AS $$
+		BEGIN
+			TRUNCATE TABLE ledger_settled_summary;
+			RETURN NULL;
+		END;
+		$$;
+
+		DROP TRIGGER IF EXISTS trg_deposits_truncate ON deposits;
+		CREATE TRIGGER trg_deposits_truncate
+			AFTER TRUNCATE ON deposits
+			FOR EACH STATEMENT
+			EXECUTE FUNCTION trg_truncate_ledger_summary();
 
 		CREATE OR REPLACE FUNCTION settle_pending_deposits(p_batch_limit INTEGER DEFAULT 100000)
 		RETURNS BIGINT
@@ -150,7 +210,6 @@ func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
 				SELECT ctid
 				FROM deposits
 				WHERE is_settled = FALSE
-				ORDER BY processed_at ASC
 				LIMIT p_batch_limit
 				FOR UPDATE SKIP LOCKED
 			),
@@ -166,12 +225,12 @@ func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
 					user_id,
 					currency,
 					SUM(amount) AS total_amount,
-					COUNT(*) AS tx_count
+					COUNT(*)::BIGINT AS tx_count
 				FROM settled_rows
 				GROUP BY user_id, currency
 				ORDER BY user_id ASC, currency ASC
 			),
-			upserted AS (
+			upserted_balances AS (
 				INSERT INTO balances (user_id, currency, balance, updated_at)
 				SELECT user_id, currency, total_amount, NOW()
 				FROM agg_balances
@@ -179,6 +238,15 @@ func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
 				DO UPDATE SET
 					balance = balances.balance + EXCLUDED.balance,
 					updated_at = NOW()
+			),
+			upserted_summary AS (
+				INSERT INTO ledger_settled_summary (user_id, currency, settled_count, settled_amount)
+				SELECT user_id, currency, tx_count, total_amount
+				FROM agg_balances
+				ON CONFLICT (user_id, currency)
+				DO UPDATE SET
+					settled_count  = ledger_settled_summary.settled_count + EXCLUDED.settled_count,
+					settled_amount = ledger_settled_summary.settled_amount + EXCLUDED.settled_amount
 			)
 			SELECT COALESCE(SUM(tx_count), 0)::BIGINT
 			INTO v_settled_count
@@ -230,6 +298,62 @@ func (r *PostgresRepository) ProcessDeposit(ctx context.Context, event *domain.D
 	return <-req.errCh
 }
 
+// collectNextBatch serializes the batch-gathering window across flusher goroutines so one
+// flusher packs up to 256 items into a single dense SQL query instead of 4 flushers
+// splitting incoming requests into tiny fragments.
+func (r *PostgresRepository) collectNextBatch(batch []*batchRequest, timer *time.Timer) ([]*batchRequest, bool) {
+	r.collectMu.Lock()
+	defer r.collectMu.Unlock()
+
+	select {
+	case <-r.stopCh:
+		for len(batch) < maxBatchSize {
+			select {
+			case req := <-r.batchCh:
+				batch = append(batch, req)
+			default:
+				return batch, false
+			}
+		}
+		return batch, true
+	case first := <-r.batchCh:
+		batch = append(batch[:0], first)
+	}
+
+drainFast:
+	for len(batch) < maxBatchSize {
+		select {
+		case next := <-r.batchCh:
+			batch = append(batch, next)
+		default:
+			break drainFast
+		}
+	}
+
+	if len(batch) < 64 {
+		timer.Reset(batchWaitDelay)
+	waitMore:
+		for len(batch) < maxBatchSize {
+			select {
+			case next := <-r.batchCh:
+				batch = append(batch, next)
+			case <-timer.C:
+				break waitMore
+			case <-r.stopCh:
+				break waitMore
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+
+	return batch, true
+}
+
 func (r *PostgresRepository) batchFlusherLoop() {
 	defer r.wg.Done()
 
@@ -244,63 +368,15 @@ func (r *PostgresRepository) batchFlusherLoop() {
 	}
 
 	for {
-		select {
-		case <-r.stopCh:
-			for {
-				select {
-				case req := <-r.batchCh:
-					batch = append(batch, req)
-					if len(batch) >= maxBatchSize {
-						r.executeBatch(batch, ws)
-						clear(batch)
-						batch = batch[:0]
-					}
-				default:
-					if len(batch) > 0 {
-						r.executeBatch(batch, ws)
-						clear(batch)
-						batch = batch[:0]
-					}
-					return
-				}
-			}
-		case first := <-r.batchCh:
-			batch = append(batch[:0], first)
-
-		drainFast:
-			for len(batch) < maxBatchSize {
-				select {
-				case next := <-r.batchCh:
-					batch = append(batch, next)
-				default:
-					break drainFast
-				}
-			}
-
-			if len(batch) < 16 {
-				timer.Reset(batchWaitDelay)
-			waitMore:
-				for len(batch) < maxBatchSize {
-					select {
-					case next := <-r.batchCh:
-						batch = append(batch, next)
-					case <-timer.C:
-						break waitMore
-					case <-r.stopCh:
-						break waitMore
-					}
-				}
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-			}
-
+		var keepRunning bool
+		batch, keepRunning = r.collectNextBatch(batch, timer)
+		if len(batch) > 0 {
 			r.executeBatch(batch, ws)
 			clear(batch)
 			batch = batch[:0]
+		}
+		if !keepRunning {
+			return
 		}
 	}
 }
@@ -543,8 +619,14 @@ type ProcessedDepositItem struct {
 }
 
 func (r *PostgresRepository) GetTotalProcessedCount(ctx context.Context) (uint64, error) {
+	const fastCountQuery = `
+		SELECT (
+			COALESCE((SELECT SUM(settled_count) FROM ledger_settled_summary), 0) +
+			COALESCE((SELECT COUNT(*) FROM deposits WHERE is_settled = FALSE), 0)
+		)::BIGINT
+	`
 	var count uint64
-	err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM deposits").Scan(&count)
+	err := r.db.QueryRowContext(ctx, fastCountQuery).Scan(&count)
 	return count, err
 }
 
@@ -559,7 +641,7 @@ func (r *PostgresRepository) GetRecentProcessedDeposits(ctx context.Context, lim
 				TO_CHAR(processed_at, 'HH24:MI:SS.MS') AS processed_at,
 				processed_at AS raw_processed_at
 			FROM deposits
-			ORDER BY processed_at DESC, event_id DESC
+			ORDER BY event_id DESC
 			LIMIT $1
 		)
 		SELECT
@@ -596,10 +678,9 @@ func (r *PostgresRepository) ReconcileLedger(ctx context.Context) ([]domain.Ledg
 			SELECT
 				user_id,
 				currency,
-				SUM(amount) AS expected_amount
-			FROM deposits
-			WHERE is_settled = TRUE
-			GROUP BY user_id, currency
+				settled_amount AS expected_amount
+			FROM ledger_settled_summary
+			WHERE settled_amount > 0
 		)
 		SELECT
 			COALESCE(e.user_id, b.user_id) AS user_id,

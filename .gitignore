@@ -13,6 +13,7 @@ vendor/
 *.pem
 *.key
 *.crt
+*.env
 
 # Runtime & loadgen logs
 *.log

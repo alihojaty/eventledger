@@ -23,7 +23,7 @@ if [[ -z "$PG_CONTAINER" ]]; then
     exit 1
 fi
 
-echo "==> [1/5] Waiting (up to ${MAX_WAIT_SECONDS}s) for depositor workers & periodic SettlementWorker to ingest and settle all${EXPECTED_COUNT} deposits..."
+echo "==> [1/5] Waiting (up to ${MAX_WAIT_SECONDS}s) for depositor workers & periodic SettlementWorker to ingest and settle all ${EXPECTED_COUNT} deposits..."
 STALL_TICKS=0
 INGEST_STALL_TICKS=0
 LAST_SETTLED=""
@@ -43,7 +43,7 @@ while true; do
 
     NOW_TS="$(date +%s)"
     if (( NOW_TS - START_TS >= MAX_WAIT_SECONDS )); then
-        echo "ERROR: Timed out after ${MAX_WAIT_SECONDS}s waiting for deposits to reach${EXPECTED_COUNT} (Ingested=${INGESTED_COUNT}, Settled=${SETTLED_COUNT})."
+        echo "ERROR: Timed out after ${MAX_WAIT_SECONDS}s waiting for deposits to reach ${EXPECTED_COUNT} (Ingested=${INGESTED_COUNT}, Settled=${SETTLED_COUNT})."
         exit 1
     fi
 
@@ -71,7 +71,7 @@ while true; do
     sleep 2
 done
 
-echo "==> [2/5] Verified exact ingested & settled row count in PostgreSQL: ${SETTLED_COUNT} ==${EXPECTED_COUNT}"
+echo "==> [2/5] Verified exact ingested & settled row count in PostgreSQL: ${SETTLED_COUNT} == ${EXPECTED_COUNT}"
 
 echo ""
 echo "==> [3/5] جدول واریزهای اضافه‌شده توسط همین تست (run-${RUN_ID}) و مقایسه با جدول balances دیتابیس:"
@@ -158,7 +158,7 @@ IS_BALANCED="$(echo "$STATS_JSON" | grep -o '"is_balanced":[a-z]*' | cut -d: -f2
 DISC_COUNT="$(echo "$STATS_JSON" | grep -o '"discrepancy_count":[0-9]*' | cut -d: -f2 || echo "")"
 if [[ -n "$IS_BALANCED" ]]; then
     echo "    Dashboard Reconciliation -> is_balanced=${IS_BALANCED}, discrepancy_count=${DISC_COUNT}"
-    if [[ "$IS_BALANCED" != "true" \vert{}\vert{} "$DISC_COUNT" != "0" ]]; then
+    if [[ "$IS_BALANCED" != "true" || "$DISC_COUNT" != "0" ]]; then
         echo "ERROR: Dashboard ledger reconciliation discrepancy detected!"
         exit 1
     fi

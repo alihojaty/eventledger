@@ -13,7 +13,10 @@ var ErrWorkerAlreadyStopped = fmt.Errorf("worker is already stopped")
 
 var ErrInvalidWorkerID = fmt.Errorf("invalid worker ID")
 
-const workerPullBatchSize = 128
+const (
+	workerPullBatchSize  = 256
+	perWorkerConcurrency = 8
+)
 
 type ConsumerGroup struct {
 	workerCount int
@@ -40,6 +43,20 @@ func NewConsumerGroup(
 	}
 }
 
+func (cg *ConsumerGroup) startWorkerConsume(consumer jetstream.Consumer, workerID int) (jetstream.ConsumeContext, error) {
+	sem := make(chan struct{}, perWorkerConcurrency)
+	return consumer.Consume(
+		func(msg jetstream.Msg) {
+			sem <- struct{}{}
+			go func(m jetstream.Msg) {
+				defer func() { <-sem }()
+				cg.processor.HandleMessage(workerID, m)
+			}(msg)
+		},
+		jetstream.PullMaxMessages(workerPullBatchSize),
+	)
+}
+
 func (cg *ConsumerGroup) Start() error {
 	cg.mu.Lock()
 	defer cg.mu.Unlock()
@@ -47,12 +64,7 @@ func (cg *ConsumerGroup) Start() error {
 	for id := 1; id <= cg.workerCount; id++ {
 		workerID := id
 
-		consumeCtx, err := cg.consumer.Consume(
-			func(msg jetstream.Msg) {
-				cg.processor.HandleMessage(workerID, msg)
-			},
-			jetstream.PullMaxMessages(workerPullBatchSize),
-		)
+		consumeCtx, err := cg.startWorkerConsume(cg.consumer, workerID)
 		if err != nil {
 			for _, activeCtx := range cg.members {
 				activeCtx.Drain()
@@ -86,12 +98,7 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 			err        error
 		)
 		for attempt := 1; attempt <= 3; attempt++ {
-			consumeCtx, err = newConsumer.Consume(
-				func(msg jetstream.Msg) {
-					cg.processor.HandleMessage(workerID, msg)
-				},
-				jetstream.PullMaxMessages(workerPullBatchSize),
-			)
+			consumeCtx, err = cg.startWorkerConsume(newConsumer, workerID)
 			if err == nil {
 				break
 			}

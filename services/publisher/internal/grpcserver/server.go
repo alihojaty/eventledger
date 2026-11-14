@@ -14,6 +14,7 @@ import (
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/healthmgr"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -155,7 +156,6 @@ func buildPublisherFingerprint(userID int, currency, amountStr string) string {
 	return string(b)
 }
 
-// marshalValidatedEventFast serializes a validated DepositEvent into JSON without reflection.
 func marshalValidatedEventFast(ev *domain.DepositEvent, amountStr string) []byte {
 	b := make([]byte, 0, 160)
 	b = append(b, `{"event_id":"`...)
@@ -194,15 +194,15 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		}
 	}()
 
-	reqID := extractRequestID(ctx)
-	log := s.logger.With(zap.String("request_id", reqID))
-
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
 	}
 
+	reqID := extractRequestID(ctx)
+
 	if draining {
-		log.Info("Deposit request arrived during DRAIN_DELAY window; processing normally",
+		s.logger.Info("Deposit request arrived during DRAIN_DELAY window; processing normally",
+			zap.String("request_id", reqID),
 			zap.String("event_id", req.GetEventId()),
 			zap.Time("received_at", receivedAt),
 		)
@@ -221,7 +221,8 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		createdAt,
 	)
 	if err != nil {
-		log.Warn("Rejected invalid deposit request at publisher gRPC boundary",
+		s.logger.Warn("Rejected invalid deposit request at publisher gRPC boundary",
+			zap.String("request_id", reqID),
 			zap.String("event_id", req.GetEventId()),
 			zap.Error(err),
 		)
@@ -231,7 +232,8 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 	normAmountStr := event.Amount.String()
 	fingerprint := buildPublisherFingerprint(event.UserID, event.Currency, normAmountStr)
 	if !s.checkOrRememberPayload(event.EventID, fingerprint) {
-		log.Warn("Rejected conflicting idempotency key with different deposit parameters",
+		s.logger.Warn("Rejected conflicting idempotency key with different deposit parameters",
+			zap.String("request_id", reqID),
 			zap.String("event_id", event.EventID),
 		)
 		return nil, status.Error(codes.AlreadyExists, "event_id was already used with different deposit parameters")
@@ -241,7 +243,8 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 
 	ack, err := s.broker.PublishDeposit(ctx, event.EventID, payload)
 	if err != nil {
-		log.Error("Failed to publish deposit event to NATS JetStream",
+		s.logger.Error("Failed to publish deposit event to NATS JetStream",
+			zap.String("request_id", reqID),
 			zap.String("event_id", event.EventID),
 			zap.Error(err),
 		)
@@ -257,14 +260,17 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 
 	s.markPayloadCommitted(event.EventID, fingerprint)
 	succeeded = true
-	log.Info("Deposit event published via gRPC",
-		zap.String("event_id", event.EventID),
-		zap.Int("user_id", event.UserID),
-		zap.String("currency", event.Currency),
-		zap.String("amount", normAmountStr),
-		zap.Uint64("stream_sequence", ack.Sequence),
-		zap.Bool("duplicate", ack.Duplicate),
-	)
+	if s.logger.Core().Enabled(zapcore.InfoLevel) {
+		s.logger.Info("Deposit event published via gRPC",
+			zap.String("request_id", reqID),
+			zap.String("event_id", event.EventID),
+			zap.Int("user_id", event.UserID),
+			zap.String("currency", event.Currency),
+			zap.String("amount", normAmountStr),
+			zap.Uint64("stream_sequence", ack.Sequence),
+			zap.Bool("duplicate", ack.Duplicate),
+		)
+	}
 
 	return &depositv1.PublishDepositResponse{
 		StreamSequence: ack.Sequence,
@@ -296,6 +302,9 @@ func UnaryInterceptors(logger *zap.Logger) grpc.ServerOption {
 			return handler(ctx, req)
 		},
 		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if !logger.Core().Enabled(zapcore.InfoLevel) {
+				return handler(ctx, req)
+			}
 			start := time.Now()
 			reqID := extractRequestID(ctx)
 			resp, err := handler(ctx, req)
