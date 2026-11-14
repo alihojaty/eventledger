@@ -1,343 +1,246 @@
-# Enterprise Reliable Deposit Processor (`eventledger`)
-
-A high-performance, fault-tolerant, and horizontally scalable financial event processing engine built in Go. Designed around the golden rule:
-
-> **"No valid transaction shall ever be lost (Zero Data Loss), and no valid transaction shall ever produce a duplicate financial effect (Exactly-Once Financial Effect)."**
-
-## 🏗️ Architecture & Core Layers
-
-```
- [Client / LoadGen]
-         │ (HTTP REST / POST /v1/deposits)
-         ▼
- ┌────────────────────────────────────────────────────────┐
- │                   gateway (:8081)                      │
- │ - RequestID & Logger  - Constant-Time API Key Auth     │
- │ - Token Bucket RPS    - Max 16KB Body Limit            │
- │ - Disallow Unknown    - Amount String Enforcement      │
- │ - gRPC Client (swarmdns:/// + round_robin + Watch)     │
- └──────────────────────────┬─────────────────────────────┘
-                            │ (gRPC mTLS / Insecure)
-                            ▼
- ┌────────────────────────────────────────────────────────┐
- │                   publisher (:50051)                   │
- │ - Zero-Trust Re-Validation (pkg/domain)                │
- │ - Synchronous NATS JetStream Publish (Nats-Msg-Id)     │
- │ - Unified Health (/livez, /readyz, /stats @ :8090)     │
- └──────────────────────────┬─────────────────────────────┘
-                            │ (NATS JetStream DEPOSITS stream)
-                            ▼
- ┌────────────────────────────────────────────────────────┐
- │              depositor (Worker Pool)                   │
- │ - Pull Consumer (MaxAckPending, AckWait)               │
- │ - Poison Pill DLQ Router (DEPOSITS_DLQ)                │
- │ - PostgreSQL ACID Transaction & ON CONFLICT Shield     │
- │ - Row-Level Exclusive Lock on balances                 │
- └────────────────────────────────────────────────────────┘
-
-```
-
-## 📦 Monorepo Structure & Package Responsibilities (Task 4)
-
-The repository is organized as a multi-module Go workspace (`go.work`) with strict dependency boundaries (`services/*` depend on `pkg`, never on each other):
-
-### Why Each Package Lives in `pkg/` vs. `internal/`
-
-* **`pkg/config`**: Shared environment variable and Docker secret file loader used by all services.
-
-* **`pkg/logger`**: Standardized `uber-go/zap` production logger factory shared across all services.
-
-* **`pkg/domain`**: Single source of truth for domain models, errors, and deposit validation rules (`NewValidatedDepositEvent`, `ValidateEventID`, `ParseAndValidateAmount`) shared across `gateway`, `publisher`, `depositor`, and `dashboard`.
-
-* **`pkg/broker`**: Shared NATS JetStream connection, stream provisioning (`DEPOSITS`, `DEPOSITS_DLQ`), deduplication header injection, and reconnect hooks used by `publisher` and `depositor`.
-
-* **`pkg/dbx`**: Shared PostgreSQL connection pooler with exponential backoff and automated `golang-migrate` execution.
-
-* **`pkg/pb/deposit/v1`**: Single shared Protobuf contract (`deposit.proto`) and generated gRPC code used by both `gateway` and `publisher`.
-
-* **`pkg/tlscfg`**: Shared mTLS 1.3 certificate and transport credentials builder for `gateway` and `publisher`.
-
-* **`services/depositor/internal/{worker,repository,metrics}`**: Service-private consumer group, database ACID ledger queries, and telemetry logic specific only to `depositor`.
-
-* **`services/publisher/internal/{grpcserver,healthmgr,generator}`**: Service-private gRPC server handlers, unified health state machine, and random event simulator specific only to `publisher`.
-
-* **`services/gateway/internal/{handler,discovery,ratelimit}`**: Service-private Gin HTTP handlers, `swarmdns` gRPC resolver, and per-API-key token bucket rate limiter specific only to `gateway`.
-
-* **`services/dashboard/internal/server`**: Service-private cluster monitoring UI, reconciliation queries, and DLQ replay server specific only to `dashboard`.
-
-### Task 4 Architectural Questions
-
-1. **Why does the Go compiler reject importing `services/publisher/internal` from `depositor`?**
-   The Go compiler strictly enforces the `internal` directory rule: packages inside an `internal/` directory may only be imported by code rooted within the immediate parent directory of that `internal/` folder (`services/publisher/...`). Any attempt by `services/depositor` to import `services/publisher/internal/...` fails at compile time with `use of internal package not allowed`.
-
-2. **Do we commit `go.work` to Git? Why?**
-   Yes. Because this project is a cohesive multi-module **monorepo** where services and `pkg/` evolve together, committing `go.work` guarantees that local development, CI pipelines, and multi-stage Docker builds (which copy the workspace root) resolve local modules identically and deterministically.
-
-3. **If a new service is added tomorrow, what changes and what stays untouched?**
-
-  * **Untouched:** `pkg/*`, `services/depositor`, `services/publisher`, `services/gateway`, and `services/dashboard` require zero code changes.
-
-  * **Changed:** Create `services/<new-service>/go.mod` and `Dockerfile`, add `./services/<new-service>` to `go.work` (`go work use`), append it to `MODULES` and `build`/`images` in `Makefile`, and register the service in `deploy/docker-compose.yml` and `deploy/stack.yml`.
-
-4. **Why are both `pkg/` and `internal/` necessary? Give one example of each from this project.**
-
-  * `pkg/` prevents code duplication (DRY) and drift for cross-cutting contracts. **Example:** `pkg/domain` defines `NewValidatedDepositEvent` so `gateway` and `publisher` enforce identical validation rules without copy-pasting.
-
-  * `internal/` enforces encapsulation and prevents tight coupling between microservices. **Example:** `services/depositor/internal/repository` encapsulates direct SQL access to `deposits` and `balances` tables so no other service can bypass `depositor` and mutate database state directly.
-
-## 💰 Deposit Processing, PostgreSQL ACID & Idempotency (Task 3)
-
-### Task 3 Architectural Questions
-
-1. **What happens if the `depositor` process crashes or is killed right after the PostgreSQL `COMMIT` and before sending `Ack` to NATS? Why is the user's balance not corrupted?**
-   When `depositor` dies before sending `Ack`, NATS JetStream waits for `AckWait` (`15s`) to expire and redelivers the message to an available `depositor` worker. Inside `PostgresRepository.ProcessDeposit`, both the deposit record insertion and balance update execute within a single PostgreSQL ACID transaction:
-
-   ```
-   INSERT INTO deposits (event_id, user_id, currency, amount, created_at)
-   VALUES ($1, $2, $3, $4, $5)
-   ON CONFLICT (event_id) DO NOTHING;
-   
-   ```
-
-   Because the first attempt already committed `event_id` (the `PRIMARY KEY` of `deposits`), the redelivered execution hits `ON CONFLICT (event_id) DO NOTHING` and returns `RowsAffected() == 0`. The repository immediately returns `domain.ErrDuplicateEvent`, rolls back the transaction without executing the `balances` update, logs `"Duplicate message detected"`, and sends `msg.Ack()` to NATS. Thus, the balance is updated **exactly once**.
-
-2. **If PostgreSQL is unreachable for 10 minutes, what happens to the messages?**
-   All published events remain safely persisted on disk inside the NATS JetStream `DEPOSITS` stream (`FileStorage`). Whenever a `depositor` worker attempts to process a message and encounters a database connection error, it logs a temporary failure, increments the retry counter, and calls `msg.NakWithDelay(5s)` (`MaxDeliver: -1` ensures valid messages are never dropped due to temporary DB outages). The `depositor` process does not crash. Once PostgreSQL comes back online after 10 minutes, `database/sql` automatically re-establishes connections and the workers drain the backlog to completion.
-
-3. **Why must `amount` never be a `float` (`float32` / `float64`)?**
-   IEEE-754 binary floating-point types (`float32`, `float64`) cannot represent base-10 fractions such as `0.1` or `0.01` exactly in base-2 (e.g., `0.1 + 0.2 = 0.30000000000000004`). Over thousands or millions of financial transactions, these rounding errors accumulate and cause permanent ledger discrepancies (`SUM(deposits.amount) != balances.balance`). Therefore, `amount` is transmitted as a `string` in JSON and Protobuf, processed using fixed-point `shopspring/decimal.Decimal` in Go, and stored as `NUMERIC(36, 18)` in PostgreSQL.
-
-## 🌐 REST API Gateway & gRPC Boundary (Task 5)
-
-### Why `POST /v1/deposits` Returns `202 Accepted` Instead of `201 Created`
-
-`201 Created` implies that the final resource (the ledger entry in `deposits` and the updated wallet balance in PostgreSQL) has been synchronously created before the HTTP response is returned. In our event-driven architecture, `gateway` forwards the request over gRPC to `publisher`, which persists the event into the NATS JetStream `DEPOSITS` stream (`PubAck`), while the actual database transaction is executed **asynchronously** by `depositor` workers. Therefore, `202 Accepted` accurately reflects that the deposit event has been durably accepted into the processing stream, pending asynchronous ledger settlement.
-
-### gRPC Status Code to HTTP Status Code Mapping
-
-Implemented in `services/gateway/internal/handler/handler.go` (`mapGRPCErrorToHTTP`):
-
-| gRPC Status Code | HTTP Status Code | Error JSON `code` | Description | 
-| ----- | ----- | ----- | ----- | 
-| `OK` (`0`) | `202 Accepted` | — | Event persisted in NATS JetStream (`PubAck` received). | 
-| `InvalidArgument` (`3`) | `400 Bad Request` | `VALIDATION_ERROR` | Payload or `Idempotency-Key` failed domain validation at Publisher. | 
-| `AlreadyExists` (`6`) | `409 Conflict` | `IDEMPOTENCY_KEY_CONFLICT` | Same `Idempotency-Key` reused with different deposit parameters. | 
-| `ResourceExhausted` (`8`) | `429 Too Many Requests` | `RATE_LIMITED` | API key rate limit exceeded. | 
-| `DeadlineExceeded` (`4`) | `504 Gateway Timeout` | `GATEWAY_TIMEOUT` | Context deadline (`REQUEST_TIMEOUT`) expired waiting for Publisher/NATS. | 
-| `Unavailable` (`14`) / `Canceled` (`1`) | `503 Service Unavailable` | `SERVICE_UNAVAILABLE` | Publisher or NATS broker is temporarily unreachable. | 
-| `Internal` (`13`) / `Unknown` (`2`) / Other | `502 Bad Gateway` | `UPSTREAM_ERROR` | Unexpected upstream error in Publisher. | 
-
-### Task 5 Architectural Questions
-
-1. **Gateway sends a request to Publisher, times out, and returns `504 Gateway Timeout` to the client, even though the message may have reached Publisher. What does the client see, what should it do, and why is retrying safe?**
-   The client receives HTTP `504 Gateway Timeout` with `{"error":{"code":"GATEWAY_TIMEOUT","message":"request timed out waiting for publisher"}}`. Because the client cannot know whether the event was persisted before the timeout, the client **must retry the exact same request using the identical `Idempotency-Key` header**. Retrying is 100% safe because:
-
-  * `publisher` sets `Nats-Msg-Id = event_id` (`Idempotency-Key`). If the first attempt actually reached NATS JetStream, NATS deduplicates the retry within its 10-minute deduplication window and returns the original `stream_sequence` with `duplicate: true`.
-
-  * Even if a duplicate message ever entered the stream, `depositor` enforces `ON CONFLICT (event_id) DO NOTHING` in PostgreSQL.
-
-2. **Why doesn't Gateway write directly to NATS? What are the benefits and costs of this extra hop?**
-
-  * **Benefits:** Separation of concerns and security isolation (Defense in Depth). `gateway` remains a stateless edge proxy focused on HTTP/REST, authentication (`X-API-Key`), rate limiting, and request shaping without needing access to internal NATS credentials, stream topologies, or subject names. `publisher` acts as an internal domain gatekeeper that can scale, evolve, or batch broker operations independently.
-
-  * **Costs:** Adds one internal network hop (`gateway ──gRPC──▶ publisher`), introducing \~`0.3ms–1.0ms` of latency and minor CPU overhead for Protobuf serialization.
-
-3. **Why must Publisher's gRPC port (`50051`) not be exposed on the host? If we were forced to expose it, what would be required?**
-   `publisher` is an internal microservice that does not perform client API-key authentication or per-tenant HTTP rate limiting; exposing `:50051` on the host would allow external attackers to bypass `gateway` and inject arbitrary RPCs directly. If `:50051` had to be exposed externally, we would need **mandatory mutual TLS (mTLS 1.3)** (`MTLS_ENABLED=true`), **gRPC authentication interceptors** (verifying per-client tokens/certificates), **gRPC rate-limiting interceptors**, and **strict firewall/IP allowlisting**.
-
-## 🐝 Production Orchestration with Docker Swarm (Task 6 — Phase 1)
-
-While `deploy/docker-compose.yml` is preserved for local development and integration testing, production deployment is orchestrated via **Docker Swarm** using `deploy/stack.yml`.
-
-### Compose Keys Ignored by `docker stack deploy` & Their Swarm Replacements
-
-| Ignored Compose Key | Why Swarm Ignores It | What Replaced It in `deploy/stack.yml` & Code | 
-| ----- | ----- | ----- | 
-| **`build:`** (`context`, `dockerfile`) | Swarm nodes pull immutable images from a registry; the orchestrator does not build source code on worker nodes. | Replaced with **`image: 127.0.0.1:5000/reliable-deposit-<svc>:${IMAGE_TAG}`** where `IMAGE_TAG` is the immutable Git commit SHA (`git rev-parse --short=12 HEAD`), built and pushed to a local `registry:2` via `make images`. | 
-| **`depends_on:`** (`condition: service_healthy` / `service_started`) | Swarm schedules tasks asynchronously across the cluster and does not support startup ordering DAGs in stack files. | Replaced with **application-level startup backoff loops** (`pkg/dbx.ConnectAndMigrate`, `pkg/broker.NewNATSBroker`), **runtime NATS stream/consumer auto-reprovisioning (`OnReconnect`)**, and **`deploy.restart_policy`**. | 
-| **`restart: unless-stopped`** | Container-level restart policies belong to standalone Docker Engine, not Swarm's service scheduler. | Replaced with **`deploy.restart_policy`** (`condition: any`, `delay: 3s`, `max_attempts: 0`, `window: 60s`). | 
-| **Plaintext Secret Env Vars** (`API_KEY`, `POSTGRES_PASSWORD`) | Passing sensitive credentials as plain environment variables exposes them in `docker service inspect`. | Replaced with **Docker Swarm `secrets:`** (`deposit_api_key`, `deposit_postgres_password`) mounted at `/run/secrets/*` and loaded via `API_KEY_FILE` and `POSTGRES_PASSWORD_FILE` with **zero default fallback values**. | 
-| **Host Port Bindings on Internal Services** (`5432:5432`, `4222:4222`, `8222:8222`) | Exposing database and broker ports on the host routing mesh violates network isolation. | Removed `ports:` from `postgres`, `nats`, `publisher`, and `depositor`. All services communicate over an isolated **`overlay` network (`deposit_overlay`)**; only `gateway` (`:8081`) and `dashboard` (`:8080`) publish ports on the host. | 
-
-## 🩺 Healthchecks, Multi-Replica Load Balancing & Zero-Error Drain (Task 6 — Phase 2)
-
-### 1. Unified Health Source (`/livez`, `/readyz`, and `gRPC Health`) & Behavior During 2-Minute NATS Outage
-
-Inside `services/publisher/internal/healthmgr`, a single `Manager` struct holds one atomic state (`state atomic.Int32`). All three health interfaces read directly from this single state:
-
-* **`GET :8090/livez`**: Returns `200 OK` when the process is alive (`STARTING`, `SERVING`, or `DEGRADED_NATS_DISCONNECTED`), and `503 Service Unavailable` when draining (`SIGTERM` received) or `FORCE_UNHEALTHY=true`.
-
-* **`GET :8090/readyz`**: Returns `200 OK` only when `state == SERVING` (connected to NATS and not draining), and `503 Service Unavailable` otherwise.
-
-* **`grpc.health.v1.Health` (`Check` & `Watch`)**: Returns `SERVING` only when `state == SERVING`, and immediately pushes `NOT_SERVING` to all active `Watch` streams the instant `state` leaves `SERVING`.
-
-* **Behavior When NATS Is Stopped for 2 Minutes:** When NATS stops, `publisher` transitions to `StateDegradedNATS`. Immediately, `/readyz` returns `503` and gRPC Health pushes `NOT_SERVING` (so `gateway`'s `/readyz` returns `503` and incoming requests fail fast with `503` instead of hanging). Crucially, **`/livez` continues returning `200 OK`** because the `publisher` container itself is alive and waiting for NATS to return; this prevents Docker Swarm from pointlessly killing and restarting healthy `publisher` containers during a downstream broker outage. As soon as NATS restarts, `publisher` reconnects, re-provisions streams, transitions back to `SERVING`, and traffic resumes automatically.
-
-### 2. `HEALTHCHECK` Parameters & Justification
-
-Configured in both `services/publisher/Dockerfile` and `deploy/stack.yml`:
-
-```
-healthcheck:
-  test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/livez >/dev/null 2>&1 || exit 1"]
-  interval: 2s
-  timeout: 1s
-  retries: 2
-  start_period: 10s
-
+# Reliable Deposit Processor — Cloud-Native Financial Ledger
+
+A **cloud-native, horizontally scalable, fault-tolerant financial deposit processing platform** built with **Go 1.25 Workspace Monorepo**, **REST API Gateway**, **gRPC (with mTLS 1.3)**, **NATS JetStream**, **PostgreSQL 16**, and **Docker Swarm**.
+
+This system implements the complete lifecycle of an exchange deposit transaction: from high-throughput HTTP ingestion, exact arbitrary-precision decimal validation (`NUMERIC(36, 18)`), multi-layer idempotency enforcement, and durable JetStream persistence to micro-batched SQL ingestion (`UNNEST`), periodic atomic ledger settlement (`settle_pending_deposits`), dead-letter queue (DLQ) replay, and real-time ledger reconciliation.
+
+---
+
+## Table of Contents
+
+1. [System Architecture & Data Flow](#1-system-architecture--data-flow)
+2. [Monorepo Structure (Go 1.25 Workspace)](#2-monorepo-structure-go-125-workspace)
+3. [Engineering Highlights & Reliability Guarantees](#3-engineering-highlights--reliability-guarantees)
+    * [3.1. REST API Gateway & Resilient gRPC Transport](#31-rest-api-gateway--resilient-grpc-transport)
+    * [3.2. Unified Health Manager & 6-Step Ordered Graceful Shutdown](#32-unified-health-manager--6-step-ordered-graceful-shutdown)
+    * [3.3. Two-Phase PostgreSQL Ingestion & Atomic Batch Settlement](#33-two-phase-postgresql-ingestion--atomic-batch-settlement)
+    * [3.4. Dead-Letter Queue (DLQ) Isolation & Safe Replay](#34-dead-letter-queue-dlq-isolation--safe-replay)
+4. [5-Million-Request Load Test under Chaos Engineering](#4-5-million-request-load-test-under-chaos-engineering)
+5. [Quick Start & Makefile Reference](#5-quick-start--makefile-reference)
+6. [Configuration & Environment Variables](#6-configuration--environment-variables)
+7. [System Design & Architectural Trade-offs (Q&A)](#7-system-design--architectural-trade-offs-qa)
+
+---
+
+## 1. System Architecture & Data Flow
+
+```text
++---------------------------------------------------------------------------------------------------+
+|                                   EXTERNAL CLIENTS / LOADGEN                                      |
+|                     POST /v1/deposits (Headers: X-API-Key, Idempotency-Key)                       |
++-------------------------------------------------+-------------------------------------------------+
+                                                  | HTTP/1.1 (JSON, Max 16KB)
+                                                  v
++---------------------------------------------------------------------------------------------------+
+|                                    1. GATEWAY SERVICE (:8081)                                     |
+|  - Constant-Time X-API-Key Auth (SHA-256) & Per-Key Token-Bucket Rate Limiter                     |
+|  - Strict JSON Validation & Sharded Commit-Aware Idempotency Payload Guard                        |
+|  - Custom Swarm DNS Resolver (swarmdns:///publisher:50051) + Round-Robin gRPC Load Balancing      |
+|  - Non-Blocking Readiness Cache (/stats) & Automatic gRPC Retry (Unavailable / ResourceExhausted) |
++-------------------------------------------------+-------------------------------------------------+
+                                                  | gRPC Unary RPC (Protobuf v1, Optional mTLS 1.3)
+                                                  v
++---------------------------------------------------------------------------------------------------+
+|                             2. PUBLISHER SERVICE (:50051 / :8090)                                 |
+|  - Unified Single-Source HealthManager (/livez, /readyz, gRPC Health Check/Watch, /stats)         |
+|  - 6-Step Ordered Graceful Shutdown (SIGTERM -> Unhealthy -> DRAIN_DELAY -> GracefulStop -> Exit) |
+|  - Publishes to NATS JetStream with Deterministic Deduplication Header (Nats-Msg-Id = event_id)   |
++-------------------------------------------------+-------------------------------------------------+
+                                                  | NATS JetStream (FileStorage)
+                                                  v
++---------------------------------------------------------------------------------------------------+
+|                                  NATS JETSTREAM BROKER (:4222)                                    |
+|  - Stream "DEPOSITS" (Subject: deposits.events, 10-min Dedup Window)                              |
+|  - Stream "DEPOSITS_DLQ" (Subject: deposits.dlq, Poison-Pill Isolation & Replay)                  |
++-------------------------------------------------+-------------------------------------------------+
+                                                  | Durable Pull Consumer (deposits_processor)
+                                                  v
++---------------------------------------------------------------------------------------------------+
+|                                     3. DEPOSITOR SERVICE                                          |
+|  - Concurrent Worker Pool (Default 20 Workers/Replica) + Exponential Backoff with Full Jitter     |
+|  - Phase A (Ingestion): 4 Concurrent Batch Flushers (Up to 128 events/batch via SQL UNNEST)       |
+|  - Phase B (Settlement): Periodic SettlementWorker (Every 5s calls settle_pending_deposits)       |
++-------------------------------------------------+-------------------------------------------------+
+                                                  | pgx / database/sql (Connection Pool)
+                                                  v
++---------------------------------------------------------------------------------------------------+
+|                                    POSTGRESQL 16 (:5432)                                          |
+|  - Table "deposits": PK (event_id COLLATE "C"), NUMERIC(36, 18), is_settled flag                  |
+|  - Table "balances": PK (user_id, currency), NUMERIC(36, 18), HOT-Update Tuned (fillfactor=70)    |
++---------------------------------------------------------------------------------------------------+
 ```
 
-* **`interval: 2s`**: Probes the container every 2 seconds so health transitions are detected rapidly without adding measurable CPU overhead.
+---
 
-* **`timeout: 1s`**: Since `/livez` is an in-memory atomic read on `127.0.0.1:8090`, a healthy response takes `< 1ms`. Anything taking longer than `1s` indicates a hung runtime.
+## 2. Monorepo Structure (Go 1.25 Workspace)
 
-* **`retries: 2`**: Requires 2 consecutive failures (`2 * 2s = 4s` maximum detection time) before marking the container `unhealthy`. Because `4s < DRAIN_DELAY (6s)`, Docker Engine is guaranteed to observe the `unhealthy` status and emit `container health_status: unhealthy` in `docker events` *before* the draining container exits.
+The repository is organized as a multi-module **Go 1.25 Workspace (`go.work`)**, isolating dependencies across shared libraries and four independent microservices:
 
-* **`start_period: 10s`**: Gives the container a 10-second grace window during initial startup to initialize the Go runtime and establish connections without counting early probe failures toward `retries`.
+```text
+reliable-deposit-processor/
+├── go.work                                      # Go workspace linking pkg and all 4 services
+├── Makefile                                     # Build, test, lint, Docker Swarm, and chaos targets
+├── chaos.sh                                     # Automated chaos runner (scaling, SIGKILL, rolling updates)
+├── verify_phase3.sh                             # End-to-end 5M deposit & ledger reconciliation verifier
+├── proto/deposit/v1/deposit.proto               # Protobuf v1 contract for DepositPublisherService
+├── deploy/
+│   ├── stack.yml                                # Docker Swarm production stack specification
+│   ├── Dockerfile.gateway                       # Multi-stage distroless image for Gateway
+│   ├── Dockerfile.publisher                     # Multi-stage distroless image for Publisher
+│   ├── Dockerfile.depositor                     # Multi-stage distroless image for Depositor + SQL migrations
+│   └── Dockerfile.dashboard                     # Multi-stage distroless image for Dashboard
+├── pkg/                                         # Shared foundational libraries
+│   ├── broker/                                  # NATS JetStream client, stream provisioning & auto-reconnect
+│   ├── config/                                  # Environment & Docker Secret (*_FILE) configuration loader
+│   ├── dbx/                                     # PostgreSQL connection pool & golang-migrate runner
+│   ├── domain/                                  # Domain models & strict Decimal validation (shopspring/decimal)
+│   ├── logger/                                  # Structured JSON logger powered by Uber Zap
+│   ├── pb/deposit/v1/                           # Generated Protobuf & gRPC Go bindings
+│   └── tlscfg/                                  # TLS 1.3 mutual authentication (external certs or secret seed)
+└── services/
+    ├── gateway/                                 # HTTP ingress, rate limiter, swarmdns resolver, and loadgen CLI
+    ├── publisher/                               # gRPC server, unified HealthManager, 6-step graceful shutdown
+    ├── depositor/                               # JetStream worker pool, UNNEST batch flusher, PL/pgSQL settlement
+    └── dashboard/                               # Real-time cluster control center, DLQ inspector, ledger auditor
+```
 
-#### Where `HEALTHCHECK` Runs & How Swarm Reacts to Each State
+---
 
-* **Where it runs:** Executed by the **Docker Engine daemon (`dockerd` / `containerd`) on the host node** running the container, spawning the test command inside the container's namespaces and inspecting its exit status (`0` = healthy, `1` = unhealthy).
+## 3. Engineering Highlights & Reliability Guarantees
 
-* **How Docker Swarm handles each state:**
+### 3.1. REST API Gateway & Resilient gRPC Transport (`services/gateway`)
 
-  1. **`starting`**: Swarm withholds the task IP from internal service DNS (`tasks.publisher`) and waits during rolling updates (`order: start-first`) until the task becomes `healthy`.
+* **Constant-Time Authentication:** Validates the `X-API-Key` header using `sha256.Sum256` and `subtle.ConstantTimeCompare` to eliminate timing side-channel vulnerabilities.
+* **Per-Key Token-Bucket Rate Limiting:** Enforces configurable RPS and burst limits per API key with automatic background eviction of idle limiters after 10 minutes.
+* **Commit-Aware Sharded Idempotency Guard:** Tracks `Idempotency-Key` fingerprints (`user_id:currency:amount`) across 32 concurrent shards with two-generation rotation. Reusing an `Idempotency-Key` with mutated parameters immediately returns `409 Conflict`. Once a request is committed (`202 Accepted`), its fingerprint is locked so concurrent transient failures never evict a committed key.
+* **Headless Swarm DNS Discovery (`swarmdns:///`):** The `publisher` service runs in `endpoint_mode: dnsrr` (bypassing Docker's single-VIP bottleneck). Gateway's custom gRPC resolver polls `tasks.publisher` every 2 seconds, retains last-known healthy IPs during transient DNS hiccups, and distributes RPCs via `round_robin`.
+* **Automatic gRPC Retry Interceptor:** Transparently retries transient upstream errors (`codes.Unavailable`, `codes.ResourceExhausted`) with exponential backoff and jitter across healthy publisher subchannels.
 
-  2. **`healthy`**: Swarm registers the container's IP in the overlay network DNS and advances rolling updates to the next replica.
+### 3.2. Unified Health Manager & 6-Step Ordered Graceful Shutdown (`services/publisher`)
 
-  3. **`unhealthy`**: Swarm removes the container IP from DNS, sends `SIGTERM` to replace the failing container (if desired state is `Running`), or triggers an automatic deployment `rollback` if `unhealthy` occurs during a service update.
+`healthmgr.Manager` serves as the single atomic source of truth for HTTP `/livez`, HTTP `/readyz`, gRPC Health Checking (`grpc.health.v1.Health/Check` and `Watch`), and `/stats`. Upon receiving `SIGTERM`, the publisher executes an **exact 6-step shutdown sequence**:
 
-### 3. `stop_grace_period` Calculation
+1. **Signal Reception (`STEP 1/6`):** Captures `SIGTERM` / `SIGINT` and logs shutdown initiation with configured `DRAIN_DELAY` and `SHUTDOWN_TIMEOUT`.
+2. **Immediate Health Flip (`STEP 2/6`):** Atomically transitions to `NOT_SERVING_UNHEALTHY`. HTTP `/livez` and `/readyz` return `503 Service Unavailable`, and active gRPC `Health.Watch` streams broadcast `NOT_SERVING` so Gateway stops routing new RPCs to this instance.
+3. **Drain Window (`STEP 3/6 - DRAIN_DELAY`):** Continues accepting and processing in-flight or arriving RPCs normally for `DRAIN_DELAY` (default `5s`) while Swarm DNS and upstream load balancers converge.
+4. **Graceful gRPC Stop (`STEP 4/6 - GracefulStop`):** Closes health watcher streams and invokes `grpcSrv.GracefulStop()`, waiting up to `SHUTDOWN_TIMEOUT` (default `10s`) for active `PublishDeposit` RPCs to complete before forcing `Stop()`.
+5. **Broker Teardown (`STEP 5/6`):** Flushes pending JetStream acknowledgments and closes the NATS connection cleanly.
+6. **Clean Exit (`STEP 6/6`):** Logs final processed request counters and timestamps, then exits with code `0`.
 
-When `publisher` receives `SIGTERM`, it executes the 6-step shutdown sequence:
+### 3.3. Two-Phase PostgreSQL Ingestion & Atomic Batch Settlement (`services/depositor`)
 
-$$
-\text{Max Shutdown Time} = \text{DRAIN\_DELAY} (6\text{s}) + \text{SHUTDOWN\_TIMEOUT} (10\text{s}) + \text{NATS\_FLUSH} (2\text{s}) + \text{HTTP\_SHUTDOWN} (2\text{s}) = 20\text{s}
-$$
+To sustain **10,000+ deposits/sec** without suffering from PostgreSQL row-level lock contention on hot user wallets, database persistence is decoupled into two specialized phases:
 
+1. **Phase A — Micro-Batched Ingestion (`executeBatch`):**
+    * Four concurrent `batchFlusherLoop` goroutines coalesce incoming worker requests into batches of up to 128 events (with a $200\ \mu\text{s}$ linger window) and execute a single parameterized array query:
+      ```sql
+      INSERT INTO deposits (event_id, user_id, currency, amount, is_settled, created_at)
+      SELECT UNNEST($1::text[]), UNNEST($2::int8[])::int4, UNNEST($3::text[]),
+             UNNEST($4::text[])::numeric(36, 18), FALSE, UNNEST($5::timestamptz[])
+      ON CONFLICT (event_id) DO NOTHING
+      RETURNING event_id;
+      ```
+    * Batch execution uses an isolated batch context (`newBatchQueryContext`) that only cancels if *every* request in the batch has been canceled, preventing a single expiring caller context from aborting 127 healthy siblings.
+2. **Phase B — Periodic Atomic Settlement (`SettlementWorker` & `settle_pending_deposits`):**
+    * Every 5 seconds, `SettlementWorker` invokes the PL/pgSQL function `settle_pending_deposits(100000)`.
+    * Guarded by `pg_advisory_xact_lock(778899)` and `FOR UPDATE SKIP LOCKED`, the function claims unsettled deposits (`is_settled = FALSE`), aggregates net amounts by `(user_id, currency)` in deterministic order (`ORDER BY user_id ASC, currency ASC` to prevent deadlocks), upserts the `balances` table in bulk, and marks all claimed rows `is_settled = TRUE` within a single ACID transaction.
 
-Adding a **5-second safety margin** gives:
+### 3.4. Dead-Letter Queue (DLQ) Isolation & Safe Replay (`services/dashboard`)
 
-$$
-\text{stop\_grace\_period} = 20\text{s} + 5\text{s} = 25\text{s}
-$$
+* **Poison-Pill Isolation:** Events failing domain validation (`ErrInvalidEvent`) bypass retry loops and are immediately published to `DEPOSITS_DLQ` (`deposits.dlq`) with full provenance metadata (`source_stream`, `stream_sequence`, `error_code`, `reason`, and `original_event`).
+* **Bounded Retries with Full Jitter:** Transient infrastructure errors are retried via `msg.NakWithDelay` using exponential backoff and full jitter up to `MaxDeliver = 5` before routing to `DEPOSITS_DLQ`.
+* **Authenticated DLQ Replay:** Operators can inspect, edit, revalidate, and replay DLQ messages back to `deposits.events` from the Dashboard UI. All mutating Dashboard endpoints (`POST /api/*`) strictly require either a valid `X-API-Key` header or a cryptographically random `HttpOnly; SameSite=Strict` session cookie.
 
+---
 
-This guarantees Docker never sends `SIGKILL` (`signal 9`) mid-shutdown.
+## 4. 5-Million-Request Load Test under Chaos Engineering
 
-### 4. How Gateway Load-Balances HTTP/2 & Detects Draining Publishers (Zero 5xx)
+The repository includes an automated end-to-end verification suite that drives **5,000,000 deposit requests** through the Gateway while simultaneously injecting infrastructure chaos (`SIGKILL`, random horizontal scaling between 1 and 6 replicas, rolling updates, and depositor restarts).
 
-1. **DNS Round-Robin (`endpoint_mode: dnsrr`) + Periodic DNS Resolver (`swarmdns:///`)**: `gateway` re-resolves `tasks.publisher` every `2s`. New replicas scaled up via `docker service scale` receive traffic within `2–5s` (well under the 30s requirement).
+### Step 1: Build Images & Deploy the Docker Swarm Stack
 
-2. **Real-Time gRPC Streaming Health Push (`Health.Watch`)**: `gateway` enables `"healthCheckConfig": {"serviceName": ""}` in its gRPC ServiceConfig. At Step 2 of shutdown (`t = 0ms`), `publisher` pushes `NOT_SERVING` over the active `Health.Watch` stream, and `gateway`'s `round_robin` picker **immediately (`< 1ms`)** stops routing new RPCs to that replica.
+```bash
+make swarm-up
+```
 
-3. **Subchannel Drain Grace Window**: `swarmdns` retains removed IPs in its subchannel list for `15s` (while `Health.Watch` keeps them excluded from new picks) so in-flight RPCs finish cleanly during `DRAIN_DELAY` (`6s`)—achieving **zero 5xx errors even with `GRPC_MAX_ATTEMPTS=1`**.
+### Step 2: Execute the 5M Chaos Benchmark & Ledger Verification
 
-### 5. Measured Publisher Shutdown Timeline (Logs + `docker events`)
+```bash
+make phase3-chaos-test
+```
 
-Captured during live load (`GRPC_MAX_ATTEMPTS=1`) when scaling `publisher` down:
+What this target does:
+1. Compiles the host-native `bin/loadgen` binary to avoid Docker ingress NAT bottlenecks.
+2. Launches `chaos.sh` in the background, recording cluster telemetry every 5 seconds to `chaos.log` while ensuring at least 2 `healthy` publisher containers exist before firing `docker kill -s KILL`.
+3. Executes `bin/loadgen` for 5,000,000 requests with deterministic user/currency/amount cycling and automatic client-side retry on transient `429`/`5xx` responses.
+4. Runs `verify_phase3.sh` to confirm that all 5,000,000 deposits are ingested (`is_settled = TRUE`) and verifies **zero ledger discrepancy** (`discrepancy_count = 0`) between `SUM(deposits.amount)` and `balances.balance` across all 20 users and 3 currencies (`USDT`, `BTC`, `IRT`).
 
-| Relative Time | UTC Timestamp | Source | Event / Milestone | 
-| ----- | ----- | ----- | ----- | 
-| **`t = 0.000s`** | `2026-11-07T10:42:10.004112Z` | Publisher Zap Log | **1. `SIGTERM` Received:** `STEP 1/6: SIGTERM received; initiating ordered graceful shutdown` | 
-| **`t = 0.000s`** | `2026-11-07T10:42:10.004389Z` | Publisher Zap Log | **2. Health Set Unhealthy:** `STEP 2/6: Health status set to UNHEALTHY across HTTP (/livez, /readyz -> 503) and gRPC (NOT_SERVING)` | 
-| **`t = 0.002s`** | `2026-11-07T10:42:10.006104Z` | Publisher Zap Log | **3. Last Request Received:** `last_request_received_at="2026-11-07T10:42:10.006104118Z"` (arrived on wire during sub-millisecond `Health.Watch` propagation; processed normally during `DRAIN_DELAY`) | 
-| **`t = 0.005s`** | `2026-11-07T10:42:10.009451Z` | Publisher Zap Log | **4. Last Request Completed:** `last_request_completed_at="2026-11-07T10:42:10.009451802Z"` (`PubAck` received & gRPC response sent) | 
-| **`t = 3.412s`** | `2026-11-07T10:42:13.416501Z` | `docker events` | **5. Docker Observes `unhealthy`:** `container health_status: unhealthy` (after 2 consecutive failed `/livez` probes at `2s` interval) | 
-| **`t = 6.001s`** | `2026-11-07T10:42:16.005190Z` | Publisher Zap Log | **6. `GracefulStop` Started:** `STEP 4/6: Starting gRPC GracefulStop; rejecting new connections and draining in-flight RPCs` (`in_flight_at_start=0`) | 
-| **`t = 6.014s`** | `2026-11-07T10:42:16.018420Z` | Publisher / Docker | **7. NATS Closed & Container Exited Cleanly:** `STEP 5/6 COMPLETE` → `STEP 6/6: Publisher process exiting cleanly` (`container die exitCode=0`) | 
+---
 
-## 🌪️ Phase 3: 5,000,000 Requests Under Live Scaling & Chaos Engineering
+## 5. Quick Start & Makefile Reference
 
-### 1. Deterministic Mathematical Verification ($O(1)$ Memory)
+| Command | Description |
+| :--- | :--- |
+| `make build` | Compiles all binaries (`gateway`, `publisher`, `depositor`, `dashboard`, `loadgen`) |
+| `make test` | Runs unit and integration tests with `-race` across all 5 workspace modules |
+| `make lint` | Runs `golangci-lint` across every module in `go.work` |
+| `make swarm-up` | Initializes Docker Swarm, creates secrets, builds images, and deploys the `deposit` stack |
+| `make swarm-down` | Removes the `deposit` stack from Docker Swarm |
+| `make swarm-status` | Displays live Docker Swarm services and task states |
+| `make scale PUB=5 DEP=5` | Horizontally scales `publisher` and `depositor` replicas |
+| `make phase3-chaos-test` | Runs the complete 5,000,000-request load test + `chaos.sh` + `verify_phase3.sh` |
 
-`cmd/loadgen` generates 5,000,000 requests using deterministic keys `run-<RUN_ID>-<seq>` (`1 <= seq <= 5,000,000`). Because $\gcd(20, 3) = 1$ and $\gcd(60, 7) = 1$, the sequence has an exact period of $P = 420$. For $N = 5,000,000$ ($11,904 \times 420 + 320$), `ComputeExpectedBalances` computes the exact expected `decimal.Decimal` sum for every `(user_id, currency)` pair in 420 iterations:
+* **Cluster Control Dashboard UI:** `http://localhost:8080`
+* **Gateway HTTP Endpoint:** `http://localhost:8081`
 
-| User ID Ranges | Expected USDT Sum | Expected BTC Sum | Expected IRT Sum | 
-| ----- | ----- | ----- | ----- | 
-| **Users 1 .. 16** (each has $83,334$ tx per currency) | `3,354,193.25` | `333.33700000` | `33,333,700,000` | 
-| **Users 17 .. 20** (each has $83,333$ tx per currency) | `3,354,153.00` | `333.33300000` | `33,333,300,000` | 
-| **Cluster Grand Total (5,000,000 Deposits)** | **`67,083,704.00`** | **`6,666.72400000`** | **`666,672,400,000`** | 
+### Sample Deposit Request (`curl`)
 
-### 2. Why `DEPOSITS` Stream Messages Can Exceed 5,000,000 & Why Balances Are Never Corrupted
+```bash
+curl -i -X POST http://localhost:8081/v1/deposits \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: super-secret-gateway-key-2026" \
+  -H "Idempotency-Key: dep-2026-00001" \
+  -d '{
+    "user_id": 7,
+    "currency": "USDT",
+    "amount": "1250.750000000000000000"
+  }'
+```
 
-* **Where extra stream messages/deliveries come from:** When `scripts/chaos.sh` executes `docker kill -s KILL` on a `publisher` container, a few in-flight RPCs may have already been persisted to NATS JetStream moments before the process died, before the gRPC response reached `gateway`. When `gateway` or `loadgen` retries with the same `Idempotency-Key`, NATS JetStream's 10-minute `DeduplicationWindow` (`Nats-Msg-Id`) deduplicates it at the broker boundary; if a run is resumed via `-from <seq>` after the deduplication window or after a NATS restart, NATS assigns a new sequence number. Similarly, restarting a `depositor` container causes unacknowledged in-flight messages to be redelivered.
+---
 
-* **Why balances are never corrupted:** `PostgresRepository.ProcessDeposit` executes `INSERT INTO deposits ... ON CONFLICT (event_id) DO NOTHING` inside the same ACID transaction as the `balances` upsert. Any duplicate event yields `RowsAffected() == 0` and rolls back without touching `balances`.
+## 6. Configuration & Environment Variables
 
-### 3. Timeline & Performance Over Time: Gateway `5xx`, `RPS`, and Publisher Replicas
+All sensitive settings support the Docker Secrets `*_FILE` convention (e.g., `API_KEY_FILE`, `DATABASE_URL_FILE`, `TLS_CA_SEED_FILE`):
 
-Correlating `loadgen-timeline.log` and `chaos.log` shows that **`5xx` responses occur exclusively during `docker kill -s KILL`** (and are 100% recovered by idempotent retry), while **graceful scale-downs and rolling updates produce zero `5xx` errors**:
+| Variable | Default | Service(s) | Description |
+| :--- | :--- | :--- | :--- |
+| `GATEWAY_PORT` | `8081` | `gateway` | HTTP listen port for the REST API Gateway |
+| `API_KEY` / `API_KEY_FILE` | — | `gateway`, `dashboard` | Shared secret key for `X-API-Key` authentication |
+| `RATE_LIMIT_RPS` | `500` (`50000` in stack) | `gateway` | Allowed requests per second per API key |
+| `RATE_LIMIT_BURST` | `1000` (`50000` in stack) | `gateway` | Token-bucket burst capacity per API key |
+| `PUBLISHER_GRPC_ADDR` | `publisher:50051` | `gateway` | Target gRPC address resolved via `swarmdns:///` |
+| `PUBLISHER_GRPC_PORT` | `50051` | `publisher` | gRPC server listen port |
+| `PUBLISHER_HEALTH_PORT` | `8090` | `publisher`, `dashboard` | HTTP health & telemetry port (`/livez`, `/readyz`, `/stats`) |
+| `DRAIN_DELAY` | `5s` | `publisher` | Duration to continue accepting requests after marking health `NOT_SERVING` |
+| `SHUTDOWN_TIMEOUT` | `10s` | All | Maximum grace period to finish in-flight work before forced stop |
+| `MTLS_ENABLED` | `true` | `gateway`, `publisher` | Enables mutual TLS 1.3 encryption and client cert verification |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` / `TLS_CA_FILE` | `""` | `gateway`, `publisher` | External X.509 PEM certificate paths for mTLS |
+| `TLS_CA_SEED` / `TLS_CA_SEED_FILE` | `""` | `gateway`, `publisher` | Secret seed for deterministic internal CA key derivation |
+| `NATS_URL` | `nats://localhost:4222` | All | NATS JetStream server connection URL |
+| `DATABASE_URL` / `DATABASE_URL_FILE` | — | `depositor`, `dashboard` | PostgreSQL connection DSN |
+| `WORKER_CONCURRENCY` | `20` | `depositor` | Number of concurrent JetStream consumer workers per replica |
 
-| Time (UTC) | Publisher Replicas | Instantaneous RPS | Window `5xx` | Chaos Event (`scripts/chaos.sh`) | 
-| ----- | ----- | ----- | ----- | ----- | 
-| `11:00:00Z` | `3` | `9,850 req/s` | `0` | `CHAOS_RUNNER_STARTED (replicas=3)` | 
-| `11:00:05Z` | `5` | `11,420 req/s` | `0` | `SCALE_PUBLISHER 3 -> 5` | 
-| `11:01:05Z` | `5 -> 4` | `10,180 req/s` | **`14`** | `DOCKER_KILL_SIGKILL (1/2)` (TCP RST on killed container; all retried) | 
-| `11:01:10Z` | `5 -> 2` | `8,940 req/s` | **`0`** | `SCALE_PUBLISHER 5 -> 2` (Graceful scale-down: zero `5xx`) | 
-| `11:02:15Z` | `2 -> 4` | `10,910 req/s` | `0` | `SCALE_PUBLISHER 2 -> 4` | 
-| `11:02:20Z` | `4` | `10,760 req/s` | **`0`** | `FORCE_ROLLING_UPDATE deposit_publisher` (`start-first`: zero `5xx`) | 
-| `11:03:25Z` | `4 -> 6` | `12,180 req/s` | `0` | `SCALE_PUBLISHER 4 -> 6` | 
-| `11:03:30Z` | `6` | `12,050 req/s` | **`0`** | `RESTART_DEPOSITOR` (Zero Gateway impact; NATS redelivers unacked) | 
-| `11:04:40Z` | `6 -> 3` | `9,920 req/s` | **`0`** | `SCALE_PUBLISHER 6 -> 3` (Graceful scale-down: zero `5xx`) | 
-| `11:04:45Z` | `3 -> 2` | `9,110 req/s` | **`19`** | `DOCKER_KILL_SIGKILL (2/2)` (TCP RST on killed container; all retried) | 
-| `11:05:50Z` | `5` | `11,650 req/s` | `0` | `SCALE_PUBLISHER 3 -> 5` | 
-| `11:07:35Z` | `5` | `11,013 req/s (avg)` | `0` | `LOADGEN_FINISHED`: **5,000,000 / 5,000,000 Accepted (`Final Failures: 0`)** | 
+---
 
-## 🚀 Quickstart & Makefile Commands
+## 7. System Design & Architectural Trade-offs (Q&A)
 
-* **Run Linters, Tests (with `-race`) & Build All Binaries:**
+### 1. Why decouple deposit ingestion (`UNNEST`) from balance updates (`settle_pending_deposits`)?
+In high-throughput financial exchanges, thousands of deposits per second often target a small number of hot accounts (e.g., market makers or 20 active test users). Updating `balances` synchronously inside every individual deposit transaction serializes execution on PostgreSQL row-level locks (`FOR NO KEY UPDATE` on `(user_id, currency)`). By ingesting immutable deposit events in 128-row `UNNEST` batches (`ON CONFLICT (event_id) DO NOTHING`) and aggregating unsettled rows periodically via `settle_pending_deposits`, the database performs at most **one balance row update per user/currency per settlement cycle**, increasing ingestion throughput by over an order of magnitude while preserving 100% ACID ledger accuracy.
 
-  ```
-  make all
-  
-  ```
-
-* **Start Local Development Stack (Docker Compose):**
-
-  ```
-  make up
-  
-  ```
-
-* **Build & Push Immutable Images (Git SHA tag) to Local Registry:**
-
-  ```
-  make images
-  
-  ```
-
-* **Deploy Production Stack to Docker Swarm:**
-
-  ```
-  make deploy
-  
-  ```
-
-* **Inspect Per-Instance Publisher Stats (`/stats` on `:8090`):**
-
-  ```
-  make publisher-stats
-  
-  ```
-
-* **Run 500,000 Request Validation Test with Live Chaos:**
-
-  ```
-  make chaos-500k
-  
-  ```
-
-* **Run 5,000,000 Request Production Load Test with Live Chaos:**
-
-  ```
-  make chaos-5m
-  
-  ```
-
-* **Teardown Swarm Stack:**
-
-  ```
-  make undeploy
-  
-  ```
+### 2. How is Exactly-Once financial effect guaranteed across an At-Least-Once network?
+Idempotency is enforced across four defense-in-depth layers:
+1. **Gateway Layer:** Sharded `Idempotency-Key` payload fingerprint validation rejects conflicting parameter reuse (`409 Conflict`).
+2. **Publisher Layer:** Secondary gRPC payload guard plus deterministic `Nats-Msg-Id` header assignment (`jetstream.WithMsgID(eventID)`).
+3. **NATS JetStream Layer:** Broker-level deduplication window (`Duplicates: 10m`) discards duplicate message publishes at the storage engine.
+4. **PostgreSQL Layer (Source of Truth):** `event_id VARCHAR(255) COLLATE "C" PRIMARY KEY` with `ON CONFLICT (event_id) DO NOTHING` guarantees that even if a message is redelivered outside the NATS deduplication window, it can never be inserted or settled twice.
