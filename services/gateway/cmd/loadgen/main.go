@@ -25,8 +25,8 @@ const (
 	numTiers      = 7
 	cyclePeriod   = numUsers * numCurrencies * numTiers // 20 * 3 * 7 = 420
 
-	// Histogram: 100,000 buckets of 100 microseconds (0.1ms) covering 0..10s
-	histBuckets   = 100_000
+	// Histogram: 600,000 buckets of 100 microseconds (0.1ms) covering 0..60s
+	histBuckets   = 600_000
 	bucketWidthUs = 100
 )
 
@@ -46,6 +46,7 @@ func (h *LatencyHistogram) Record(d time.Duration) {
 	idx := int(us / bucketWidthUs)
 	if idx >= histBuckets {
 		idx = histBuckets
+		us = int64(histBuckets * bucketWidthUs)
 	}
 	h.buckets[idx].Add(1)
 	h.total.Add(1)
@@ -65,7 +66,7 @@ func (h *LatencyHistogram) PercentileMs(p float64) float64 {
 	for i := 0; i <= histBuckets; i++ {
 		cum += h.buckets[i].Load()
 		if cum >= target {
-			return float64(i*bucketWidthUs) / 1000.0
+			return (float64(i) + 0.5) * float64(bucketWidthUs) / 1000.0
 		}
 	}
 	return float64(histBuckets*bucketWidthUs) / 1000.0

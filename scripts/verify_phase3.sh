@@ -5,6 +5,17 @@ RUN_ID="${1:?Usage: $0 <RUN_ID> [EXPECTED_COUNT]}"
 EXPECTED_COUNT="${2:-5000000}"
 STACK_NAME="${STACK_NAME:-deposit}"
 DASHBOARD_URL="${DASHBOARD_URL:-http://localhost:8080/api/stats}"
+MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-600}"
+
+if [[ ! "$RUN_ID" =~ ^[a-zA-Z0-9_.:-]+$ ]]; then
+    echo "ERROR: Invalid RUN_ID format '${RUN_ID}'. Only alphanumeric characters and -_.: are allowed."
+    exit 1
+fi
+
+if [[ ! "$EXPECTED_COUNT" =~ ^[0-9]+$ ]] || (( EXPECTED_COUNT <= 0 )); then
+    echo "ERROR: EXPECTED_COUNT must be a positive integer, got '${EXPECTED_COUNT}'."
+    exit 1
+fi
 
 PG_CONTAINER="$(docker ps -qf "name=${STACK_NAME}_postgres" | head -n 1)"
 if [[ -z "$PG_CONTAINER" ]]; then
@@ -12,9 +23,12 @@ if [[ -z "$PG_CONTAINER" ]]; then
     exit 1
 fi
 
-echo "==> [1/5] Waiting for depositor workers & periodic SettlementWorker to ingest and settle all ${EXPECTED_COUNT} deposits..."
+echo "==> [1/5] Waiting (up to ${MAX_WAIT_SECONDS}s) for depositor workers & periodic SettlementWorker to ingest and settle all${EXPECTED_COUNT} deposits..."
 STALL_TICKS=0
+INGEST_STALL_TICKS=0
 LAST_SETTLED=""
+LAST_INGESTED=""
+START_TS="$(date +%s)"
 
 while true; do
     COUNTS="$(docker exec -i "$PG_CONTAINER" psql -U postgres -d deposits_db -tAc \
@@ -27,6 +41,22 @@ while true; do
         break
     fi
 
+    NOW_TS="$(date +%s)"
+    if (( NOW_TS - START_TS >= MAX_WAIT_SECONDS )); then
+        echo "ERROR: Timed out after ${MAX_WAIT_SECONDS}s waiting for deposits to reach${EXPECTED_COUNT} (Ingested=${INGESTED_COUNT}, Settled=${SETTLED_COUNT})."
+        exit 1
+    fi
+
+    if [[ "$INGESTED_COUNT" == "$LAST_INGESTED" && "$INGESTED_COUNT" != "$EXPECTED_COUNT" ]]; then
+        INGEST_STALL_TICKS=$(( INGEST_STALL_TICKS + 1 ))
+        if (( INGEST_STALL_TICKS >= 30 )); then
+            echo "WARNING: Ingested count has not progressed for 60s (${INGESTED_COUNT}/${EXPECTED_COUNT}). Checking NATS stream state..."
+            INGEST_STALL_TICKS=0
+        fi
+    else
+        INGEST_STALL_TICKS=0
+    fi
+
     if [[ "$SETTLED_COUNT" == "$LAST_SETTLED" && "$INGESTED_COUNT" != "$SETTLED_COUNT" ]]; then
         STALL_TICKS=$(( STALL_TICKS + 1 ))
         if (( STALL_TICKS >= 6 )); then
@@ -36,11 +66,12 @@ while true; do
     else
         STALL_TICKS=0
     fi
+    LAST_INGESTED="$INGESTED_COUNT"
     LAST_SETTLED="$SETTLED_COUNT"
     sleep 2
 done
 
-echo "==> [2/5] Verified exact ingested & settled row count in PostgreSQL: ${SETTLED_COUNT} == ${EXPECTED_COUNT}"
+echo "==> [2/5] Verified exact ingested & settled row count in PostgreSQL: ${SETTLED_COUNT} ==${EXPECTED_COUNT}"
 
 echo ""
 echo "==> [3/5] جدول واریزهای اضافه‌شده توسط همین تست (run-${RUN_ID}) و مقایسه با جدول balances دیتابیس:"
@@ -127,7 +158,7 @@ IS_BALANCED="$(echo "$STATS_JSON" | grep -o '"is_balanced":[a-z]*' | cut -d: -f2
 DISC_COUNT="$(echo "$STATS_JSON" | grep -o '"discrepancy_count":[0-9]*' | cut -d: -f2 || echo "")"
 if [[ -n "$IS_BALANCED" ]]; then
     echo "    Dashboard Reconciliation -> is_balanced=${IS_BALANCED}, discrepancy_count=${DISC_COUNT}"
-    if [[ "$IS_BALANCED" != "true" || "$DISC_COUNT" != "0" ]]; then
+    if [[ "$IS_BALANCED" != "true" \vert{}\vert{} "$DISC_COUNT" != "0" ]]; then
         echo "ERROR: Dashboard ledger reconciliation discrepancy detected!"
         exit 1
     fi

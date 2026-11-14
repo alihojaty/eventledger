@@ -19,51 +19,75 @@ fi
 log_event() {
     local ts
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "[$ts] [CHAOS] $*" | tee -a "$CHAOS_LOG"
+    echo "[$ts] [CHAOS] $*" \vert{} tee -a "$CHAOS_LOG"
+}
+
+count_healthy_publishers() {
+    docker ps -qf "name=${PUB_SERVICE}" --filter "health=healthy" | wc -l | tr -d ' '
 }
 
 sample_cluster_state() {
-    local ts pub_running stats_json gw_total gw_5xx
+    local ts pub_running pub_healthy stats_json gw_total gw_5xx
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     pub_running="$(docker ps -qf "name=${PUB_SERVICE}" | wc -l | tr -d ' ')"
-    stats_json="$(curl -sf "$DASHBOARD_STATS_URL" || curl -sf "$GATEWAY_STATS_URL" || echo '{}')"
+    pub_healthy="$(count_healthy_publishers)"
+
+    # Query Dashboard first (which aggregates all Gateway replicas); retry once before falling back
+    stats_json="$(curl -sf --max-time 2 "$DASHBOARD_STATS_URL" || sleep 0.2 && curl -sf --max-time 2 "$DASHBOARD_STATS_URL" \vert{}\vert{} curl -sf --max-time 2 "$GATEWAY_STATS_URL" || echo '{}')"
     gw_total="$(echo "$stats_json" | grep -o '"total_requests":[0-9]*' | head -n 1 | cut -d: -f2 || echo 0)"
     gw_5xx="$(echo "$stats_json" | grep -o '"upstream_error_5xx":[0-9]*' | head -n 1 | cut -d: -f2 || echo 0)"
-    echo "[$ts] [TELEMETRY] publisher_replicas=${pub_running} gateway_total_reqs=${gw_total:-0} gateway_5xx=${gw_5xx:-0}" | tee -a "$CHAOS_LOG"
+    echo "[$ts] [TELEMETRY] publisher_replicas=${pub_running} publisher_healthy=${pub_healthy} gateway_total_reqs=${gw_total:-0} gateway_5xx=${gw_5xx:-0}" \vert{} tee -a "$CHAOS_LOG"
+}
+
+wait_for_healthy_publishers() {
+    local min_healthy="$1"
+    local max_wait="${2:-30}"
+    local elapsed=0
+    while (( elapsed < max_wait )); do
+        local hc
+        hc="$(count_healthy_publishers)"
+        if (( hc >= min_healthy )); then
+            return 0
+        fi
+        sleep 1
+        elapsed=$(( elapsed + 1 ))
+    done
+    return 1
 }
 
 random_scale_publisher() {
     local target=$(( (RANDOM % 6) + 1 ))
     log_event "ACTION=SCALE_PUBLISHER target_replicas=${target} service=${PUB_SERVICE}"
     docker service scale "${PUB_SERVICE}=${target}" >/dev/null
+    wait_for_healthy_publishers 1 30 || true
     log_event "COMPLETED=SCALE_PUBLISHER target_replicas=${target}"
     sample_cluster_state
 }
 
 kill_one_publisher() {
     local label="$1"
-    local running_count
-    running_count="$(docker ps -qf "name=${PUB_SERVICE}" | wc -l | tr -d ' ')"
-    if (( running_count < 2 )); then
-        log_event "PRE_KILL_SCALE ensuring at least 2 publisher replicas before SIGKILL (${label})"
+    local healthy_count
+    healthy_count="$(count_healthy_publishers)"
+    if (( healthy_count < 2 )); then
+        log_event "PRE_KILL_SCALE ensuring at least 2 HEALTHY publisher replicas before SIGKILL (${label})"
         docker service scale "${PUB_SERVICE}=2" >/dev/null
-        for _ in {1..15}; do
-            running_count="$(docker ps -qf "name=${PUB_SERVICE}" | wc -l | tr -d ' ')"
-            if (( running_count >= 2 )); then
-                break
-            fi
-            sleep 1
-        done
+        if ! wait_for_healthy_publishers 2 35; then
+            log_event "SKIPPED=DOCKER_KILL_SIGKILL (${label}) reason=fewer_than_2_healthy_replicas_ready"
+            sample_cluster_state
+            return
+        fi
+        # Allow Gateway swarmdns resolver (2s refresh) to discover the newly healthy replica
         sleep 3
     fi
+
     local cid
-    cid="$(docker ps -qf "name=${PUB_SERVICE}" | head -n 1)"
+    cid="$(docker ps -qf "name=${PUB_SERVICE}" --filter "health=healthy" | tail -n 1)"
     if [[ -n "$cid" ]]; then
         log_event "ACTION=DOCKER_KILL_SIGKILL (${label}) container_id=${cid} service=${PUB_SERVICE}"
         docker kill -s KILL "$cid" >/dev/null
         log_event "COMPLETED=DOCKER_KILL_SIGKILL (${label}) container_id=${cid}"
     else
-        log_event "SKIPPED=DOCKER_KILL_SIGKILL (${label}) reason=no_running_publisher_container"
+        log_event "SKIPPED=DOCKER_KILL_SIGKILL (${label}) reason=no_healthy_publisher_container"
     fi
     sample_cluster_state
 }

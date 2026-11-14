@@ -159,12 +159,18 @@ func (r *swarmDNSResolver) resolve(force bool) {
 		for _, ip := range ips {
 			r.knownIPs[ip] = now
 		}
-	}
-
-	for ip, lastSeen := range r.knownIPs {
-		if now.Sub(lastSeen) > r.retireGrace {
-			delete(r.knownIPs, ip)
+		// Only expire retired IPs when DNS resolution succeeded so a temporary
+		// DNS hiccup never wipes out healthy active publisher subchannels.
+		for ip, lastSeen := range r.knownIPs {
+			if now.Sub(lastSeen) > r.retireGrace {
+				delete(r.knownIPs, ip)
+			}
 		}
+	} else if err != nil && r.logger != nil {
+		r.logger.Debug("Transient DNS lookup failure in swarmdns resolver; retaining last known IPs",
+			zap.String("host", r.host),
+			zap.Error(err),
+		)
 	}
 
 	activeIPs := make([]string, 0, len(r.knownIPs))

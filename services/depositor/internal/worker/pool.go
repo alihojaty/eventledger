@@ -3,6 +3,7 @@ package worker
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	"go.uber.org/zap"
@@ -67,17 +68,33 @@ func (cg *ConsumerGroup) Start() error {
 
 func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 	cg.mu.Lock()
-	defer cg.mu.Unlock()
-
 	cg.consumer = newConsumer
-	for id, oldCtx := range cg.members {
+	activeIDs := make([]int, 0, len(cg.members))
+	for id := range cg.members {
+		activeIDs = append(activeIDs, id)
+	}
+	cg.mu.Unlock()
+
+	var oldContexts []jetstream.ConsumeContext
+
+	for _, id := range activeIDs {
 		workerID := id
-		consumeCtx, err := cg.consumer.Consume(
-			func(msg jetstream.Msg) {
-				cg.processor.HandleMessage(workerID, msg)
-			},
-			jetstream.PullMaxMessages(32),
+		var (
+			consumeCtx jetstream.ConsumeContext
+			err        error
 		)
+		for attempt := 1; attempt <= 3; attempt++ {
+			consumeCtx, err = newConsumer.Consume(
+				func(msg jetstream.Msg) {
+					cg.processor.HandleMessage(workerID, msg)
+				},
+				jetstream.PullMaxMessages(32),
+			)
+			if err == nil {
+				break
+			}
+			time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+		}
 		if err != nil {
 			cg.logger.Error("Failed to rebind worker after NATS reconnect",
 				zap.Int("worker_id", workerID),
@@ -85,9 +102,21 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 			)
 			continue
 		}
+
+		cg.mu.Lock()
+		if oldCtx, stillActive := cg.members[workerID]; stillActive {
+			cg.members[workerID] = consumeCtx
+			oldContexts = append(oldContexts, oldCtx)
+			cg.logger.Info("Worker rebound to NATS consumer after reconnect", zap.Int("worker_id", workerID))
+		} else {
+			// Worker was stopped while rebind was in progress
+			consumeCtx.Drain()
+		}
+		cg.mu.Unlock()
+	}
+
+	for _, oldCtx := range oldContexts {
 		oldCtx.Drain()
-		cg.members[workerID] = consumeCtx
-		cg.logger.Info("Worker rebound to NATS consumer after reconnect", zap.Int("worker_id", workerID))
 	}
 }
 

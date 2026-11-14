@@ -7,6 +7,7 @@ import (
 type Collector struct {
 	received          atomic.Uint64
 	processed         atomic.Uint64
+	sessionProcessed  atomic.Uint64
 	duplicate         atomic.Uint64
 	invalid           atomic.Uint64
 	dlq               atomic.Uint64
@@ -17,6 +18,7 @@ type Collector struct {
 type Snapshot struct {
 	MessagesReceived  uint64 `json:"messages_received"`
 	MessagesProcessed uint64 `json:"messages_processed"`
+	SessionProcessed  uint64 `json:"session_processed"`
 	MessagesDuplicate uint64 `json:"messages_duplicate"`
 	MessagesInvalid   uint64 `json:"messages_invalid"`
 	MessagesDLQ       uint64 `json:"messages_dlq"`
@@ -31,12 +33,16 @@ func NewCollector() *Collector {
 func (c *Collector) RestoreState(processedInDB, dlqInBroker uint64) {
 	c.restoredAtStartup.Store(processedInDB)
 	c.processed.Store(processedInDB)
+	c.sessionProcessed.Store(0)
 	c.dlq.Store(dlqInBroker)
 	c.received.Store(processedInDB + dlqInBroker)
 }
 
-func (c *Collector) IncReceived()  { c.received.Add(1) }
-func (c *Collector) IncProcessed() { c.processed.Add(1) }
+func (c *Collector) IncReceived() { c.received.Add(1) }
+func (c *Collector) IncProcessed() {
+	c.processed.Add(1)
+	c.sessionProcessed.Add(1)
+}
 func (c *Collector) IncDuplicate() { c.duplicate.Add(1) }
 func (c *Collector) IncInvalid()   { c.invalid.Add(1) }
 func (c *Collector) IncDLQ()       { c.dlq.Add(1) }
@@ -46,6 +52,7 @@ func (c *Collector) GetSnapshot() Snapshot {
 	return Snapshot{
 		MessagesReceived:  c.received.Load(),
 		MessagesProcessed: c.processed.Load(),
+		SessionProcessed:  c.sessionProcessed.Load(),
 		MessagesDuplicate: c.duplicate.Load(),
 		MessagesInvalid:   c.invalid.Load(),
 		MessagesDLQ:       c.dlq.Load(),

@@ -52,36 +52,46 @@ func (p *Publisher) SetEnabled(enable bool) {
 }
 
 func (p *Publisher) StartControlListener(ctx context.Context, natsURL string) {
-	ctrlConn, err := nats.Connect(
-		natsURL,
-		nats.Name("reliable-deposit-publisher-control"),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
-	)
-	if err != nil {
-		p.logger.Warn("Failed to connect control listener to NATS", zap.Error(err))
-		return
-	}
-
-	sub, err := ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
-		var cmd struct {
-			PublishEnabled bool `json:"publish_enabled"`
-		}
-		if err := json.Unmarshal(msg.Data, &cmd); err == nil {
-			p.SetEnabled(cmd.PublishEnabled)
-		}
-	})
-	if err != nil {
-		p.logger.Warn("Failed to subscribe to control.publisher subject", zap.Error(err))
-		ctrlConn.Close()
-		return
-	}
-
 	go func() {
-		<-ctx.Done()
-		_ = sub.Unsubscribe()
-		ctrlConn.Close()
+		backoff := 500 * time.Millisecond
+		for {
+			ctrlConn, err := nats.Connect(
+				natsURL,
+				nats.Name("reliable-deposit-publisher-control"),
+				nats.RetryOnFailedConnect(true),
+				nats.MaxReconnects(-1),
+				nats.ReconnectWait(2*time.Second),
+			)
+			if err == nil {
+				sub, subErr := ctrlConn.Subscribe("control.publisher", func(msg *nats.Msg) {
+					var cmd struct {
+						PublishEnabled bool `json:"publish_enabled"`
+					}
+					if err := json.Unmarshal(msg.Data, &cmd); err == nil {
+						p.SetEnabled(cmd.PublishEnabled)
+					}
+				})
+				if subErr == nil {
+					<-ctx.Done()
+					_ = sub.Drain()
+					_ = ctrlConn.Drain()
+					ctrlConn.Close()
+					return
+				}
+				ctrlConn.Close()
+				err = subErr
+			}
+
+			p.logger.Warn("Waiting to attach control listener to NATS", zap.Error(err))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+				if backoff < 5*time.Second {
+					backoff *= 2
+				}
+			}
+		}
 	}()
 }
 

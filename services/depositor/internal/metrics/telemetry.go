@@ -47,13 +47,16 @@ func StartTelemetryReporter(
 		if err != nil {
 			return
 		}
-		defer nc.Close()
+		defer func() {
+			_ = nc.FlushTimeout(1 * time.Second)
+			nc.Close()
+		}()
 
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
 		var lastProcessed uint64
-		initialized := false
+		lastTick := time.Now()
 
 		for {
 			select {
@@ -62,26 +65,25 @@ func StartTelemetryReporter(
 			case now := <-ticker.C:
 				snap := getSnapshot()
 
-				var proc uint64
-				if snap.MessagesProcessed >= snap.RestoredFromDB {
+				proc := snap.SessionProcessed
+				if proc == 0 && snap.MessagesProcessed >= snap.RestoredFromDB {
 					proc = snap.MessagesProcessed - snap.RestoredFromDB
-				} else {
-					proc = snap.MessagesProcessed
 				}
 
 				fail := snap.MessagesInvalid + snap.MessagesRetried
 				dup := snap.MessagesDuplicate
 
-				if !initialized {
-					lastProcessed = proc
-					initialized = true
+				elapsedSec := now.Sub(lastTick).Seconds()
+				if elapsedSec <= 0 {
+					elapsedSec = 1.0
 				}
 
-				tps := float64(proc - lastProcessed)
-				if proc < lastProcessed {
-					tps = 0
+				var tps float64
+				if proc >= lastProcessed {
+					tps = float64(proc-lastProcessed) / elapsedSec
 				}
 				lastProcessed = proc
+				lastTick = now
 
 				currentWorkers := workerCount
 				if getActiveWorkers != nil {

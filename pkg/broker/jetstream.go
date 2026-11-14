@@ -44,6 +44,7 @@ type NATSBroker struct {
 
 	mu                 sync.Mutex
 	reconnecting       atomic.Bool
+	reconnectPending   atomic.Bool
 	onReconnectHooks   []func(ctx context.Context)
 	hasConsumerConfig  bool
 	savedMaxAckPending int
@@ -122,43 +123,46 @@ func (b *NATSBroker) OnReconnect(fn func(ctx context.Context)) {
 }
 
 func (b *NATSBroker) handleReconnected() {
+	b.reconnectPending.Store(true)
 	if !b.reconnecting.CompareAndSwap(false, true) {
 		return
 	}
 	defer b.reconnecting.Store(false)
 
-	b.mu.Lock()
-	hasConsumer := b.hasConsumerConfig
-	maxAck := b.savedMaxAckPending
-	ackWait := b.savedAckWait
-	hooks := append([]func(ctx context.Context){}, b.onReconnectHooks...)
-	b.mu.Unlock()
+	for b.reconnectPending.Swap(false) {
+		b.mu.Lock()
+		hasConsumer := b.hasConsumerConfig
+		maxAck := b.savedMaxAckPending
+		ackWait := b.savedAckWait
+		hooks := append([]func(ctx context.Context){}, b.onReconnectHooks...)
+		b.mu.Unlock()
 
-	for attempt := 1; attempt <= 10; attempt++ {
-		if !b.IsConnected() {
-			return
-		}
-		reconnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := b.setupStreams(reconnCtx)
-		if err == nil && hasConsumer && len(hooks) == 0 {
-			_, err = b.CreateOrUpdateDepositConsumerWithAckWait(reconnCtx, maxAck, ackWait)
-		}
-		cancel()
-
-		if err == nil {
-			for _, hook := range hooks {
-				hookCtx, hCancel := context.WithTimeout(context.Background(), 10*time.Second)
-				hook(hookCtx)
-				hCancel()
+		for attempt := 1; attempt <= 10; attempt++ {
+			if !b.IsConnected() {
+				break
 			}
-			return
-		}
+			reconnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := b.setupStreams(reconnCtx)
+			if err == nil && hasConsumer && len(hooks) == 0 {
+				_, err = b.CreateOrUpdateDepositConsumerWithAckWait(reconnCtx, maxAck, ackWait)
+			}
+			cancel()
 
-		b.logger.Warn("Retrying stream/consumer provisioning after NATS reconnect",
-			zap.Int("attempt", attempt),
-			zap.Error(err),
-		)
-		time.Sleep(500 * time.Millisecond)
+			if err == nil {
+				for _, hook := range hooks {
+					hookCtx, hCancel := context.WithTimeout(context.Background(), 10*time.Second)
+					hook(hookCtx)
+					hCancel()
+				}
+				break
+			}
+
+			b.logger.Warn("Retrying stream/consumer provisioning after NATS reconnect",
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 }
 
