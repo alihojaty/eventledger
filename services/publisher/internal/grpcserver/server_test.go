@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
@@ -20,7 +21,8 @@ func TestPublishDeposit_IntegrationWithNATS(t *testing.T) {
 		natsURL = "nats://localhost:4222"
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	nopLog := zap.NewNop()
 
 	b, err := broker.NewNATSBroker(ctx, natsURL, nopLog)

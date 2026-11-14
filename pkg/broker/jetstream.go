@@ -227,18 +227,31 @@ func (b *NATSBroker) CreateOrUpdateDepositConsumerWithAckWait(
 	return consumer, nil
 }
 
+// PublishDeposit uses JetStream async pipelining under the hood while synchronously
+// awaiting the durable PubAck before returning to the caller.
 func (b *NATSBroker) PublishDeposit(ctx context.Context, eventID string, payload []byte) (*jetstream.PubAck, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	var opts []jetstream.PublishOpt
 	if eventID != "" {
 		opts = append(opts, jetstream.WithMsgID(eventID))
 	}
 
-	ack, err := b.js.Publish(ctx, SubjectDepositEvents, payload, opts...)
+	future, err := b.js.PublishAsync(SubjectDepositEvents, payload, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, err)
 	}
 
-	return ack, nil
+	select {
+	case ack := <-future.Ok():
+		return ack, nil
+	case pubErr := <-future.Err():
+		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, pubErr)
+	case <-ctx.Done():
+		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, ctx.Err())
+	}
 }
 
 func (b *NATSBroker) PublishDepositAsync(eventID string, payload []byte) (jetstream.PubAckFuture, error) {

@@ -3,20 +3,22 @@ package ratelimit
 import (
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const numLimiterShards = 32
 
+// bucket implements a lock-free atomic token bucket using nanosecond credit accounting (GCRA/TAT).
 type bucket struct {
-	tokens     float64
-	lastRefill time.Time
+	emptyAtNs  atomic.Int64
+	lastSeenNs atomic.Int64
 }
 
 type limiterShard struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex
 	buckets     map[string]*bucket
-	lastCleanup time.Time
+	lastCleanup atomic.Int64
 }
 
 type KeyRateLimiter struct {
@@ -32,14 +34,14 @@ func NewKeyRateLimiter(rps float64, burst int) *KeyRateLimiter {
 	if burst <= 0 {
 		burst = 100
 	}
-	now := time.Now()
+	nowNs := time.Now().UnixNano()
 	l := &KeyRateLimiter{
 		rps:   rps,
 		burst: float64(burst),
 	}
 	for i := 0; i < numLimiterShards; i++ {
 		l.shards[i].buckets = make(map[string]*bucket)
-		l.shards[i].lastCleanup = now
+		l.shards[i].lastCleanup.Store(nowNs)
 	}
 	return l
 }
@@ -55,45 +57,71 @@ func (l *KeyRateLimiter) Allow(apiKey string) bool {
 }
 
 func (l *KeyRateLimiter) AllowWithCustomLimit(bucketKey string, rps, burst float64) bool {
-	now := time.Now()
+	if rps <= 0 || burst < 1.0 {
+		return false
+	}
+
+	nowNs := time.Now().UnixNano()
+	deltaNs := int64(float64(time.Second) / rps)
+	if deltaNs <= 0 {
+		deltaNs = 1
+	}
+	burstWindowNs := int64(burst * float64(deltaNs))
+
 	shard := l.shardFor(bucketKey)
 
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	if now.Sub(shard.lastCleanup) > 5*time.Minute {
-		for k, v := range shard.buckets {
-			if now.Sub(v.lastRefill) > 10*time.Minute {
-				delete(shard.buckets, k)
-			}
-		}
-		shard.lastCleanup = now
-	}
-
+	// Fast path: Read-only lock on shard map
+	shard.mu.RLock()
 	b, exists := shard.buckets[bucketKey]
+	shard.mu.RUnlock()
+
 	if !exists {
-		shard.buckets[bucketKey] = &bucket{
-			tokens:     burst - 1,
-			lastRefill: now,
+		shard.mu.Lock()
+		b, exists = shard.buckets[bucketKey]
+		if !exists {
+			b = &bucket{}
+			// Initialize with (burst - 1) tokens remaining after this first request
+			b.emptyAtNs.Store(nowNs - burstWindowNs + deltaNs)
+			b.lastSeenNs.Store(nowNs)
+			shard.buckets[bucketKey] = b
+			shard.maybeCleanupLocked(nowNs)
+			shard.mu.Unlock()
+			return true
 		}
-		return true
+		shard.mu.Unlock()
 	}
 
-	elapsed := now.Sub(b.lastRefill).Seconds()
-	if elapsed > 0 {
-		b.tokens += elapsed * rps
-		if b.tokens > burst {
-			b.tokens = burst
+	b.lastSeenNs.Store(nowNs)
+	minEmptyAtNs := nowNs - burstWindowNs
+
+	for {
+		oldEmptyAt := b.emptyAtNs.Load()
+		base := oldEmptyAt
+		if base < minEmptyAtNs {
+			base = minEmptyAtNs
 		}
-		b.lastRefill = now
+		newEmptyAt := base + deltaNs
+		if newEmptyAt > nowNs {
+			return false
+		}
+		if b.emptyAtNs.CompareAndSwap(oldEmptyAt, newEmptyAt) {
+			return true
+		}
 	}
+}
 
-	if b.tokens >= 1.0 {
-		b.tokens -= 1.0
-		return true
+func (s *limiterShard) maybeCleanupLocked(nowNs int64) {
+	last := s.lastCleanup.Load()
+	if nowNs-last <= int64(5*time.Minute) {
+		return
 	}
-
-	return false
+	s.lastCleanup.Store(nowNs)
+	expireThreshold := nowNs - int64(10*time.Minute)
+	for k, v := range s.buckets {
+		if v.lastSeenNs.Load() < expireThreshold {
+			delete(s.buckets, k)
+		}
+	}
 }
 
 func (l *KeyRateLimiter) RPS() float64 { return l.rps }

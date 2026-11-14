@@ -25,6 +25,9 @@ const (
 	MaxDecimalPrecision = 36
 )
 
+// Pre-computed upper bound for NUMERIC(36, 18) to avoid allocating a new big.Int on every request.
+var maxAllowedAmount = decimal.New(1, MaxDecimalPrecision-MaxDecimalScale)
+
 type DepositEvent struct {
 	EventID   string          `json:"event_id"`
 	UserID    int             `json:"user_id"`
@@ -94,9 +97,7 @@ func ParseAndValidateAmount(rawAmount string) (decimal.Decimal, error) {
 	if amt.Exponent() < -MaxDecimalScale {
 		return decimal.Zero, fmt.Errorf("amount precision exceeds maximum %d decimal places", MaxDecimalScale)
 	}
-	// NUMERIC(36, 18) allows at most 18 integer digits
-	maxAllowed := decimal.New(1, MaxDecimalPrecision-MaxDecimalScale)
-	if amt.GreaterThanOrEqual(maxAllowed) {
+	if amt.GreaterThanOrEqual(maxAllowedAmount) {
 		return decimal.Zero, fmt.Errorf("amount exceeds maximum allowed limit")
 	}
 	return amt, nil
@@ -163,6 +164,23 @@ type rawDepositEventJSON struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+// UnquoteJSONStringFast extracts a JSON string literal without spawning a second json.Unmarshal state machine
+// when the string contains no escape sequences.
+func UnquoteJSONStringFast(raw json.RawMessage) (string, error) {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return "", fmt.Errorf("not a JSON string")
+	}
+	inner := raw[1 : len(raw)-1]
+	if bytes.IndexByte(inner, '\\') == -1 && bytes.IndexByte(inner, '"') == -1 {
+		return string(inner), nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
 // ParseAndValidateDepositEvent parses raw JSON bytes and validates all domain rules.
 func ParseAndValidateDepositEvent(data []byte) (*DepositEvent, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
@@ -183,8 +201,8 @@ func ParseAndValidateDepositEvent(data []byte) (*DepositEvent, error) {
 		return nil, NewInvalidMessageError(raw.EventID, "amount must be a JSON string", nil)
 	}
 
-	var amountStr string
-	if err := json.Unmarshal(raw.Amount, &amountStr); err != nil {
+	amountStr, err := UnquoteJSONStringFast(raw.Amount)
+	if err != nil {
 		return nil, NewInvalidMessageError(raw.EventID, "invalid amount string", err)
 	}
 

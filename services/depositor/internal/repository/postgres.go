@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	maxBatchSize         = 128
-	batchWaitDelay       = 200 * time.Microsecond
+	maxBatchSize         = 256
+	batchWaitDelay       = 300 * time.Microsecond
 	batchFlushers        = 4
 	batchQueryTimeout    = 10 * time.Second
 	settlementBatchLimit = 100_000
@@ -32,6 +32,47 @@ type batchRequest struct {
 	ctx   context.Context
 	event *domain.DepositEvent
 	errCh chan error
+}
+
+// flusherWorkspace holds pre-allocated buffers for a single batchFlusherLoop goroutine
+// so executeBatch performs zero slice/map allocations on the hot path.
+type flusherWorkspace struct {
+	activeBatch      []*batchRequest
+	uniqueEventIDs   []string
+	userIDs          []int64
+	currencies       []string
+	amounts          []string
+	createdAts       []time.Time
+	duplicateInBatch []bool
+	seenInBatch      map[string]int
+	insertedSet      map[string]struct{}
+}
+
+func newFlusherWorkspace() *flusherWorkspace {
+	return &flusherWorkspace{
+		activeBatch:      make([]*batchRequest, 0, maxBatchSize),
+		uniqueEventIDs:   make([]string, 0, maxBatchSize),
+		userIDs:          make([]int64, 0, maxBatchSize),
+		currencies:       make([]string, 0, maxBatchSize),
+		amounts:          make([]string, 0, maxBatchSize),
+		createdAts:       make([]time.Time, 0, maxBatchSize),
+		duplicateInBatch: make([]bool, 0, maxBatchSize),
+		seenInBatch:      make(map[string]int, maxBatchSize),
+		insertedSet:      make(map[string]struct{}, maxBatchSize),
+	}
+}
+
+func (w *flusherWorkspace) reset() {
+	clear(w.activeBatch)
+	w.activeBatch = w.activeBatch[:0]
+	w.uniqueEventIDs = w.uniqueEventIDs[:0]
+	w.userIDs = w.userIDs[:0]
+	w.currencies = w.currencies[:0]
+	w.amounts = w.amounts[:0]
+	w.createdAts = w.createdAts[:0]
+	w.duplicateInBatch = w.duplicateInBatch[:0]
+	clear(w.seenInBatch)
+	clear(w.insertedSet)
 }
 
 type PostgresRepository struct {
@@ -56,7 +97,7 @@ func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath stri
 	r := &PostgresRepository{
 		db:      db,
 		logger:  logger,
-		batchCh: make(chan *batchRequest, 2048),
+		batchCh: make(chan *batchRequest, 4096),
 		stopCh:  make(chan struct{}),
 	}
 	for i := 0; i < batchFlushers; i++ {
@@ -186,14 +227,13 @@ func (r *PostgresRepository) ProcessDeposit(ctx context.Context, event *domain.D
 		return errors.New("repository is closing")
 	}
 
-	// Once queued into batchCh, wait for the exact ground-truth outcome from executeBatch
-	// so a caller never mistakes an already-committed row for a client-side context timeout.
 	return <-req.errCh
 }
 
 func (r *PostgresRepository) batchFlusherLoop() {
 	defer r.wg.Done()
 
+	ws := newFlusherWorkspace()
 	batch := make([]*batchRequest, 0, maxBatchSize)
 	timer := time.NewTimer(batchWaitDelay)
 	if !timer.Stop() {
@@ -211,12 +251,15 @@ func (r *PostgresRepository) batchFlusherLoop() {
 				case req := <-r.batchCh:
 					batch = append(batch, req)
 					if len(batch) >= maxBatchSize {
-						r.executeBatch(batch)
+						r.executeBatch(batch, ws)
+						clear(batch)
 						batch = batch[:0]
 					}
 				default:
 					if len(batch) > 0 {
-						r.executeBatch(batch)
+						r.executeBatch(batch, ws)
+						clear(batch)
+						batch = batch[:0]
 					}
 					return
 				}
@@ -234,7 +277,7 @@ func (r *PostgresRepository) batchFlusherLoop() {
 				}
 			}
 
-			if len(batch) < 8 {
+			if len(batch) < 16 {
 				timer.Reset(batchWaitDelay)
 			waitMore:
 				for len(batch) < maxBatchSize {
@@ -255,82 +298,75 @@ func (r *PostgresRepository) batchFlusherLoop() {
 				}
 			}
 
-			r.executeBatch(batch)
+			r.executeBatch(batch, ws)
+			clear(batch)
+			batch = batch[:0]
 		}
 	}
 }
 
-// newBatchQueryContext creates a bounded context for a batch SQL query that is NOT
-// poisoned if a single request's context expires, but immediately cancels if ALL
-// requests in activeBatch are canceled (e.g., on global SHUTDOWN_TIMEOUT).
 func newBatchQueryContext(activeBatch []*batchRequest, timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	doneCh := make(chan struct{})
+	exitedCh := make(chan struct{})
 
 	go func() {
+		defer close(exitedCh)
 		for _, req := range activeBatch {
 			if req.ctx == nil {
 				return
 			}
 			select {
 			case <-req.ctx.Done():
-				// This request canceled; check if remaining requests in the batch are also canceled
 			case <-doneCh:
 				return
 			case <-ctx.Done():
 				return
 			}
 		}
-		// Every single request in activeBatch has been canceled
 		cancel()
 	}()
 
 	return ctx, func() {
 		close(doneCh)
 		cancel()
+		<-exitedCh
 	}
 }
 
-func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
+func (r *PostgresRepository) executeBatch(batch []*batchRequest, ws *flusherWorkspace) {
 	if len(batch) == 0 {
 		return
 	}
 
-	activeBatch := make([]*batchRequest, 0, len(batch))
+	ws.reset()
+
 	for _, req := range batch {
 		if req.ctx != nil && req.ctx.Err() != nil {
 			req.errCh <- req.ctx.Err()
 			continue
 		}
-		activeBatch = append(activeBatch, req)
+		ws.activeBatch = append(ws.activeBatch, req)
 	}
 
-	n := len(activeBatch)
+	n := len(ws.activeBatch)
 	if n == 0 {
 		return
 	}
 
-	uniqueEventIDs := make([]string, 0, n)
-	userIDs := make([]int64, 0, n)
-	currencies := make([]string, 0, n)
-	amounts := make([]string, 0, n)
-	createdAts := make([]time.Time, 0, n)
-
-	seenInBatch := make(map[string]int, n)
-	duplicateInBatch := make([]bool, n)
-
-	for i, req := range activeBatch {
+	for i, req := range ws.activeBatch {
 		ev := req.event
-		if _, exists := seenInBatch[ev.EventID]; exists {
-			duplicateInBatch[i] = true
+		if _, exists := ws.seenInBatch[ev.EventID]; exists {
+			ws.duplicateInBatch = append(ws.duplicateInBatch, true)
 			continue
 		}
-		seenInBatch[ev.EventID] = i
-		uniqueEventIDs = append(uniqueEventIDs, ev.EventID)
-		userIDs = append(userIDs, int64(ev.UserID))
-		currencies = append(currencies, ev.Currency)
-		amounts = append(amounts, ev.Amount.String())
-		createdAts = append(createdAts, ev.CreatedAt)
+		ws.seenInBatch[ev.EventID] = i
+		ws.duplicateInBatch = append(ws.duplicateInBatch, false)
+		ws.uniqueEventIDs = append(ws.uniqueEventIDs, ev.EventID)
+		ws.userIDs = append(ws.userIDs, int64(ev.UserID))
+		ws.currencies = append(ws.currencies, ev.Currency)
+		ws.amounts = append(ws.amounts, ev.Amount.String())
+		ws.createdAts = append(ws.createdAts, ev.CreatedAt)
 	}
 
 	const insertDepositsQuery = `
@@ -346,42 +382,49 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 		RETURNING event_id
 	`
 
-	ctx, cancel := newBatchQueryContext(activeBatch, batchQueryTimeout)
+	ctx, cancel := newBatchQueryContext(ws.activeBatch, batchQueryTimeout)
 	defer cancel()
 
-	rows, err := r.db.QueryContext(ctx, insertDepositsQuery, uniqueEventIDs, userIDs, currencies, amounts, createdAts)
+	rows, err := r.db.QueryContext(
+		ctx,
+		insertDepositsQuery,
+		ws.uniqueEventIDs,
+		ws.userIDs,
+		ws.currencies,
+		ws.amounts,
+		ws.createdAts,
+	)
 	if err != nil {
-		for _, req := range activeBatch {
+		for _, req := range ws.activeBatch {
 			req.errCh <- fmt.Errorf("failed to execute deposit ingestion batch: %w", err)
 		}
 		return
 	}
 	defer func() { _ = rows.Close() }()
 
-	insertedSet := make(map[string]struct{}, len(uniqueEventIDs))
 	for rows.Next() {
 		var id string
 		if scanErr := rows.Scan(&id); scanErr != nil {
-			for _, req := range activeBatch {
+			for _, req := range ws.activeBatch {
 				req.errCh <- fmt.Errorf("failed to scan inserted event_id: %w", scanErr)
 			}
 			return
 		}
-		insertedSet[id] = struct{}{}
+		ws.insertedSet[id] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
-		for _, req := range activeBatch {
+		for _, req := range ws.activeBatch {
 			req.errCh <- fmt.Errorf("error reading deposit ingestion result: %w", err)
 		}
 		return
 	}
 
-	for i, req := range activeBatch {
-		if duplicateInBatch[i] {
+	for i, req := range ws.activeBatch {
+		if ws.duplicateInBatch[i] {
 			req.errCh <- domain.ErrDuplicateEvent
 			continue
 		}
-		if _, inserted := insertedSet[req.event.EventID]; inserted {
+		if _, inserted := ws.insertedSet[req.event.EventID]; inserted {
 			req.errCh <- nil
 		} else {
 			req.errCh <- domain.ErrDuplicateEvent

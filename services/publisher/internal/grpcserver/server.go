@@ -2,11 +2,10 @@ package grpcserver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"hash/fnv"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 
@@ -146,6 +145,33 @@ func (s *Server) forgetPayloadIfUncommitted(eventID string) {
 	}
 }
 
+func buildPublisherFingerprint(userID int, currency, amountStr string) string {
+	var buf [64]byte
+	b := strconv.AppendInt(buf[:0], int64(userID), 10)
+	b = append(b, ':')
+	b = append(b, currency...)
+	b = append(b, ':')
+	b = append(b, amountStr...)
+	return string(b)
+}
+
+// marshalValidatedEventFast serializes a validated DepositEvent into JSON without reflection.
+func marshalValidatedEventFast(ev *domain.DepositEvent, amountStr string) []byte {
+	b := make([]byte, 0, 160)
+	b = append(b, `{"event_id":"`...)
+	b = append(b, ev.EventID...)
+	b = append(b, `","user_id":`...)
+	b = strconv.AppendInt(b, int64(ev.UserID), 10)
+	b = append(b, `,"currency":"`...)
+	b = append(b, ev.Currency...)
+	b = append(b, `","amount":"`...)
+	b = append(b, amountStr...)
+	b = append(b, `","created_at":"`...)
+	b = ev.CreatedAt.UTC().AppendFormat(b, time.RFC3339Nano)
+	b = append(b, `"}`...)
+	return b
+}
+
 func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
 	var receivedAt time.Time
 	var draining bool
@@ -202,7 +228,8 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	fingerprint := fmt.Sprintf("%d:%s:%s", event.UserID, event.Currency, event.Amount.String())
+	normAmountStr := event.Amount.String()
+	fingerprint := buildPublisherFingerprint(event.UserID, event.Currency, normAmountStr)
 	if !s.checkOrRememberPayload(event.EventID, fingerprint) {
 		log.Warn("Rejected conflicting idempotency key with different deposit parameters",
 			zap.String("event_id", event.EventID),
@@ -210,12 +237,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		return nil, status.Error(codes.AlreadyExists, "event_id was already used with different deposit parameters")
 	}
 
-	payload, err := json.Marshal(event)
-	if err != nil {
-		s.forgetPayloadIfUncommitted(event.EventID)
-		log.Error("Failed to marshal validated deposit event", zap.Error(err))
-		return nil, status.Error(codes.Internal, "failed to serialize deposit event")
-	}
+	payload := marshalValidatedEventFast(event, normAmountStr)
 
 	ack, err := s.broker.PublishDeposit(ctx, event.EventID, payload)
 	if err != nil {
@@ -239,7 +261,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		zap.String("event_id", event.EventID),
 		zap.Int("user_id", event.UserID),
 		zap.String("currency", event.Currency),
-		zap.String("amount", event.Amount.String()),
+		zap.String("amount", normAmountStr),
 		zap.Uint64("stream_sequence", ack.Sequence),
 		zap.Bool("duplicate", ack.Duplicate),
 	)

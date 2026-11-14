@@ -7,10 +7,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +38,12 @@ const (
 	maxIdemEntriesPerShard = 4096
 	readyCacheTTL          = 1 * time.Second
 )
+
+var bodyBufferPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 256))
+	},
+}
 
 type ErrorBody struct {
 	Error ErrorDetail `json:"error"`
@@ -120,7 +126,6 @@ func (g *idempotencyPayloadGuard) checkOrRemember(eventID, fingerprint string) b
 			if existing.fingerprint != fingerprint {
 				return false
 			}
-			// Promote active key into current generation while preserving committed state
 			if len(shard.current) >= maxIdemEntriesPerShard {
 				shard.previous = shard.current
 				shard.current = make(map[string]idemEntry, maxIdemEntriesPerShard)
@@ -164,9 +169,6 @@ func (g *idempotencyPayloadGuard) markCommitted(eventID, fingerprint string) {
 	}
 }
 
-// forgetIfUncommitted removes an idempotency key only if no request with this key
-// has succeeded yet. This prevents a concurrent failed retry from erasing an already
-// committed key's fingerprint.
 func (g *idempotencyPayloadGuard) forgetIfUncommitted(eventID string) {
 	shard := g.shardFor(eventID)
 
@@ -186,6 +188,16 @@ func (g *idempotencyPayloadGuard) forgetIfUncommitted(eventID string) {
 	if shard.previous != nil {
 		delete(shard.previous, eventID)
 	}
+}
+
+func buildFingerprint(userID int, currency, amountStr string) string {
+	var buf [64]byte
+	b := strconv.AppendInt(buf[:0], int64(userID), 10)
+	b = append(b, ':')
+	b = append(b, currency...)
+	b = append(b, ':')
+	b = append(b, amountStr...)
+	return string(b)
 }
 
 type GatewayOption func(*GatewayHandler)
@@ -365,8 +377,6 @@ func (h *GatewayHandler) isPublisherReady(ctx context.Context) bool {
 	return ready
 }
 
-// isPublisherReadyNonBlocking returns the cached readiness state immediately so /stats
-// never blocks on network I/O, refreshing the state asynchronously when the TTL expires.
 func (h *GatewayHandler) isPublisherReadyNonBlocking(ctx context.Context) bool {
 	if h.healthClient == nil {
 		return false
@@ -375,7 +385,6 @@ func (h *GatewayHandler) isPublisherReadyNonBlocking(ctx context.Context) bool {
 	untilNs := h.cachedReadyUntil.Load()
 	nowNs := time.Now().UnixNano()
 
-	// Perform a synchronous check only on the very first call before cache initialization
 	if untilNs == 0 {
 		return h.isPublisherReady(ctx)
 	}
@@ -435,8 +444,15 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
-	bodyBytes, err := io.ReadAll(c.Request.Body)
-	if err != nil {
+	buf := bodyBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer func() {
+		if buf.Cap() <= MaxBodyBytes*2 {
+			bodyBufferPool.Put(buf)
+		}
+	}()
+
+	if _, err := buf.ReadFrom(c.Request.Body); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
 			h.payloadLarge413.Add(1)
@@ -448,7 +464,8 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
-	if len(bytes.TrimSpace(bodyBytes)) == 0 {
+	bodyBytes := bytes.TrimSpace(buf.Bytes())
+	if len(bodyBytes) == 0 {
 		h.badRequest400.Add(1)
 		respondError(c, http.StatusBadRequest, "INVALID_JSON", "request body cannot be empty")
 		return
@@ -468,8 +485,8 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
-	var amountStr string
-	if err := json.Unmarshal(req.Amount, &amountStr); err != nil {
+	amountStr, err := domain.UnquoteJSONStringFast(req.Amount)
+	if err != nil {
 		h.badRequest400.Add(1)
 		respondError(c, http.StatusBadRequest, "VALIDATION_ERROR", "amount must be a valid string")
 		return
@@ -489,7 +506,8 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
-	fingerprint := fmt.Sprintf("%d:%s:%s", validatedEvent.UserID, validatedEvent.Currency, validatedEvent.Amount.String())
+	normAmountStr := validatedEvent.Amount.String()
+	fingerprint := buildFingerprint(validatedEvent.UserID, validatedEvent.Currency, normAmountStr)
 	if !h.idemGuard.checkOrRemember(validatedEvent.EventID, fingerprint) {
 		respondError(c, http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", "Idempotency-Key was already used with different deposit parameters")
 		return
@@ -503,7 +521,7 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		EventId:   validatedEvent.EventID,
 		UserId:    int64(validatedEvent.UserID),
 		Currency:  validatedEvent.Currency,
-		Amount:    validatedEvent.Amount.String(),
+		Amount:    normAmountStr,
 		CreatedAt: timestamppb.New(validatedEvent.CreatedAt),
 	})
 	if err != nil {

@@ -13,6 +13,8 @@ var ErrWorkerAlreadyStopped = fmt.Errorf("worker is already stopped")
 
 var ErrInvalidWorkerID = fmt.Errorf("invalid worker ID")
 
+const workerPullBatchSize = 128
+
 type ConsumerGroup struct {
 	workerCount int
 	consumer    jetstream.Consumer
@@ -49,7 +51,7 @@ func (cg *ConsumerGroup) Start() error {
 			func(msg jetstream.Msg) {
 				cg.processor.HandleMessage(workerID, msg)
 			},
-			jetstream.PullMaxMessages(32),
+			jetstream.PullMaxMessages(workerPullBatchSize),
 		)
 		if err != nil {
 			for _, activeCtx := range cg.members {
@@ -88,7 +90,7 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 				func(msg jetstream.Msg) {
 					cg.processor.HandleMessage(workerID, msg)
 				},
-				jetstream.PullMaxMessages(32),
+				jetstream.PullMaxMessages(workerPullBatchSize),
 			)
 			if err == nil {
 				break
@@ -109,7 +111,6 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 			oldContexts = append(oldContexts, oldCtx)
 			cg.logger.Info("Worker rebound to NATS consumer after reconnect", zap.Int("worker_id", workerID))
 		} else {
-			// Worker was stopped while rebind was in progress
 			consumeCtx.Drain()
 		}
 		cg.mu.Unlock()
