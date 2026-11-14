@@ -24,10 +24,10 @@ func ConnectAndMigrate(ctx context.Context, databaseURL, migrationsPath string, 
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
 
-	db.SetMaxOpenConns(64)
-	db.SetMaxIdleConns(64)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(15)
 	db.SetConnMaxLifetime(30 * time.Minute)
-	db.SetConnMaxIdleTime(10 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	backoff := 500 * time.Millisecond
 	const maxBackoff = 5 * time.Second

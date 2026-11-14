@@ -5,7 +5,16 @@ STACK_NAME="${STACK_NAME:-deposit}"
 PUB_SERVICE="${STACK_NAME}_publisher"
 DEP_SERVICE="${STACK_NAME}_depositor"
 CHAOS_LOG="${CHAOS_LOG:-chaos.log}"
+DASHBOARD_STATS_URL="${DASHBOARD_STATS_URL:-http://localhost:8080/api/stats}"
 GATEWAY_STATS_URL="${GATEWAY_STATS_URL:-http://localhost:8081/stats}"
+LOCK_FILE="/tmp/reliable_deposit_chaos.lock"
+
+# Prevent concurrent executions of chaos.sh from colliding on Swarm services and chaos.log
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Another instance of chaos.sh is already running (lock: $LOCK_FILE). Exiting."
+    exit 0
+fi
 
 log_event() {
     local ts
@@ -14,12 +23,12 @@ log_event() {
 }
 
 sample_cluster_state() {
-    local ts pub_running gw_stats gw_total gw_5xx
+    local ts pub_running stats_json gw_total gw_5xx
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     pub_running="$(docker ps -qf "name=${PUB_SERVICE}" | wc -l | tr -d ' ')"
-    gw_stats="$(curl -sf "$GATEWAY_STATS_URL" || echo '{}')"
-    gw_total="$(echo "$gw_stats" | grep -o '"total_requests":[0-9]*' | cut -d: -f2 || echo 0)"
-    gw_5xx="$(echo "$gw_stats" | grep -o '"upstream_error_5xx":[0-9]*' | cut -d: -f2 || echo 0)"
+    stats_json="$(curl -sf "$DASHBOARD_STATS_URL" || curl -sf "$GATEWAY_STATS_URL" || echo '{}')"
+    gw_total="$(echo "$stats_json" | grep -o '"total_requests":[0-9]*' | head -n 1 | cut -d: -f2 || echo 0)"
+    gw_5xx="$(echo "$stats_json" | grep -o '"upstream_error_5xx":[0-9]*' | head -n 1 | cut -d: -f2 || echo 0)"
     echo "[$ts] [TELEMETRY] publisher_replicas=${pub_running} gateway_total_reqs=${gw_total:-0} gateway_5xx=${gw_5xx:-0}" | tee -a "$CHAOS_LOG"
 }
 
@@ -38,7 +47,14 @@ kill_one_publisher() {
     if (( running_count < 2 )); then
         log_event "PRE_KILL_SCALE ensuring at least 2 publisher replicas before SIGKILL (${label})"
         docker service scale "${PUB_SERVICE}=2" >/dev/null
-        sleep 5
+        for _ in {1..15}; do
+            running_count="$(docker ps -qf "name=${PUB_SERVICE}" | wc -l | tr -d ' ')"
+            if (( running_count >= 2 )); then
+                break
+            fi
+            sleep 1
+        done
+        sleep 3
     fi
     local cid
     cid="$(docker ps -qf "name=${PUB_SERVICE}" | head -n 1)"

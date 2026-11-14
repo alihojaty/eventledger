@@ -1,0 +1,2107 @@
+-e 
+
+=== FILE: ./broker/jetstream.go ===
+package broker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"go.uber.org/zap"
+)
+
+const (
+	StreamDeposits       = "DEPOSITS"
+	SubjectDepositEvents = "deposits.events"
+
+	StreamDepositsDLQ  = "DEPOSITS_DLQ"
+	SubjectDepositsDLQ = "deposits.dlq"
+
+	ConsumerDurableName = "deposits_processor"
+
+	DeduplicationWindow = 10 * time.Minute
+	DefaultAckWait      = 15 * time.Second
+)
+
+type Broker interface {
+	PublishDeposit(ctx context.Context, eventID string, payload []byte) (*jetstream.PubAck, error)
+	PublishDepositAsync(eventID string, payload []byte) (jetstream.PubAckFuture, error)
+	PublishAsyncComplete() <-chan struct{}
+	PublishDLQ(ctx context.Context, dlqMsg domain.DLQMessage) error
+	CreateOrUpdateDepositConsumer(ctx context.Context, maxAckPending int) (jetstream.Consumer, error)
+	CreateOrUpdateDepositConsumerWithAckWait(ctx context.Context, maxAckPending int, ackWait time.Duration) (jetstream.Consumer, error)
+	Close()
+}
+
+type NATSBroker struct {
+	nc     *nats.Conn
+	js     jetstream.JetStream
+	logger *zap.Logger
+
+	mu                 sync.Mutex
+	reconnecting       atomic.Bool
+	onReconnectHooks   []func(ctx context.Context)
+	hasConsumerConfig  bool
+	savedMaxAckPending int
+	savedAckWait       time.Duration
+}
+
+func NewNATSBroker(ctx context.Context, natsURL string, logger *zap.Logger) (*NATSBroker, error) {
+	b := &NATSBroker{
+		logger: logger,
+	}
+
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		nc, err := nats.Connect(
+			natsURL,
+			nats.Name("reliable-deposit-processor"),
+			nats.Timeout(5*time.Second),
+			nats.MaxReconnects(-1),
+			nats.ReconnectWait(1*time.Second),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				logger.Warn("Temporary failure",
+					zap.String("component", "nats_broker"),
+					zap.String("event", "disconnected from NATS"),
+					zap.Error(err),
+				)
+			}),
+			nats.ReconnectHandler(func(nc *nats.Conn) {
+				logger.Info("Reconnected to Message Broker", zap.String("url", nc.ConnectedUrl()))
+				go b.handleReconnected()
+			}),
+		)
+		if err == nil {
+			js, jsErr := jetstream.New(nc, jetstream.WithPublishAsyncMaxPending(65536))
+			if jsErr == nil {
+				b.nc = nc
+				b.js = js
+				setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				streamErr := b.setupStreams(setupCtx)
+				cancel()
+				if streamErr == nil {
+					logger.Info("Connected to Message Broker")
+					return b, nil
+				}
+				err = streamErr
+			} else {
+				err = jsErr
+			}
+			nc.Close()
+		}
+
+		logger.Warn("Waiting for NATS JetStream broker to become ready",
+			zap.String("nats_url", natsURL),
+			zap.Int("attempt", attempt),
+			zap.Duration("retry_in", backoff),
+			zap.Error(err),
+		)
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("failed to connect to NATS server before context canceled: %w", err)
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+func (b *NATSBroker) OnReconnect(fn func(ctx context.Context)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onReconnectHooks = append(b.onReconnectHooks, fn)
+}
+
+func (b *NATSBroker) handleReconnected() {
+	if !b.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	defer b.reconnecting.Store(false)
+
+	b.mu.Lock()
+	hasConsumer := b.hasConsumerConfig
+	maxAck := b.savedMaxAckPending
+	ackWait := b.savedAckWait
+	hooks := append([]func(ctx context.Context){}, b.onReconnectHooks...)
+	b.mu.Unlock()
+
+	for attempt := 1; attempt <= 10; attempt++ {
+		if !b.IsConnected() {
+			return
+		}
+		reconnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := b.setupStreams(reconnCtx)
+		if err == nil && hasConsumer && len(hooks) == 0 {
+			_, err = b.CreateOrUpdateDepositConsumerWithAckWait(reconnCtx, maxAck, ackWait)
+		}
+		cancel()
+
+		if err == nil {
+			for _, hook := range hooks {
+				hookCtx, hCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				hook(hookCtx)
+				hCancel()
+			}
+			return
+		}
+
+		b.logger.Warn("Retrying stream/consumer provisioning after NATS reconnect",
+			zap.Int("attempt", attempt),
+			zap.Error(err),
+		)
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (b *NATSBroker) setupStreams(ctx context.Context) error {
+	_, err := b.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:       StreamDeposits,
+		Subjects:   []string{SubjectDepositEvents},
+		Storage:    jetstream.FileStorage,
+		Duplicates: DeduplicationWindow,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create or update %s stream: %w", StreamDeposits, err)
+	}
+
+	_, err = b.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:       StreamDepositsDLQ,
+		Subjects:   []string{SubjectDepositsDLQ},
+		Storage:    jetstream.FileStorage,
+		Duplicates: DeduplicationWindow,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create or update %s stream: %w", StreamDepositsDLQ, err)
+	}
+
+	return nil
+}
+
+func (b *NATSBroker) CreateOrUpdateDepositConsumer(ctx context.Context, maxAckPending int) (jetstream.Consumer, error) {
+	return b.CreateOrUpdateDepositConsumerWithAckWait(ctx, maxAckPending, DefaultAckWait)
+}
+
+func (b *NATSBroker) CreateOrUpdateDepositConsumerWithAckWait(
+	ctx context.Context,
+	maxAckPending int,
+	ackWait time.Duration,
+) (jetstream.Consumer, error) {
+	if maxAckPending <= 0 {
+		maxAckPending = 100
+	}
+	if ackWait <= 0 {
+		ackWait = DefaultAckWait
+	}
+
+	b.mu.Lock()
+	b.hasConsumerConfig = true
+	b.savedMaxAckPending = maxAckPending
+	b.savedAckWait = ackWait
+	b.mu.Unlock()
+
+	consumer, err := b.js.CreateOrUpdateConsumer(ctx, StreamDeposits, jetstream.ConsumerConfig{
+		Durable:       ConsumerDurableName,
+		FilterSubject: SubjectDepositEvents,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       ackWait,
+		MaxDeliver:    -1,
+		MaxAckPending: maxAckPending,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create or update durable consumer %s: %w", ConsumerDurableName, err)
+	}
+
+	return consumer, nil
+}
+
+func (b *NATSBroker) PublishDeposit(ctx context.Context, eventID string, payload []byte) (*jetstream.PubAck, error) {
+	var opts []jetstream.PublishOpt
+	if eventID != "" {
+		opts = append(opts, jetstream.WithMsgID(eventID))
+	}
+
+	ack, err := b.js.Publish(ctx, SubjectDepositEvents, payload, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, err)
+	}
+
+	return ack, nil
+}
+
+func (b *NATSBroker) PublishDepositAsync(eventID string, payload []byte) (jetstream.PubAckFuture, error) {
+	var opts []jetstream.PublishOpt
+	if eventID != "" {
+		opts = append(opts, jetstream.WithMsgID(eventID))
+	}
+	return b.js.PublishAsync(SubjectDepositEvents, payload, opts...)
+}
+
+func (b *NATSBroker) PublishAsyncComplete() <-chan struct{} {
+	return b.js.PublishAsyncComplete()
+}
+
+func (b *NATSBroker) PublishDLQ(ctx context.Context, dlqMsg domain.DLQMessage) error {
+	data, err := json.Marshal(dlqMsg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal DLQ message: %w", err)
+	}
+
+	var opts []jetstream.PublishOpt
+	if dlqMsg.SourceStream != "" && dlqMsg.StreamSequence > 0 {
+		dlqMsgID := fmt.Sprintf("dlq-%s-%d", dlqMsg.SourceStream, dlqMsg.StreamSequence)
+		opts = append(opts, jetstream.WithMsgID(dlqMsgID))
+	} else if dlqMsg.EventID != "" {
+		opts = append(opts, jetstream.WithMsgID("dlq-evt-"+dlqMsg.EventID))
+	}
+
+	_, err = b.js.Publish(ctx, SubjectDepositsDLQ, data, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to publish message to %s: %w", StreamDepositsDLQ, err)
+	}
+
+	return nil
+}
+
+func (b *NATSBroker) JetStream() jetstream.JetStream {
+	return b.js
+}
+
+func (b *NATSBroker) Close() {
+	if b.nc != nil {
+		if b.js != nil {
+			select {
+			case <-b.js.PublishAsyncComplete():
+			case <-time.After(1 * time.Second):
+			}
+		}
+		_ = b.nc.FlushTimeout(2 * time.Second)
+		b.nc.Close()
+		b.logger.Info("Message Broker connection closed")
+	}
+}
+
+type QueueStats struct {
+	StreamTotalMsgs uint64 `json:"stream_total_msgs"`
+	DLQTotalMsgs    uint64 `json:"dlq_total_msgs"`
+	ConsumerPending uint64 `json:"consumer_pending"`
+	AckFloorSeq     uint64 `json:"ack_floor_seq"`
+	NextSequence    uint64 `json:"next_sequence"`
+}
+
+func (b *NATSBroker) GetQueueStats(ctx context.Context) (QueueStats, error) {
+	var stats QueueStats
+
+	if s, err := b.js.Stream(ctx, StreamDeposits); err == nil {
+		if info, err := s.Info(ctx); err == nil {
+			stats.StreamTotalMsgs = info.State.Msgs
+		}
+		if c, err := s.Consumer(ctx, ConsumerDurableName); err == nil {
+			if cInfo, err := c.Info(ctx); err == nil {
+				stats.ConsumerPending = cInfo.NumPending + uint64(cInfo.NumAckPending)
+				stats.AckFloorSeq = cInfo.AckFloor.Stream
+				if stats.ConsumerPending > 0 {
+					stats.NextSequence = cInfo.AckFloor.Stream + 1
+				}
+			}
+		}
+	}
+
+	if dlq, err := b.js.Stream(ctx, StreamDepositsDLQ); err == nil {
+		if info, err := dlq.Info(ctx); err == nil {
+			stats.DLQTotalMsgs = info.State.Msgs
+		}
+	}
+
+	return stats, nil
+}
+
+func (b *NATSBroker) IsConnected() bool {
+	return b.nc != nil && b.nc.IsConnected()
+}
+-e 
+
+=== FILE: ./broker/jetstream_test.go ===
+package broker
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
+	"github.com/google/uuid"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/nats-io/nats.go/jetstream"
+	"go.uber.org/zap"
+)
+
+func setupTestBroker(t *testing.T) *NATSBroker {
+	t.Helper()
+
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://postgres:postgres@localhost:5432/deposits_db?sslmode=disable"
+	}
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = "nats://localhost:4222"
+	}
+
+	ctx := context.Background()
+	nopLogger := zap.NewNop()
+
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		t.Fatalf("failed to open db for advisory lock: %v", err)
+	}
+	lockConn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("failed to get lock conn: %v", err)
+	}
+	if _, err := lockConn.ExecContext(ctx, "SELECT pg_advisory_lock(998877)"); err != nil {
+		_ = lockConn.Close()
+		_ = db.Close()
+		t.Fatalf("failed to acquire advisory lock: %v", err)
+	}
+
+	b, err := NewNATSBroker(ctx, natsURL, nopLogger)
+	if err != nil {
+		_, _ = lockConn.ExecContext(ctx, "SELECT pg_advisory_unlock(998877)")
+		_ = lockConn.Close()
+		_ = db.Close()
+		t.Fatalf("failed to connect to NATS: %v", err)
+	}
+
+	if stream, err := b.JetStream().Stream(ctx, StreamDeposits); err == nil {
+		_ = stream.Purge(ctx)
+	}
+	if dlqStream, err := b.JetStream().Stream(ctx, StreamDepositsDLQ); err == nil {
+		_ = dlqStream.Purge(ctx)
+	}
+
+	t.Cleanup(func() {
+		b.Close()
+		_, _ = lockConn.ExecContext(ctx, "SELECT pg_advisory_unlock(998877)")
+		_ = lockConn.Close()
+		_ = db.Close()
+	})
+
+	return b
+}
+
+func TestNATSBroker_PublishDeduplication(t *testing.T) {
+	b := setupTestBroker(t)
+	ctx := context.Background()
+
+	eventID := "evt-dedup-" + uuid.NewString()
+	payload := []byte(`{"event_id":"` + eventID + `","user_id":1,"currency":"USDT","amount":"100","created_at":"2026-10-04T10:00:00Z"}`)
+
+	ack1, err := b.PublishDeposit(ctx, eventID, payload)
+	if err != nil {
+		t.Fatalf("first publish failed: %v", err)
+	}
+	if ack1.Duplicate {
+		t.Errorf("expected first publish Duplicate=false, got true")
+	}
+
+	ack2, err := b.PublishDeposit(ctx, eventID, payload)
+	if err != nil {
+		t.Fatalf("second publish failed: %v", err)
+	}
+	if !ack2.Duplicate {
+		t.Errorf("expected second publish with same MsgID to return Duplicate=true, got false")
+	}
+	if ack1.Sequence != ack2.Sequence {
+		t.Errorf("expected both PubAcks to point to the same stream sequence %d, got %d", ack1.Sequence, ack2.Sequence)
+	}
+
+	stream, err := b.JetStream().Stream(ctx, StreamDeposits)
+	if err != nil {
+		t.Fatalf("failed to get stream info: %v", err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatalf("failed to get stream state: %v", err)
+	}
+	if info.State.Msgs != 1 {
+		t.Errorf("expected exactly 1 message in DEPOSITS stream after duplicate publish, got %d", info.State.Msgs)
+	}
+}
+
+func TestNATSBroker_PublishDLQ(t *testing.T) {
+	b := setupTestBroker(t)
+	ctx := context.Background()
+
+	dlqPayload := domain.DLQMessage{
+		OriginalEvent: `{"event_id":"bad-1","currency":"DOGE"}`,
+		Reason:        "unsupported currency \"DOGE\"",
+		Timestamp:     time.Now().UTC().Truncate(time.Second),
+	}
+
+	if err := b.PublishDLQ(ctx, dlqPayload); err != nil {
+		t.Fatalf("failed to publish to DLQ: %v", err)
+	}
+
+	dlqConsumer, err := b.JetStream().CreateOrUpdateConsumer(ctx, StreamDepositsDLQ, jetstream.ConsumerConfig{
+		AckPolicy: jetstream.AckExplicitPolicy,
+	})
+	if err != nil {
+		t.Fatalf("failed to create DLQ consumer: %v", err)
+	}
+
+	msgs, err := dlqConsumer.Fetch(1, jetstream.FetchMaxWait(2*time.Second))
+	if err != nil {
+		t.Fatalf("failed to fetch message from DLQ: %v", err)
+	}
+
+	var received domain.DLQMessage
+	count := 0
+	for msg := range msgs.Messages() {
+		count++
+		if err := json.Unmarshal(msg.Data(), &received); err != nil {
+			t.Fatalf("failed to unmarshal DLQ message: %v", err)
+		}
+		_ = msg.Ack()
+	}
+
+	if count != 1 {
+		t.Fatalf("expected 1 message in DLQ stream, got %d", count)
+	}
+	if received.Reason != dlqPayload.Reason || received.OriginalEvent != dlqPayload.OriginalEvent {
+		t.Errorf("DLQ message mismatch: got %+v, want %+v", received, dlqPayload)
+	}
+}
+-e 
+
+=== FILE: ./pb/deposit/v1/deposit.proto ===
+syntax = "proto3";
+
+package deposit.v1;
+
+option go_package = "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1;depositv1";
+
+import "google/protobuf/timestamp.proto";
+
+service DepositPublisherService {
+  rpc PublishDeposit(PublishDepositRequest) returns (PublishDepositResponse);
+}
+
+message PublishDepositRequest {
+  string event_id = 1;
+  int64 user_id = 2;
+  string currency = 3;
+  string amount = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message PublishDepositResponse {
+  uint64 stream_sequence = 1;
+  bool duplicate = 2;
+}-e 
+
+=== FILE: ./pb/deposit/v1/deposit.pb.go ===
+// Code generated by protoc-gen-go. DO NOT EDIT.
+// versions:
+// 	protoc-gen-go v1.36.12
+// 	protoc        v3.21.12
+// source: pkg/pb/deposit/v1/deposit.proto
+
+package depositv1
+
+import (
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
+)
+
+const (
+	// Verify that this generated code is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(20 - protoimpl.MinVersion)
+	// Verify that runtime/protoimpl is sufficiently up-to-date.
+	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
+)
+
+type PublishDepositRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	EventId       string                 `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	UserId        int64                  `protobuf:"varint,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	Currency      string                 `protobuf:"bytes,3,opt,name=currency,proto3" json:"currency,omitempty"`
+	Amount        string                 `protobuf:"bytes,4,opt,name=amount,proto3" json:"amount,omitempty"`
+	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishDepositRequest) Reset() {
+	*x = PublishDepositRequest{}
+	mi := &file_pkg_pb_deposit_v1_deposit_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishDepositRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishDepositRequest) ProtoMessage() {}
+
+func (x *PublishDepositRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_pb_deposit_v1_deposit_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishDepositRequest.ProtoReflect.Descriptor instead.
+func (*PublishDepositRequest) Descriptor() ([]byte, []int) {
+	return file_pkg_pb_deposit_v1_deposit_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *PublishDepositRequest) GetEventId() string {
+	if x != nil {
+		return x.EventId
+	}
+	return ""
+}
+
+func (x *PublishDepositRequest) GetUserId() int64 {
+	if x != nil {
+		return x.UserId
+	}
+	return 0
+}
+
+func (x *PublishDepositRequest) GetCurrency() string {
+	if x != nil {
+		return x.Currency
+	}
+	return ""
+}
+
+func (x *PublishDepositRequest) GetAmount() string {
+	if x != nil {
+		return x.Amount
+	}
+	return ""
+}
+
+func (x *PublishDepositRequest) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
+type PublishDepositResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	StreamSequence uint64                 `protobuf:"varint,1,opt,name=stream_sequence,json=streamSequence,proto3" json:"stream_sequence,omitempty"`
+	Duplicate      bool                   `protobuf:"varint,2,opt,name=duplicate,proto3" json:"duplicate,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PublishDepositResponse) Reset() {
+	*x = PublishDepositResponse{}
+	mi := &file_pkg_pb_deposit_v1_deposit_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishDepositResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishDepositResponse) ProtoMessage() {}
+
+func (x *PublishDepositResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_pkg_pb_deposit_v1_deposit_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishDepositResponse.ProtoReflect.Descriptor instead.
+func (*PublishDepositResponse) Descriptor() ([]byte, []int) {
+	return file_pkg_pb_deposit_v1_deposit_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *PublishDepositResponse) GetStreamSequence() uint64 {
+	if x != nil {
+		return x.StreamSequence
+	}
+	return 0
+}
+
+func (x *PublishDepositResponse) GetDuplicate() bool {
+	if x != nil {
+		return x.Duplicate
+	}
+	return false
+}
+
+var File_pkg_pb_deposit_v1_deposit_proto protoreflect.FileDescriptor
+
+const file_pkg_pb_deposit_v1_deposit_proto_rawDesc = "" +
+	"\n" +
+	"\x1fpkg/pb/deposit/v1/deposit.proto\x12\n" +
+	"deposit.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xba\x01\n" +
+	"\x15PublishDepositRequest\x12\x19\n" +
+	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\x03R\x06userId\x12\x1a\n" +
+	"\bcurrency\x18\x03 \x01(\tR\bcurrency\x12\x16\n" +
+	"\x06amount\x18\x04 \x01(\tR\x06amount\x129\n" +
+	"\n" +
+	"created_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"_\n" +
+	"\x16PublishDepositResponse\x12'\n" +
+	"\x0fstream_sequence\x18\x01 \x01(\x04R\x0estreamSequence\x12\x1c\n" +
+	"\tduplicate\x18\x02 \x01(\bR\tduplicate2r\n" +
+	"\x17DepositPublisherService\x12W\n" +
+	"\x0ePublishDeposit\x12!.deposit.v1.PublishDepositRequest\x1a\".deposit.v1.PublishDepositResponseBMZKgithub.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1;depositv1b\x06proto3"
+
+var (
+	file_pkg_pb_deposit_v1_deposit_proto_rawDescOnce sync.Once
+	file_pkg_pb_deposit_v1_deposit_proto_rawDescData []byte
+)
+
+func file_pkg_pb_deposit_v1_deposit_proto_rawDescGZIP() []byte {
+	file_pkg_pb_deposit_v1_deposit_proto_rawDescOnce.Do(func() {
+		file_pkg_pb_deposit_v1_deposit_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_pkg_pb_deposit_v1_deposit_proto_rawDesc), len(file_pkg_pb_deposit_v1_deposit_proto_rawDesc)))
+	})
+	return file_pkg_pb_deposit_v1_deposit_proto_rawDescData
+}
+
+var file_pkg_pb_deposit_v1_deposit_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
+var file_pkg_pb_deposit_v1_deposit_proto_goTypes = []any{
+	(*PublishDepositRequest)(nil),  // 0: deposit.v1.PublishDepositRequest
+	(*PublishDepositResponse)(nil), // 1: deposit.v1.PublishDepositResponse
+	(*timestamppb.Timestamp)(nil),  // 2: google.protobuf.Timestamp
+}
+var file_pkg_pb_deposit_v1_deposit_proto_depIdxs = []int32{
+	2, // 0: deposit.v1.PublishDepositRequest.created_at:type_name -> google.protobuf.Timestamp
+	0, // 1: deposit.v1.DepositPublisherService.PublishDeposit:input_type -> deposit.v1.PublishDepositRequest
+	1, // 2: deposit.v1.DepositPublisherService.PublishDeposit:output_type -> deposit.v1.PublishDepositResponse
+	2, // [2:3] is the sub-list for method output_type
+	1, // [1:2] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
+}
+
+func init() { file_pkg_pb_deposit_v1_deposit_proto_init() }
+func file_pkg_pb_deposit_v1_deposit_proto_init() {
+	if File_pkg_pb_deposit_v1_deposit_proto != nil {
+		return
+	}
+	type x struct{}
+	out := protoimpl.TypeBuilder{
+		File: protoimpl.DescBuilder{
+			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_pb_deposit_v1_deposit_proto_rawDesc), len(file_pkg_pb_deposit_v1_deposit_proto_rawDesc)),
+			NumEnums:      0,
+			NumMessages:   2,
+			NumExtensions: 0,
+			NumServices:   1,
+		},
+		GoTypes:           file_pkg_pb_deposit_v1_deposit_proto_goTypes,
+		DependencyIndexes: file_pkg_pb_deposit_v1_deposit_proto_depIdxs,
+		MessageInfos:      file_pkg_pb_deposit_v1_deposit_proto_msgTypes,
+	}.Build()
+	File_pkg_pb_deposit_v1_deposit_proto = out.File
+	file_pkg_pb_deposit_v1_deposit_proto_goTypes = nil
+	file_pkg_pb_deposit_v1_deposit_proto_depIdxs = nil
+}
+-e 
+
+=== FILE: ./pb/deposit/v1/deposit_grpc.pb.go ===
+// Code generated by protoc-gen-go-grpc. DO NOT EDIT.
+// versions:
+// - protoc-gen-go-grpc v1.6.2
+// - protoc             v3.21.12
+// source: pkg/pb/deposit/v1/deposit.proto
+
+package depositv1
+
+import (
+	context "context"
+	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
+)
+
+// This is a compile-time assertion to ensure that this generated file
+// is compatible with the grpc package it is being compiled against.
+// Requires gRPC-Go v1.64.0 or later.
+const _ = grpc.SupportPackageIsVersion9
+
+const (
+	DepositPublisherService_PublishDeposit_FullMethodName = "/deposit.v1.DepositPublisherService/PublishDeposit"
+)
+
+// DepositPublisherServiceClient is the client API for DepositPublisherService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type DepositPublisherServiceClient interface {
+	PublishDeposit(ctx context.Context, in *PublishDepositRequest, opts ...grpc.CallOption) (*PublishDepositResponse, error)
+}
+
+type depositPublisherServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewDepositPublisherServiceClient(cc grpc.ClientConnInterface) DepositPublisherServiceClient {
+	return &depositPublisherServiceClient{cc}
+}
+
+func (c *depositPublisherServiceClient) PublishDeposit(ctx context.Context, in *PublishDepositRequest, opts ...grpc.CallOption) (*PublishDepositResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishDepositResponse)
+	err := c.cc.Invoke(ctx, DepositPublisherService_PublishDeposit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DepositPublisherServiceServer is the server API for DepositPublisherService service.
+// All implementations must embed UnimplementedDepositPublisherServiceServer
+// for forward compatibility.
+type DepositPublisherServiceServer interface {
+	PublishDeposit(context.Context, *PublishDepositRequest) (*PublishDepositResponse, error)
+	mustEmbedUnimplementedDepositPublisherServiceServer()
+}
+
+// UnimplementedDepositPublisherServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedDepositPublisherServiceServer struct{}
+
+func (UnimplementedDepositPublisherServiceServer) PublishDeposit(context.Context, *PublishDepositRequest) (*PublishDepositResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishDeposit not implemented")
+}
+func (UnimplementedDepositPublisherServiceServer) mustEmbedUnimplementedDepositPublisherServiceServer() {
+}
+func (UnimplementedDepositPublisherServiceServer) testEmbeddedByValue() {}
+
+// UnsafeDepositPublisherServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to DepositPublisherServiceServer will
+// result in compilation errors.
+type UnsafeDepositPublisherServiceServer interface {
+	mustEmbedUnimplementedDepositPublisherServiceServer()
+}
+
+func RegisterDepositPublisherServiceServer(s grpc.ServiceRegistrar, srv DepositPublisherServiceServer) {
+	// If the following call panics, it indicates UnimplementedDepositPublisherServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&DepositPublisherService_ServiceDesc, srv)
+}
+
+func _DepositPublisherService_PublishDeposit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PublishDepositRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DepositPublisherServiceServer).PublishDeposit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DepositPublisherService_PublishDeposit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DepositPublisherServiceServer).PublishDeposit(ctx, req.(*PublishDepositRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// DepositPublisherService_ServiceDesc is the grpc.ServiceDesc for DepositPublisherService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var DepositPublisherService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "deposit.v1.DepositPublisherService",
+	HandlerType: (*DepositPublisherServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PublishDeposit",
+			Handler:    _DepositPublisherService_PublishDeposit_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "pkg/pb/deposit/v1/deposit.proto",
+}
+-e 
+
+=== FILE: ./all_project_files.tx ===
+-e 
+
+=== FILE: ./go.mod ===
+module github.com/alihojaty/reliable-deposit-processor/pkg
+
+go 1.26.0
+
+require (
+	github.com/caarlos0/env/v11 v11.4.1
+	github.com/golang-migrate/migrate/v4 v4.20.1
+	github.com/google/uuid v1.6.0
+	github.com/jackc/pgx/v5 v5.11.0
+	github.com/joho/godotenv v1.5.1
+	github.com/nats-io/nats.go v1.54.0
+	github.com/shopspring/decimal v1.5.0
+	go.uber.org/zap v1.28.0
+	google.golang.org/grpc v1.82.0
+	google.golang.org/protobuf v1.36.11
+)
+
+require (
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/klauspost/compress v1.20.0 // indirect
+	github.com/lib/pq v1.10.9 // indirect
+	github.com/nats-io/nkeys v0.4.16 // indirect
+	github.com/nats-io/nuid v1.0.1 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 // indirect
+)
+-e 
+
+=== FILE: ./config/config_test.go ===
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestLoad_OSEnvOverridesDotEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	envFile := filepath.Join(tmpDir, ".env")
+
+	envContent := "WORKER_COUNT=5\n"
+
+	if err := os.WriteFile(envFile, []byte(envContent), 0600); err != nil {
+		t.Fatalf("failed to write temp .env file: %v", err)
+	}
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working dir: %v", err)
+	}
+	defer func() { _ = os.Chdir(origDir) }()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to chdir: %v", err)
+	}
+
+	t.Setenv("DATABASE_URL", "postgres://test:test@localhost:5432/testdb")
+	t.Setenv("NATS_URL", "nats://localhost:4222")
+	t.Setenv("WORKER_COUNT", "12")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	if cfg.WorkerCount != 12 {
+		t.Errorf("expected OS env WORKER_COUNT=12 to override .env (5), but got %d", cfg.WorkerCount)
+	}
+}
+
+func TestLoad_Defaults_NoDefaultSecrets(t *testing.T) {
+	os.Clearenv()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("failed to load default config: %v", err)
+	}
+
+	if cfg.GatewayPort != 8081 {
+		t.Errorf("expected GatewayPort 8081, got %d", cfg.GatewayPort)
+	}
+	if cfg.PublisherGRPCPort != 50051 {
+		t.Errorf("expected PublisherGRPCPort 50051, got %d", cfg.PublisherGRPCPort)
+	}
+	if cfg.APIKey != "" {
+		t.Errorf("expected empty default APIKey, got %q", cfg.APIKey)
+	}
+	if cfg.DatabaseURL != "" {
+		t.Errorf("expected empty default DatabaseURL when no password is provided, got %q", cfg.DatabaseURL)
+	}
+	if cfg.RequestTimeout != 3*time.Second {
+		t.Errorf("expected RequestTimeout 3s, got %v", cfg.RequestTimeout)
+	}
+}
+
+func TestLoad_SecretFiles(t *testing.T) {
+	os.Clearenv()
+	tmpDir := t.TempDir()
+
+	apiKeyFile := filepath.Join(tmpDir, "api_key")
+	dbPassFile := filepath.Join(tmpDir, "postgres_password")
+
+	if err := os.WriteFile(apiKeyFile, []byte("swarm-secret-api-key\n"), 0600); err != nil {
+		t.Fatalf("failed to write api_key secret file: %v", err)
+	}
+	if err := os.WriteFile(dbPassFile, []byte("swarm-db-pass-999\n"), 0600); err != nil {
+		t.Fatalf("failed to write postgres_password secret file: %v", err)
+	}
+
+	t.Setenv("API_KEY_FILE", apiKeyFile)
+	t.Setenv("POSTGRES_PASSWORD_FILE", dbPassFile)
+	t.Setenv("DB_HOST", "postgres")
+	t.Setenv("DB_PORT", "5432")
+	t.Setenv("DB_USER", "postgres")
+	t.Setenv("DB_NAME", "deposits_db")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("failed to load config with secret files: %v", err)
+	}
+
+	if cfg.APIKey != "swarm-secret-api-key" {
+		t.Errorf("expected APIKey 'swarm-secret-api-key', got %q", cfg.APIKey)
+	}
+	expectedDSN := "postgres://postgres:swarm-db-pass-999@postgres:5432/deposits_db?sslmode=disable"
+	if !strings.EqualFold(cfg.DatabaseURL, expectedDSN) {
+		t.Errorf("expected DatabaseURL %q, got %q", expectedDSN, cfg.DatabaseURL)
+	}
+}
+-e 
+
+=== FILE: ./config/config.go ===
+package config
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/caarlos0/env/v11"
+	"github.com/joho/godotenv"
+)
+
+type Config struct {
+	DatabaseURL      string `env:"DATABASE_URL"`
+	DatabaseURLFile  string `env:"DATABASE_URL_FILE"`
+	DBHost           string `env:"DB_HOST" envDefault:"postgres"`
+	DBPort           int    `env:"DB_PORT" envDefault:"5432"`
+	DBUser           string `env:"DB_USER" envDefault:"postgres"`
+	DBName           string `env:"DB_NAME" envDefault:"deposits_db"`
+	DBSSLMode        string `env:"DB_SSLMODE" envDefault:"disable"`
+	PostgresPassword string `env:"POSTGRES_PASSWORD"`
+	PostgresPassFile string `env:"POSTGRES_PASSWORD_FILE"`
+	MigrationsPath   string `env:"MIGRATIONS_PATH" envDefault:"file://migrations"`
+
+	NatsURL string `env:"NATS_URL" envDefault:"nats://localhost:4222"`
+
+	WorkerCount        int           `env:"WORKER_COUNT" envDefault:"3"`
+	RetryInterval      time.Duration `env:"RETRY_INTERVAL" envDefault:"5s"`
+	SettlementInterval time.Duration `env:"SETTLEMENT_INTERVAL" envDefault:"5s"`
+	ShutdownTimeout    time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+	MetricsPort        int           `env:"METRICS_PORT" envDefault:"8080"`
+
+	PublishInterval     time.Duration `env:"PUBLISH_INTERVAL" envDefault:"1s"`
+	PublishEnabled      bool          `env:"PUBLISH_ENABLED" envDefault:"false"`
+	PublisherGRPCPort   int           `env:"PUBLISHER_GRPC_PORT" envDefault:"50051"`
+	PublisherHealthPort int           `env:"PUBLISHER_HEALTH_PORT" envDefault:"8090"`
+	DrainDelay          time.Duration `env:"DRAIN_DELAY" envDefault:"6s"`
+	ForceUnhealthy      bool          `env:"FORCE_UNHEALTHY" envDefault:"false"`
+
+	GatewayPort        int           `env:"GATEWAY_PORT" envDefault:"8081"`
+	PublisherGRPCAddr  string        `env:"PUBLISHER_GRPC_ADDR" envDefault:"localhost:50051"`
+	DNSRefreshInterval time.Duration `env:"DNS_REFRESH_INTERVAL" envDefault:"2s"`
+	APIKey             string        `env:"API_KEY"`
+	APIKeyFile         string        `env:"API_KEY_FILE"`
+	RequestTimeout     time.Duration `env:"REQUEST_TIMEOUT" envDefault:"3s"`
+	RateLimitRPS       float64       `env:"RATE_LIMIT_RPS" envDefault:"500"`
+	RateLimitBurst     int           `env:"RATE_LIMIT_BURST" envDefault:"200"`
+	GRPCMaxAttempts    int           `env:"GRPC_MAX_ATTEMPTS" envDefault:"3"`
+	GRPCRetryBackoff   time.Duration `env:"GRPC_RETRY_BACKOFF" envDefault:"50ms"`
+
+	MTLSEnabled bool   `env:"MTLS_ENABLED" envDefault:"false"`
+	TLSCertFile string `env:"TLS_CERT_FILE"`
+	TLSKeyFile  string `env:"TLS_KEY_FILE"`
+	TLSCAFile   string `env:"TLS_CA_FILE"`
+
+	LogLevel string `env:"LOG_LEVEL" envDefault:"info"`
+}
+
+func Load() (*Config, error) {
+	_ = godotenv.Load()
+
+	cfg := &Config{}
+	if err := env.Parse(cfg); err != nil {
+		return nil, fmt.Errorf("parsing environment variables: %w", err)
+	}
+
+	if err := cfg.resolveSecrets(); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func (c *Config) resolveSecrets() error {
+	if c.APIKeyFile != "" {
+		val, err := ReadSecretFile(c.APIKeyFile)
+		if err != nil {
+			return fmt.Errorf("reading API_KEY_FILE: %w", err)
+		}
+		c.APIKey = val
+	}
+
+	if c.DatabaseURLFile != "" {
+		val, err := ReadSecretFile(c.DatabaseURLFile)
+		if err != nil {
+			return fmt.Errorf("reading DATABASE_URL_FILE: %w", err)
+		}
+		c.DatabaseURL = val
+	}
+
+	if c.PostgresPassFile != "" {
+		val, err := ReadSecretFile(c.PostgresPassFile)
+		if err != nil {
+			return fmt.Errorf("reading POSTGRES_PASSWORD_FILE: %w", err)
+		}
+		c.PostgresPassword = val
+	}
+
+	if c.DatabaseURL == "" && c.PostgresPassword != "" {
+		u := &url.URL{
+			Scheme:   "postgres",
+			User:     url.UserPassword(c.DBUser, c.PostgresPassword),
+			Host:     fmt.Sprintf("%s:%d", c.DBHost, c.DBPort),
+			Path:     c.DBName,
+			RawQuery: "sslmode=" + url.QueryEscape(c.DBSSLMode),
+		}
+		c.DatabaseURL = u.String()
+	} else if c.DatabaseURL != "" && c.PostgresPassword != "" {
+		if parsed, err := url.Parse(c.DatabaseURL); err == nil {
+			user := c.DBUser
+			if parsed.User != nil && parsed.User.Username() != "" {
+				user = parsed.User.Username()
+			}
+			parsed.User = url.UserPassword(user, c.PostgresPassword)
+			c.DatabaseURL = parsed.String()
+		}
+	}
+
+	return nil
+}
+
+func ReadSecretFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	val := strings.TrimSpace(string(b))
+	if val == "" {
+		return "", fmt.Errorf("secret file %s is empty", path)
+	}
+	return val, nil
+}
+
+func (c *Config) validate() error {
+	if c.WorkerCount <= 0 {
+		return fmt.Errorf("WORKER_COUNT must be greater than 0, got %d", c.WorkerCount)
+	}
+	if c.PublishInterval <= 0 {
+		return fmt.Errorf("PUBLISH_INTERVAL must be greater than 0, got %v", c.PublishInterval)
+	}
+	if c.RetryInterval <= 0 {
+		return fmt.Errorf("RETRY_INTERVAL must be greater than 0, got %v", c.RetryInterval)
+	}
+	if c.SettlementInterval <= 0 {
+		c.SettlementInterval = 5 * time.Second
+	}
+	if c.ShutdownTimeout <= 0 {
+		return fmt.Errorf("SHUTDOWN_TIMEOUT must be greater than 0, got %v", c.ShutdownTimeout)
+	}
+	if c.DrainDelay < 0 {
+		return fmt.Errorf("DRAIN_DELAY cannot be negative, got %v", c.DrainDelay)
+	}
+	return nil
+}
+-e 
+
+=== FILE: ./domain/deposit.go ===
+package domain
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/shopspring/decimal"
+)
+
+const (
+	CurrencyUSDT = "USDT"
+	CurrencyBTC  = "BTC"
+	CurrencyIRT  = "IRT"
+
+	MinUserID = 1
+	MaxUserID = 20
+
+	MinEventIDLen       = 1
+	MaxEventIDLen       = 128
+	MaxDecimalScale     = 18
+	MaxDecimalPrecision = 36
+)
+
+type DepositEvent struct {
+	EventID   string          `json:"event_id"`
+	UserID    int             `json:"user_id"`
+	Currency  string          `json:"currency"`
+	Amount    decimal.Decimal `json:"amount"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+type DLQMessage struct {
+	EventID        string    `json:"event_id"`
+	ErrorCode      string    `json:"error_code"`
+	SourceStream   string    `json:"source_stream"`
+	Subject        string    `json:"subject"`
+	StreamSequence uint64    `json:"stream_sequence"`
+	OriginalEvent  string    `json:"original_event"`
+	Reason         string    `json:"reason"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+type LedgerDiscrepancy struct {
+	UserID          int             `json:"user_id"`
+	Currency        string          `json:"currency"`
+	ExpectedBalance decimal.Decimal `json:"expected_balance"`
+	ActualBalance   decimal.Decimal `json:"actual_balance"`
+	Difference      decimal.Decimal `json:"difference"`
+}
+
+// ValidateEventID checks length (1..128) and allowed characters (alphanumeric and -_:. ).
+func ValidateEventID(eventID string) error {
+	if strings.TrimSpace(eventID) == "" {
+		return fmt.Errorf("event_id is required")
+	}
+	n := len(eventID)
+	if n < MinEventIDLen || n > MaxEventIDLen {
+		return fmt.Errorf("event_id length must be between %d and %d characters", MinEventIDLen, MaxEventIDLen)
+	}
+	for i := 0; i < n; i++ {
+		c := eventID[i]
+		if (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == ':' || c == '.' {
+			continue
+		}
+		return fmt.Errorf("event_id contains invalid characters (must be alphanumeric or -_:.)")
+	}
+	return nil
+}
+
+// ParseAndValidateAmount ensures the amount is a valid positive decimal string with at most 18 fractional digits.
+func ParseAndValidateAmount(rawAmount string) (decimal.Decimal, error) {
+	trimmed := strings.TrimSpace(rawAmount)
+	if trimmed == "" {
+		return decimal.Zero, fmt.Errorf("amount is required")
+	}
+
+	amt, err := decimal.NewFromString(trimmed)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("amount must be a valid decimal string: %w", err)
+	}
+	if strings.ContainsAny(trimmed, "eE") {
+		return decimal.Zero, fmt.Errorf("amount must be in standard decimal format without scientific notation")
+	}
+	if !amt.IsPositive() {
+		return decimal.Zero, fmt.Errorf("amount must be strictly greater than zero")
+	}
+	if amt.Exponent() < -MaxDecimalScale {
+		return decimal.Zero, fmt.Errorf("amount precision exceeds maximum %d decimal places", MaxDecimalScale)
+	}
+	// NUMERIC(36, 18) allows at most 18 integer digits
+	maxAllowed := decimal.New(1, MaxDecimalPrecision-MaxDecimalScale)
+	if amt.GreaterThanOrEqual(maxAllowed) {
+		return decimal.Zero, fmt.Errorf("amount exceeds maximum allowed limit")
+	}
+	return amt, nil
+}
+
+// ValidateUserID checks that user_id falls within the allowed range.
+func ValidateUserID(userID int) error {
+	if userID < MinUserID || userID > MaxUserID {
+		return fmt.Errorf("user_id must be between %d and %d", MinUserID, MaxUserID)
+	}
+	return nil
+}
+
+// ValidateCurrency checks that currency is supported.
+func ValidateCurrency(currency string) error {
+	switch currency {
+	case CurrencyUSDT, CurrencyBTC, CurrencyIRT:
+		return nil
+	default:
+		return fmt.Errorf("unsupported currency %q", currency)
+	}
+}
+
+// NewValidatedDepositEvent constructs and validates a DepositEvent from raw inputs (used by Gateway & Publisher gRPC).
+func NewValidatedDepositEvent(
+	eventID string,
+	userID int,
+	currency string,
+	rawAmount string,
+	createdAt time.Time,
+) (*DepositEvent, error) {
+	if err := ValidateEventID(eventID); err != nil {
+		return nil, NewInvalidMessageError(eventID, err.Error(), err)
+	}
+	if err := ValidateUserID(userID); err != nil {
+		return nil, NewInvalidMessageError(eventID, err.Error(), err)
+	}
+	if err := ValidateCurrency(currency); err != nil {
+		return nil, NewInvalidMessageError(eventID, err.Error(), err)
+	}
+	amt, err := ParseAndValidateAmount(rawAmount)
+	if err != nil {
+		return nil, NewInvalidMessageError(eventID, err.Error(), err)
+	}
+	if createdAt.IsZero() {
+		return nil, NewInvalidMessageError(eventID, "created_at is required", nil)
+	}
+
+	return &DepositEvent{
+		EventID:   eventID,
+		UserID:    userID,
+		Currency:  currency,
+		Amount:    amt,
+		CreatedAt: createdAt.UTC(),
+	}, nil
+}
+
+// rawDepositEventJSON enforces that "amount" in JSON is strictly a JSON string (not a float/number).
+type rawDepositEventJSON struct {
+	EventID   string          `json:"event_id"`
+	UserID    int             `json:"user_id"`
+	Currency  string          `json:"currency"`
+	Amount    json.RawMessage `json:"amount"`
+	CreatedAt time.Time       `json:"created_at"`
+}
+
+// ParseAndValidateDepositEvent parses raw JSON bytes and validates all domain rules.
+func ParseAndValidateDepositEvent(data []byte) (*DepositEvent, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, NewInvalidMessageError("", "empty message payload", nil)
+	}
+
+	var raw rawDepositEventJSON
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return nil, NewInvalidMessageError("", fmt.Sprintf("malformed JSON payload: %v", err), err)
+	}
+	if dec.More() || dec.Decode(&struct{}{}) != io.EOF {
+		return nil, NewInvalidMessageError(raw.EventID, "malformed JSON payload: unexpected trailing data", nil)
+	}
+
+	if len(raw.Amount) < 2 || raw.Amount[0] != '"' || raw.Amount[len(raw.Amount)-1] != '"' {
+		return nil, NewInvalidMessageError(raw.EventID, "amount must be a JSON string", nil)
+	}
+
+	var amountStr string
+	if err := json.Unmarshal(raw.Amount, &amountStr); err != nil {
+		return nil, NewInvalidMessageError(raw.EventID, "invalid amount string", err)
+	}
+
+	return NewValidatedDepositEvent(raw.EventID, raw.UserID, raw.Currency, amountStr, raw.CreatedAt)
+}
+-e 
+
+=== FILE: ./domain/errors.go ===
+package domain
+
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrDuplicateEvent = errors.New("duplicate deposit event")
+
+type InvalidMessageError struct {
+	EventID string
+	Reason  string
+	Err     error
+}
+
+func (e *InvalidMessageError) Error() string {
+	if e.EventID != "" {
+		return fmt.Sprintf("invalid deposit message (event_id=%s): %s", e.EventID, e.Reason)
+	}
+	return fmt.Sprintf("invalid deposit message: %s", e.Reason)
+}
+
+func (e *InvalidMessageError) Unwrap() error {
+	return e.Err
+}
+
+func NewInvalidMessageError(eventID, reason string, err error) *InvalidMessageError {
+	return &InvalidMessageError{
+		EventID: eventID,
+		Reason:  reason,
+		Err:     err,
+	}
+}
+-e 
+
+=== FILE: ./domain/deposit_test.go ===
+package domain
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/shopspring/decimal"
+)
+
+func TestParseAndValidateDepositEvent(t *testing.T) {
+	tests := []struct {
+		name           string
+		payload        string
+		wantErr        bool
+		expectedReason string
+		expectedAmount string
+	}{
+		{
+			name: "Valid USDT deposit event",
+			payload: `{
+				"event_id": "evt-1001",
+				"user_id": 7,
+				"currency": "USDT",
+				"amount": "125.50",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        false,
+			expectedAmount: "125.5",
+		},
+		{
+			name: "Valid BTC deposit with high precision (8 decimals)",
+			payload: `{
+				"event_id": "evt-1002",
+				"user_id": 20,
+				"currency": "BTC",
+				"amount": "0.00045678",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        false,
+			expectedAmount: "0.00045678",
+		},
+		{
+			name: "Valid IRT deposit at lower user_id boundary (1)",
+			payload: `{
+				"event_id": "evt-1003",
+				"user_id": 1,
+				"currency": "IRT",
+				"amount": "50000000",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        false,
+			expectedAmount: "50000000",
+		},
+		{
+			name:           "Invalid - Empty payload",
+			payload:        `   `,
+			wantErr:        true,
+			expectedReason: "empty message payload",
+		},
+		{
+			name:           "Invalid - Corrupted JSON syntax",
+			payload:        `{"event_id": "evt-bad", "user_id": 7, broken_json`,
+			wantErr:        true,
+			expectedReason: "malformed JSON payload",
+		},
+		{
+			name: "Invalid - Non-numeric amount string",
+			payload: `{
+				"event_id": "evt-1004",
+				"user_id": 5,
+				"currency": "USDT",
+				"amount": "not-a-number",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount must be a valid decimal string",
+		},
+		{
+			name: "Invalid - Empty event_id",
+			payload: `{
+				"event_id": "   ",
+				"user_id": 7,
+				"currency": "USDT",
+				"amount": "100.00",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "event_id is required",
+		},
+		{
+			name: "Invalid - user_id less than 1 (0)",
+			payload: `{
+				"event_id": "evt-1005",
+				"user_id": 0,
+				"currency": "USDT",
+				"amount": "100.00",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "user_id must be between 1 and 20",
+		},
+		{
+			name: "Invalid - user_id greater than 20 (21)",
+			payload: `{
+				"event_id": "evt-1006",
+				"user_id": 21,
+				"currency": "USDT",
+				"amount": "100.00",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "user_id must be between 1 and 20",
+		},
+		{
+			name: "Invalid - Unsupported currency (DOGE)",
+			payload: `{
+				"event_id": "evt-1007",
+				"user_id": 10,
+				"currency": "DOGE",
+				"amount": "100.00",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "unsupported currency",
+		},
+		{
+			name: "Invalid - Zero amount",
+			payload: `{
+				"event_id": "evt-1008",
+				"user_id": 10,
+				"currency": "USDT",
+				"amount": "0",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount must be strictly greater than zero",
+		},
+		{
+			name: "Invalid - Negative amount",
+			payload: `{
+				"event_id": "evt-1009",
+				"user_id": 10,
+				"currency": "USDT",
+				"amount": "-50.25",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount must be strictly greater than zero",
+		},
+		{
+			name: "Invalid - Exceeds 18 decimal places",
+			payload: `{
+				"event_id": "evt-1010",
+				"user_id": 10,
+				"currency": "BTC",
+				"amount": "0.1234567890123456789",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount precision exceeds maximum 18 decimal places",
+		},
+		{
+			name: "Invalid - Exceeds maximum allowed limit",
+			payload: `{
+				"event_id": "evt-1011",
+				"user_id": 10,
+				"currency": "IRT",
+				"amount": "1000000000000000000",
+				"created_at": "2026-10-04T10:00:00Z"
+			}`,
+			wantErr:        true,
+			expectedReason: "amount exceeds maximum allowed limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event, err := ParseAndValidateDepositEvent([]byte(tt.payload))
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, but got nil", tt.expectedReason)
+				}
+
+				var invalidErr *InvalidMessageError
+				if !errors.As(err, &invalidErr) {
+					t.Fatalf("expected error of type *InvalidMessageError, got %T (%v)", err, err)
+				}
+				if !strings.Contains(invalidErr.Reason, tt.expectedReason) {
+					t.Errorf("expected error reason containing %q, got %q", tt.expectedReason, invalidErr.Reason)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			expectedDec, _ := decimal.NewFromString(tt.expectedAmount)
+			if !event.Amount.Equal(expectedDec) {
+				t.Errorf("expected amount %s, got %s", expectedDec.String(), event.Amount.String())
+			}
+		})
+	}
+}
+
+func TestSentinelDuplicateError(t *testing.T) {
+	wrappedErr := errors.Join(ErrDuplicateEvent)
+	if !errors.Is(wrappedErr, ErrDuplicateEvent) {
+		t.Fatalf("expected errors.Is to detect ErrDuplicateEvent")
+	}
+}
+-e 
+
+=== FILE: ./tlscfg/tlscfg.go ===
+package tlscfg
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
+	"os"
+	"time"
+
+	"google.golang.org/grpc/credentials"
+)
+
+// ServerTransportCredentials returns mTLS 1.3 gRPC server credentials for publisher.
+func ServerTransportCredentials(certFile, keyFile, caFile string) (credentials.TransportCredentials, error) {
+	if certFile != "" || keyFile != "" || caFile != "" {
+		if certFile == "" || keyFile == "" || caFile == "" {
+			return nil, fmt.Errorf("TLS_CERT_FILE, TLS_KEY_FILE, and TLS_CA_FILE must all be provided together")
+		}
+		return loadFileCredentials(certFile, keyFile, caFile, true)
+	}
+
+	caCert, caPriv, caPool, err := deterministicDevCA()
+	if err != nil {
+		return nil, err
+	}
+
+	srvCert, err := issueLeafCert(caCert, caPriv, "publisher", true)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{srvCert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+	return credentials.NewTLS(tlsCfg), nil
+}
+
+// ClientTransportCredentials returns mTLS 1.3 gRPC client credentials for gateway.
+func ClientTransportCredentials(certFile, keyFile, caFile string) (credentials.TransportCredentials, error) {
+	if certFile != "" || keyFile != "" || caFile != "" {
+		if certFile == "" || keyFile == "" || caFile == "" {
+			return nil, fmt.Errorf("TLS_CERT_FILE, TLS_KEY_FILE, and TLS_CA_FILE must all be provided together")
+		}
+		return loadFileCredentials(certFile, keyFile, caFile, false)
+	}
+
+	caCert, caPriv, caPool, err := deterministicDevCA()
+	if err != nil {
+		return nil, err
+	}
+
+	cliCert, err := issueLeafCert(caCert, caPriv, "gateway", false)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsCfg := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cliCert},
+		RootCAs:      caPool,
+		ServerName:   "publisher",
+	}
+	return credentials.NewTLS(tlsCfg), nil
+}
+
+func loadFileCredentials(certFile, keyFile, caFile string, isServer bool) (credentials.TransportCredentials, error) {
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load x509 key pair: %w", err)
+	}
+	caBytes, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA file: %w", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caBytes) {
+		return nil, fmt.Errorf("failed to append CA certificate to pool")
+	}
+
+	if isServer {
+		return credentials.NewTLS(&tls.Config{
+			MinVersion:   tls.VersionTLS13,
+			Certificates: []tls.Certificate{pair},
+			ClientCAs:    caPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+		}), nil
+	}
+
+	return credentials.NewTLS(&tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{pair},
+		RootCAs:      caPool,
+		ServerName:   "publisher",
+	}), nil
+}
+
+func deterministicDevCA() (*x509.Certificate, ed25519.PrivateKey, *x509.CertPool, error) {
+	seed := sha256.Sum256([]byte("reliable-deposit-processor-internal-mtls-ca-v1"))
+	caPriv := ed25519.NewKeyFromSeed(seed[:])
+	caPub := caPriv.Public().(ed25519.PublicKey)
+
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			Organization: []string{"Reliable Deposit Processor"},
+			CommonName:   "DepositProcessor-Internal-Root-CA",
+		},
+		NotBefore:             time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+		NotAfter:              time.Date(2035, 1, 1, 0, 0, 0, 0, time.UTC),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	caDER, err := x509.CreateCertificate(nil, tpl, tpl, caPub, caPriv)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	return caCert, caPriv, pool, nil
+}
+
+func issueLeafCert(caCert *x509.Certificate, caPriv ed25519.PrivateKey, cn string, isServer bool) (tls.Certificate, error) {
+	leafPub, leafPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	serial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	tpl := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{"Reliable Deposit Processor"},
+			CommonName:   cn,
+		},
+		NotBefore: time.Now().Add(-1 * time.Hour),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature,
+	}
+
+	if isServer {
+		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		tpl.DNSNames = []string{"publisher", "localhost", "bufnet"}
+		tpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	} else {
+		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+
+	leafDER, err := x509.CreateCertificate(rand.Reader, tpl, caCert, leafPub, caPriv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	privBytes, err := x509.MarshalPKCS8PrivateKey(leafPriv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privBytes})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+-e 
+
+=== FILE: ./tlscfg/tls_test.go ===
+package tlscfg
+
+import "testing"
+
+func TestMTLS_CredentialsGeneration(t *testing.T) {
+	srvCreds, err := ServerTransportCredentials("", "", "")
+	if err != nil {
+		t.Fatalf("expected server mTLS credentials to succeed, got: %v", err)
+	}
+	if srvCreds.Info().SecurityProtocol != "tls" {
+		t.Errorf("expected security protocol 'tls', got %q", srvCreds.Info().SecurityProtocol)
+	}
+
+	cliCreds, err := ClientTransportCredentials("", "", "")
+	if err != nil {
+		t.Fatalf("expected client mTLS credentials to succeed, got: %v", err)
+	}
+	if cliCreds.Info().SecurityProtocol != "tls" {
+		t.Errorf("expected security protocol 'tls', got %q", cliCreds.Info().SecurityProtocol)
+	}
+}
+-e 
+
+=== FILE: ./go.sum ===
+github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEKWjV8V+WSxDXJ4NFATAsZjh8iIbsQIg=
+github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
+github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
+github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
+github.com/caarlos0/env/v11 v11.4.1 h1:fYwH0sWEsBSMPG7t4e/PEfTFzrWrpjyygXyUnWiSwEw=
+github.com/caarlos0/env/v11 v11.4.1/go.mod h1:qupehSf/Y0TUTsxKywqRt/vJjN5nz6vauiYEUUr8P4U=
+github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
+github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
+github.com/containerd/errdefs v1.0.0 h1:tg5yIfIlQIrxYtu9ajqY42W3lpS19XqdxRQeEwYG8PI=
+github.com/containerd/errdefs v1.0.0/go.mod h1:+YBYIdtsnF4Iw6nWZhJcqGSg/dwvV7tyJ/kCkyJ2k+M=
+github.com/containerd/errdefs/pkg v0.3.0 h1:9IKJ06FvyNlexW690DXuQNx2KA2cUJXx151Xdx3ZPPE=
+github.com/containerd/errdefs/pkg v0.3.0/go.mod h1:NJw6s9HwNuRhnjJhM7pylWwMyAkmCQvQ4GpJHEqRLVk=
+github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc h1:U9qPSI2PIWSS1VwoXQT9A3Wy9MM3WgvqSxFWenqJduM=
+github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/dhui/dktest v0.4.6 h1:+DPKyScKSEp3VLtbMDHcUq6V5Lm5zfZZVb0Sk7Ahom4=
+github.com/dhui/dktest v0.4.6/go.mod h1:JHTSYDtKkvFNFHJKqCzVzqXecyv+tKt8EzceOmQOgbU=
+github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
+github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
+github.com/docker/docker v28.5.2+incompatible h1:DBX0Y0zAjZbSrm1uzOkdr1onVghKaftjlSWt4AFexzM=
+github.com/docker/docker v28.5.2+incompatible/go.mod h1:eEKB0N0r5NX/I1kEveEz05bcu8tLC/8azJZsviup8Sk=
+github.com/docker/go-connections v0.7.0 h1:6SsRfJddP22WMrCkj19x9WKjEDTB+ahsdiGYf0mN39c=
+github.com/docker/go-connections v0.7.0/go.mod h1:no1qkHdjq7kLMGUXYAduOhYPSJxxvgWBh7ogVvptn3Q=
+github.com/docker/go-units v0.5.0 h1:69rxXcBk27SvSaaxTtLh/8llcHD8vYHT7WSdRZ/jvr4=
+github.com/docker/go-units v0.5.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
+github.com/felixge/httpsnoop v1.1.0 h1:3YtUj32ZZkqZtt3sZZsClsymw/QDuVfpNhoA31zeORc=
+github.com/felixge/httpsnoop v1.1.0/go.mod h1:Zqxgdd+1Rkcz8euOqdr7lqgCRJztwr5hp9vDSi5UZCE=
+github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
+github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
+github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
+github.com/golang-migrate/migrate/v4 v4.20.1 h1:2N/ToVTKrKl58ynBpgeVJ4In7VcLCjWTZtm4eP1LxhU=
+github.com/golang-migrate/migrate/v4 v4.20.1/go.mod h1:DDPgKVb4ovSWc4FwSPfV2Uz1160f4XBiTHTrAJtljmM=
+github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
+github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
+github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
+github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
+github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
+github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761/go.mod h1:5TJZWKEWniPve33vlWYSoGYefn3gLQRzjfDlhSJ9ZKM=
+github.com/jackc/pgx/v5 v5.11.0 h1:IzBBtyK9AHqf98cctWFifYSci2hgQR/cd56wB4p+ogg=
+github.com/jackc/pgx/v5 v5.11.0/go.mod h1:mal1tBGAFfLHvZzaYh77YS/eC6IX9OWbRV1QIIM0Jn4=
+github.com/jackc/puddle/v2 v2.2.2 h1:PR8nw+E/1w0GLuRFSmiioY6UooMp6KJv0/61nB7icHo=
+github.com/jackc/puddle/v2 v2.2.2/go.mod h1:vriiEXHvEE654aYKXXjOvZM39qJ0q+azkZFrfEOc3H4=
+github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
+github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
+github.com/klauspost/compress v1.20.0 h1:a3C1ke2ohxFymNlb2HWAHjDeKCI90scRskErZkR0ezA=
+github.com/klauspost/compress v1.20.0/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+github.com/lib/pq v1.10.9 h1:YXG7RB+JIjhP29X+OtkiDnYaXQwpS4JEWq7dtCCRUEw=
+github.com/lib/pq v1.10.9/go.mod h1:AlVN5x4E4T544tWzH6hKfbfQvm3HdbOxrmggDNAPY9o=
+github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
+github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=
+github.com/moby/moby/api v1.54.2 h1:wiat9QAhnDQjA7wk1kh/TqHz2I1uUA7M7t9SAl/JNXg=
+github.com/moby/moby/api v1.54.2/go.mod h1:+RQ6wluLwtYaTd1WnPLykIDPekkuyD/ROWQClE83pzs=
+github.com/moby/moby/client v0.4.1 h1:DMQgisVoMkmMs7fp3ROSdiBnoAu8+vo3GggFl06M/wY=
+github.com/moby/moby/client v0.4.1/go.mod h1:z52C9O2POPOsnxZAy//WtKcQ32P+jT/NGeXu/7nfjGQ=
+github.com/moby/term v0.5.2 h1:6qk3FJAFDs6i/q3W/pQ97SX192qKfZgGjCQqfCJkgzQ=
+github.com/moby/term v0.5.2/go.mod h1:d3djjFCrjnB+fl8NJux+EJzu0msscUP+f8it8hPkFLc=
+github.com/morikuni/aec v1.0.0 h1:nP9CBfwrvYnBRgY6qfDQkygYDmYwOilePFkwzv4dU8A=
+github.com/morikuni/aec v1.0.0/go.mod h1:BbKIizmSmc5MMPqRYbxO4ZU0S0+P200+tUnFx7PXmsc=
+github.com/nats-io/nats.go v1.54.0 h1:vsXoOxjHp/GmPUN+EcI7uOf/uB+iAP+kEsAFNQN0yzA=
+github.com/nats-io/nats.go v1.54.0/go.mod h1:y+DZoD1oBOYfZTU681eTUiUjI0vbqYGixNVFHcjHJ0k=
+github.com/nats-io/nkeys v0.4.16 h1:rd5oAuLOb8mnAycB0xleuEBNS1pVVnN0fv/FF34Eypg=
+github.com/nats-io/nkeys v0.4.16/go.mod h1:llLgWoI0o4z/Q57q2R1kHfmocyhGV6VG/U18Glg1Afs=
+github.com/nats-io/nuid v1.0.1 h1:5iA8DT8V7q8WK2EScv2padNa/rTESc1KdnPw4TC2paw=
+github.com/nats-io/nuid v1.0.1/go.mod h1:19wcPz3Ph3q0Jbyiqsd0kePYG7A95tJPxeL+1OSON2c=
+github.com/opencontainers/go-digest v1.0.0 h1:apOUWs51W5PlhuyGyz9FCeeBIOUDA/6nW8Oi/yOhh5U=
+github.com/opencontainers/go-digest v1.0.0/go.mod h1:0JzlMkj0TRzQZfJkVvzbP0HBR3IKzErnv2BNG4W4MAM=
+github.com/opencontainers/image-spec v1.1.1 h1:y0fUlFfIZhPF1W537XOLg0/fcx6zcHCJwooC2xJA040=
+github.com/opencontainers/image-spec v1.1.1/go.mod h1:qpqAh3Dmcf36wStyyWU+kCeDgrGnAve2nCC8+7h8Q0M=
+github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRIccs7FGNTlIRMkT8wgtp5eCXdBlqhYGL6U=
+github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/shopspring/decimal v1.5.0 h1:HxSWk31RmJv0EyY4oLiGQB9u7WPludUwPBdvQZnYFPc=
+github.com/shopspring/decimal v1.5.0/go.mod h1:gawqmDU56v4yIKSwfBSFip1HdCCXN8/+DMd9qYNcwME=
+github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
+github.com/stretchr/testify v1.7.0/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
+github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
+github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
+go.opentelemetry.io/auto/sdk v1.2.1/go.mod h1:KRTj+aOaElaLi+wW1kO/DZRXwkF4C5xPbEe3ZiIhN7Y=
+go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 h1:8tvICD4vSTOOsNrsI4Ljf6C+6UKvpTEH5XY3JMoyPoo=
+go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0/go.mod h1:z9+yiacE0IHRqM4qFfkbt/JYlmYXgss8GY/jXoNuPJI=
+go.opentelemetry.io/otel v1.44.0 h1:JjwHmHpA4iZ3wBxluu2fbbE7j4kqlE8jXyAyPXH7HqU=
+go.opentelemetry.io/otel v1.44.0/go.mod h1:BMgjTHL9WPRlRjL2oZCBTL4whCGtXch2H4BhOPIAyYc=
+go.opentelemetry.io/otel/metric v1.44.0 h1:1w0gILTcHdr3YI+ixLyjemwrVnsMURbTZFrSYCdDdmc=
+go.opentelemetry.io/otel/metric v1.44.0/go.mod h1:8O7hanEPBNgEMmybD3s2VBKcgWOCsA6tzHBPODAiquo=
+go.opentelemetry.io/otel/sdk v1.44.0 h1:nHYwb9lK+fJPU/dnT6s7W7Z8itMWyqrnVfbheVYrZ58=
+go.opentelemetry.io/otel/sdk v1.44.0/go.mod h1:Osuydd3Se74nqjAKxid74N5eC+jfEqfTegHRnq58oK0=
+go.opentelemetry.io/otel/sdk/metric v1.44.0 h1:3LlKgI+VjbVsjNRFZJZAJ30WjXC5VkNRks6si09iEfI=
+go.opentelemetry.io/otel/sdk/metric v1.44.0/go.mod h1:5B5pMARnXxKhltooO4xUuCBorl65a4EpnTalObqOigA=
+go.opentelemetry.io/otel/trace v1.44.0 h1:jxF5CsGYCe74MCRx2X4g7WsY/VBKRqqpNvXlX/6gtIk=
+go.opentelemetry.io/otel/trace v1.44.0/go.mod h1:oLl1jrMQAVo6v3GAggN+1VH9VIz9iUSvW53sW1Q8PIE=
+go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
+go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
+go.uber.org/multierr v1.10.0 h1:S0h4aNzvfcFsC3dRF1jLoaov7oRaKqRGC/pUEJ2yvPQ=
+go.uber.org/multierr v1.10.0/go.mod h1:20+QtiLqy0Nd6FdQB9TLXag12DsQkrbs3htMFfDN80Y=
+go.uber.org/zap v1.28.0 h1:IZzaP1Fv73/T/pBMLk4VutPl36uNC+OSUh3JLG3FIjo=
+go.uber.org/zap v1.28.0/go.mod h1:rDLpOi171uODNm/mxFcuYWxDsqWSAVkFdX4XojSKg/Q=
+go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
+go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
+golang.org/x/crypto v0.57.0 h1:3ZVCjf8Ggz7zneR/EHRVx68Ctf+2pmIMP2UFhh9cC6M=
+golang.org/x/crypto v0.57.0/go.mod h1:Fdz0i5U6CoizGwLda9DttjSk6qlZo25zYNtR+ycvuZA=
+golang.org/x/net v0.58.0 h1:ynWG7rqYi4ccpTEuPZ2QGWHktVEM9DMCj9yzDE0Q7To=
+golang.org/x/net v0.58.0/go.mod h1:YwCddHnFlT7eLQqVprV19OnhLGtc5xOKgE0RyqgfWAU=
+golang.org/x/sync v0.23.0 h1:KameEIfc1IkluZyXWLn39Wd4tURc6GbCiISGiZm2bQk=
+golang.org/x/sync v0.23.0/go.mod h1:sUUOizhqBxiL6pEWpqNLUiaJn1ShEbZ6BBqskPbjZm0=
+golang.org/x/sys v0.48.0 h1:bbX/i/6MgT9BVLM9RT1thmxL04yeTAhbEz4SyadbXoo=
+golang.org/x/sys v0.48.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=
+golang.org/x/text v0.42.0 h1:JbOZXgfeCPU9gacVtYliJqOhD+zhrEqK4LfdpmlUZqI=
+golang.org/x/text v0.42.0/go.mod h1:ojzP1Z+2QtioaF8DTtO8K5q7JWVVYwZKenzujK0Zd0E=
+gonum.org/v1/gonum v0.17.0 h1:VbpOemQlsSMrYmn7T2OUvQ4dqxQXU+ouZFQsZOx50z4=
+gonum.org/v1/gonum v0.17.0/go.mod h1:El3tOrEuMpv2UdMrbNlKEh9vd86bmQ6vqIcDwxEOc1E=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7 h1:eM/YSd5bBFagF51o1E745Ta7RwzpW0h+z+QDNZOgmQ8=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20260630182238-925bb5da69e7/go.mod h1:4Hqkh8ycfw05ld/3BWL7rJOSfebL2Q+DVDeRgYgxUU8=
+google.golang.org/grpc v1.82.0 h1:vguDnZUPjE26w09A63VoxZPnvPjB5Riyc0mkXPFmAIU=
+google.golang.org/grpc v1.82.0/go.mod h1:yzTZ1TB1Z3SG+LIYaI+WiE8D5+PZ3ArnrSp8zF3+/ZA=
+google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
+google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+-e 
+
+=== FILE: ./dbx/postgres.go ===
+package dbx
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"go.uber.org/zap"
+)
+
+func ConnectAndMigrate(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) (*sql.DB, error) {
+	if databaseURL == "" {
+		return nil, errors.New("DATABASE_URL is required")
+	}
+
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database connection: %w", err)
+	}
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(15)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	backoff := 500 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	for attempt := 1; ; attempt++ {
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		pingErr := db.PingContext(pingCtx)
+		cancel()
+
+		if pingErr == nil {
+			break
+		}
+
+		logger.Warn("Waiting for PostgreSQL database to become reachable",
+			zap.String("component", "dbx_postgres"),
+			zap.Int("attempt", attempt),
+			zap.Duration("retry_in", backoff),
+			zap.Error(pingErr),
+		)
+
+		select {
+		case <-ctx.Done():
+			_ = db.Close()
+			return nil, fmt.Errorf("context canceled while waiting for database: %w", ctx.Err())
+		case <-time.After(backoff):
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+
+	logger.Info("Connected to Database")
+
+	if migrationsPath != "" {
+		if err := RunMigrations(ctx, databaseURL, migrationsPath, logger); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to run database migrations: %w", err)
+		}
+	}
+
+	return db, nil
+}
+
+func RunMigrations(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) error {
+	var lastErr error
+	for attempt := 1; attempt <= 15; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		m, err := migrate.New(migrationsPath, databaseURL)
+		if err != nil {
+			lastErr = fmt.Errorf("failed to create migrate instance: %w", err)
+		} else {
+			err = m.Up()
+			_, _ = m.Close()
+
+			if err == nil || errors.Is(err, migrate.ErrNoChange) {
+				logger.Debug("Database migrations applied successfully")
+				return nil
+			}
+			lastErr = fmt.Errorf("failed to apply up migrations: %w", err)
+		}
+
+		logger.Warn("Migration lock contention or temporary failure; retrying",
+			zap.Int("attempt", attempt),
+			zap.Error(lastErr),
+		)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(min(attempt, 5)) * 500 * time.Millisecond):
+		}
+	}
+
+	return lastErr
+}
+-e 
+
+=== FILE: ./logger/logger.go ===
+package logger
+
+import (
+	"fmt"
+	"strings"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+func New(level string) (*zap.Logger, error) {
+	var zapLevel zapcore.Level
+	if err := zapLevel.UnmarshalText([]byte(strings.ToLower(strings.TrimSpace(level)))); err != nil {
+		zapLevel = zapcore.InfoLevel
+	}
+
+	cfg := zap.NewProductionConfig()
+	cfg.Level = zap.NewAtomicLevelAt(zapLevel)
+	// Disable aggressive log sampling so critical audit, DLQ, and graceful shutdown logs are never dropped.
+	cfg.Sampling = nil
+
+	cfg.EncoderConfig.TimeKey = "timestamp"
+	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+	cfg.EncoderConfig.MessageKey = "message"
+
+	log, err := cfg.Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize zap logger: %w", err)
+	}
+
+	return log, nil
+}

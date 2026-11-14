@@ -3,11 +3,15 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +31,7 @@ const (
 	subjectDepositEvents = "deposits.events"
 	streamDepositsDLQ    = "DEPOSITS_DLQ"
 	maxDashboardBodySize = 32 * 1024 // 32 KB
+	dashboardSessionCook = "dashboard_session"
 )
 
 type DepositorTelemetry struct {
@@ -40,9 +45,23 @@ type DepositorTelemetry struct {
 	LastSeen        time.Time `json:"-"`
 }
 
+type PublisherTelemetry struct {
+	InstanceID        string  `json:"instance_id"`
+	Status            string  `json:"status"`
+	Live              bool    `json:"live"`
+	Ready             bool    `json:"ready"`
+	Draining          bool    `json:"draining"`
+	NATSConnected     bool    `json:"nats_connected"`
+	ProcessedRequests uint64  `json:"processed_requests"`
+	InFlightRequests  int64   `json:"in_flight_requests"`
+	UptimeSeconds     float64 `json:"uptime_seconds"`
+}
+
 type LedgerReconciliationReport struct {
 	IsBalanced       bool                    `json:"is_balanced"`
 	DiscrepancyCount int                     `json:"discrepancy_count"`
+	SettledCount     int64                   `json:"settled_count"`
+	PendingCount     int64                   `json:"pending_count"`
 	TotalLedgerUSDT  string                  `json:"total_ledger_usdt"`
 	TotalLedgerBTC   string                  `json:"total_ledger_btc"`
 	TotalLedgerIRT   string                  `json:"total_ledger_irt"`
@@ -88,21 +107,25 @@ type GatewayTelemetry struct {
 }
 
 type AggregatedResponse struct {
-	ActiveReplicas  int                        `json:"active_replicas"`
-	TotalWorkers    int                        `json:"total_workers"`
-	GlobalTPS       float64                    `json:"global_tps"`
-	GlobalProcessed uint64                     `json:"global_processed"`
-	GlobalFailed    uint64                     `json:"global_failed"`
-	GlobalDuplicate uint64                     `json:"global_duplicates"`
-	DBTotalDeposits int64                      `json:"db_total_deposits"`
-	DLQTotalCount   uint64                     `json:"dlq_total_count"`
-	PublishEnabled  bool                       `json:"publish_enabled"`
-	Gateway         GatewayTelemetry           `json:"gateway"`
-	Reconciliation  LedgerReconciliationReport `json:"reconciliation"`
-	Replicas        []DepositorTelemetry       `json:"replicas"`
-	RecentDeposits  []RecentDepositItem        `json:"recent_deposits"`
-	DLQMessages     []DLQInspectorItem         `json:"dlq_messages"`
-	Balances        []UserBalanceRow           `json:"balances"`
+	PublisherReplicas int                        `json:"publisher_replicas"`
+	ActiveReplicas    int                        `json:"active_replicas"`
+	TotalWorkers      int                        `json:"total_workers"`
+	GlobalTPS         float64                    `json:"global_tps"`
+	GlobalProcessed   uint64                     `json:"global_processed"`
+	GlobalFailed      uint64                     `json:"global_failed"`
+	GlobalDuplicate   uint64                     `json:"global_duplicates"`
+	DBTotalDeposits   int64                      `json:"db_total_deposits"`
+	DBSettledDeposits int64                      `json:"db_settled_deposits"`
+	DBPendingDeposits int64                      `json:"db_pending_deposits"`
+	DLQTotalCount     uint64                     `json:"dlq_total_count"`
+	PublishEnabled    bool                       `json:"publish_enabled"`
+	Gateway           GatewayTelemetry           `json:"gateway"`
+	Reconciliation    LedgerReconciliationReport `json:"reconciliation"`
+	Publishers        []PublisherTelemetry       `json:"publishers"`
+	Replicas          []DepositorTelemetry       `json:"replicas"`
+	RecentDeposits    []RecentDepositItem        `json:"recent_deposits"`
+	DLQMessages       []DLQInspectorItem         `json:"dlq_messages"`
+	Balances          []UserBalanceRow           `json:"balances"`
 }
 
 type RecentDepositItem struct {
@@ -111,6 +134,7 @@ type RecentDepositItem struct {
 	UserID      int    `json:"user_id"`
 	Currency    string `json:"currency"`
 	Amount      string `json:"amount"`
+	IsSettled   bool   `json:"is_settled"`
 	ProcessedAt string `json:"processed_at"`
 }
 
@@ -129,7 +153,14 @@ type DashboardServer struct {
 	js             jetstream.JetStream
 	db             *sql.DB
 	gatewayURL     string
+	gatewayHost    string
+	gatewayPort    string
+	publisherHost  string
+	publisherPort  string
 	apiKey         string
+	apiKeyHash     [32]byte
+	uiSessionToken string
+	uiSessionHash  [32]byte
 	httpClient     *http.Client
 	publishEnabled atomic.Bool
 	loadgenRunning atomic.Bool
@@ -159,14 +190,45 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 		key = env
 	}
 
+	gwHost := "gateway"
+	gwPort := "8081"
+	if parsedGW, err := url.Parse(gwURL); err == nil && parsedGW.Host != "" {
+		if h, p, splitErr := net.SplitHostPort(parsedGW.Host); splitErr == nil {
+			gwHost = h
+			gwPort = p
+		} else {
+			gwHost = parsedGW.Host
+		}
+	}
+
+	pubHost := os.Getenv("PUBLISHER_HOST")
+	if pubHost == "" {
+		pubHost = "publisher"
+	}
+	pubPort := os.Getenv("PUBLISHER_HEALTH_PORT")
+	if pubPort == "" {
+		pubPort = "8090"
+	}
+
+	tokenBytes := make([]byte, 32)
+	_, _ = rand.Read(tokenBytes)
+	sessionToken := hex.EncodeToString(tokenBytes)
+
 	s := &DashboardServer{
-		replicas:   make(map[string]DepositorTelemetry),
-		nc:         nc,
-		js:         js,
-		db:         db,
-		gatewayURL: strings.TrimRight(gwURL, "/"),
-		apiKey:     key,
-		httpClient: &http.Client{Timeout: 3 * time.Second},
+		replicas:       make(map[string]DepositorTelemetry),
+		nc:             nc,
+		js:             js,
+		db:             db,
+		gatewayURL:     strings.TrimRight(gwURL, "/"),
+		gatewayHost:    gwHost,
+		gatewayPort:    gwPort,
+		publisherHost:  pubHost,
+		publisherPort:  pubPort,
+		apiKey:         key,
+		apiKeyHash:     sha256.Sum256([]byte(key)),
+		uiSessionToken: sessionToken,
+		uiSessionHash:  sha256.Sum256([]byte(sessionToken)),
+		httpClient:     &http.Client{Timeout: 3 * time.Second},
 		cachedRecon: LedgerReconciliationReport{
 			IsBalanced:      true,
 			TotalLedgerUSDT: "0",
@@ -189,6 +251,7 @@ func (s *DashboardServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", s.handleUI)
 	mux.HandleFunc("/api/stats", s.handleStats)
 	mux.HandleFunc("/api/publisher/toggle", s.guardPost(s.handleTogglePublisher))
+	mux.HandleFunc("/api/settlement/trigger", s.guardPost(s.handleTriggerSettlement))
 	mux.HandleFunc("/api/dlq/replay", s.guardPost(s.handleReplayDLQ))
 	mux.HandleFunc("/api/dlq/inject", s.guardPost(s.handleInjectInvalidEvent))
 	mux.HandleFunc("/api/gateway/send", s.guardPost(s.handleGatewaySendSingle))
@@ -207,12 +270,30 @@ func (s *DashboardServer) guardPost(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 		}
+		if secSite := r.Header.Get("Sec-Fetch-Site"); secSite != "" &&
+			!strings.EqualFold(secSite, "same-origin") &&
+			!strings.EqualFold(secSite, "none") {
+			http.Error(w, "cross-site request forbidden", http.StatusForbidden)
+			return
+		}
+
 		if providedKey := r.Header.Get("X-API-Key"); providedKey != "" && s.apiKey != "" {
-			if subtle.ConstantTimeCompare([]byte(providedKey), []byte(s.apiKey)) != 1 {
+			providedHash := sha256.Sum256([]byte(providedKey))
+			if subtle.ConstantTimeCompare(providedHash[:], s.apiKeyHash[:]) != 1 {
 				http.Error(w, "invalid X-API-Key", http.StatusUnauthorized)
 				return
 			}
+		} else if cookie, err := r.Cookie(dashboardSessionCook); err == nil && cookie.Value != "" {
+			cookieHash := sha256.Sum256([]byte(cookie.Value))
+			if subtle.ConstantTimeCompare(cookieHash[:], s.uiSessionHash[:]) != 1 {
+				http.Error(w, "invalid dashboard session", http.StatusUnauthorized)
+				return
+			}
+		} else if s.apiKey != "" && r.Header.Get("Origin") != "" {
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
 		}
+
 		r.Body = http.MaxBytesReader(w, r.Body, maxDashboardBodySize)
 		next(w, r)
 	}
@@ -226,14 +307,14 @@ func (s *DashboardServer) invalidateReconCache() {
 
 func (s *DashboardServer) StartNATSListener(ctx context.Context) error {
 	_, err := s.nc.Subscribe("telemetry.depositor", func(msg *nats.Msg) {
-		var t DepositorTelemetry
-		if err := json.Unmarshal(msg.Data, &t); err != nil {
+		var tel DepositorTelemetry
+		if err := json.Unmarshal(msg.Data, &tel); err != nil {
 			return
 		}
-		t.LastSeen = time.Now()
+		tel.LastSeen = time.Now()
 
 		s.mu.Lock()
-		s.replicas[t.InstanceID] = t
+		s.replicas[tel.InstanceID] = tel
 		s.mu.Unlock()
 	})
 	if err != nil {
@@ -262,27 +343,156 @@ func (s *DashboardServer) StartNATSListener(ctx context.Context) error {
 	return nil
 }
 
-func (s *DashboardServer) fetchGatewayTelemetry(ctx context.Context) GatewayTelemetry {
-	var gt GatewayTelemetry
-	reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+func (s *DashboardServer) fetchPublisherTelemetry(ctx context.Context) []PublisherTelemetry {
+	lookupCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, s.gatewayURL+"/stats", nil)
-	if err != nil {
-		return gt
+	var candidateIPs []string
+	if ips, err := net.DefaultResolver.LookupHost(lookupCtx, "tasks."+s.publisherHost); err == nil && len(ips) > 0 {
+		candidateIPs = ips
+	} else if ips, err := net.DefaultResolver.LookupHost(lookupCtx, s.publisherHost); err == nil && len(ips) > 0 {
+		candidateIPs = ips
+	} else {
+		candidateIPs = []string{"127.0.0.1"}
 	}
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return gt
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusOK {
-		if err := json.NewDecoder(resp.Body).Decode(&gt); err == nil {
-			gt.Online = true
+	seen := make(map[string]struct{}, len(candidateIPs))
+	uniqueIPs := make([]string, 0, len(candidateIPs))
+	for _, ip := range candidateIPs {
+		if _, exists := seen[ip]; !exists {
+			seen[ip] = struct{}{}
+			uniqueIPs = append(uniqueIPs, ip)
 		}
 	}
-	return gt
+
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		results = make([]PublisherTelemetry, 0, len(uniqueIPs))
+	)
+
+	for _, ip := range uniqueIPs {
+		targetIP := ip
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reqCtx, reqCancel := context.WithTimeout(ctx, 600*time.Millisecond)
+			defer reqCancel()
+
+			statsURL := fmt.Sprintf("http://%s/stats", net.JoinHostPort(targetIP, s.publisherPort))
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, statsURL, nil)
+			if err != nil {
+				return
+			}
+			resp, err := s.httpClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			var snap PublisherTelemetry
+			if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+				return
+			}
+			mu.Lock()
+			results = append(results, snap)
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].InstanceID < results[j].InstanceID
+	})
+
+	return results
+}
+
+// fetchGatewayTelemetry discovers all Gateway replicas via Swarm DNS (tasks.gateway)
+// and aggregates their counters so multi-replica Gateway deployments never oscillate.
+func (s *DashboardServer) fetchGatewayTelemetry(ctx context.Context) GatewayTelemetry {
+	lookupCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
+	defer cancel()
+
+	var targetURLs []string
+	if s.gatewayHost != "" && s.gatewayHost != "localhost" && net.ParseIP(s.gatewayHost) == nil {
+		if ips, err := net.DefaultResolver.LookupHost(lookupCtx, "tasks."+s.gatewayHost); err == nil && len(ips) > 0 {
+			seen := make(map[string]struct{}, len(ips))
+			for _, ip := range ips {
+				if _, ok := seen[ip]; !ok {
+					seen[ip] = struct{}{}
+					targetURLs = append(targetURLs, fmt.Sprintf("http://%s/stats", net.JoinHostPort(ip, s.gatewayPort)))
+				}
+			}
+		}
+	}
+	if len(targetURLs) == 0 {
+		targetURLs = []string{s.gatewayURL + "/stats"}
+	}
+
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		agg GatewayTelemetry
+	)
+
+	for _, u := range targetURLs {
+		statsURL := u
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reqCtx, reqCancel := context.WithTimeout(ctx, 800*time.Millisecond)
+			defer reqCancel()
+
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, statsURL, nil)
+			if err != nil {
+				return
+			}
+			resp, err := s.httpClient.Do(req)
+			if err != nil {
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+			var snap GatewayTelemetry
+			if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+				return
+			}
+
+			mu.Lock()
+			agg.Online = true
+			if snap.Ready {
+				agg.Ready = true
+			}
+			if snap.MTLSEnabled {
+				agg.MTLSEnabled = true
+			}
+			if snap.RateLimitRPS > 0 {
+				agg.RateLimitRPS = snap.RateLimitRPS
+				agg.RateLimitBurst = snap.RateLimitBurst
+			}
+			agg.TotalRequests += snap.TotalRequests
+			agg.Accepted202 += snap.Accepted202
+			agg.Duplicates += snap.Duplicates
+			agg.BadRequest400 += snap.BadRequest400
+			agg.Unauthorized401 += snap.Unauthorized401
+			agg.PayloadLarge413 += snap.PayloadLarge413
+			agg.RateLimited429 += snap.RateLimited429
+			agg.UpstreamError5xx += snap.UpstreamError5xx
+			agg.GRPCRetries += snap.GRPCRetries
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	return agg
 }
 
 func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -326,9 +536,10 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 				sub.user_id,
 				sub.currency,
 				ROUND(sub.amount, 8)::TEXT,
+				sub.is_settled,
 				TO_CHAR(sub.processed_at, 'YYYY-MM-DD HH24:MI:SS')
 			FROM (
-				SELECT event_id, user_id, currency, amount, processed_at
+				SELECT event_id, user_id, currency, amount, is_settled, processed_at
 				FROM deposits
 				ORDER BY processed_at DESC
 				LIMIT 15
@@ -338,7 +549,7 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 			defer func() { _ = rows.Close() }()
 			for rows.Next() {
 				var item RecentDepositItem
-				_ = rows.Scan(&item.OrderNum, &item.EventID, &item.UserID, &item.Currency, &item.Amount, &item.ProcessedAt)
+				_ = rows.Scan(&item.OrderNum, &item.EventID, &item.UserID, &item.Currency, &item.Amount, &item.IsSettled, &item.ProcessedAt)
 				recentDeposits = append(recentDeposits, item)
 			}
 		}
@@ -378,23 +589,28 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	gwTelemetry := s.fetchGatewayTelemetry(r.Context())
+	publishersList := s.fetchPublisherTelemetry(r.Context())
 
 	resp := AggregatedResponse{
-		ActiveReplicas:  len(replicasList),
-		TotalWorkers:    totalWorkers,
-		GlobalTPS:       globalTPS,
-		GlobalProcessed: globalProc,
-		GlobalFailed:    globalFail,
-		GlobalDuplicate: globalDup,
-		DBTotalDeposits: dbCount,
-		DLQTotalCount:   dlqTotal,
-		PublishEnabled:  s.publishEnabled.Load(),
-		Gateway:         gwTelemetry,
-		Reconciliation:  reconReport,
-		Replicas:        replicasList,
-		RecentDeposits:  recentDeposits,
-		DLQMessages:     dlqItems,
-		Balances:        balances,
+		PublisherReplicas: len(publishersList),
+		ActiveReplicas:    len(replicasList),
+		TotalWorkers:      totalWorkers,
+		GlobalTPS:         globalTPS,
+		GlobalProcessed:   globalProc,
+		GlobalFailed:      globalFail,
+		GlobalDuplicate:   globalDup,
+		DBTotalDeposits:   dbCount,
+		DBSettledDeposits: reconReport.SettledCount,
+		DBPendingDeposits: reconReport.PendingCount,
+		DLQTotalCount:     dlqTotal,
+		PublishEnabled:    s.publishEnabled.Load(),
+		Gateway:           gwTelemetry,
+		Reconciliation:    reconReport,
+		Publishers:        publishersList,
+		Replicas:          replicasList,
+		RecentDeposits:    recentDeposits,
+		DLQMessages:       dlqItems,
+		Balances:          balances,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -407,15 +623,22 @@ func (s *DashboardServer) getReconciliationAndCount(ctx context.Context, current
 
 	if !s.lastReconAt.IsZero() {
 		elapsed := time.Since(s.lastReconAt)
-		if currentGlobalProc == s.lastReconProc && elapsed < 3*time.Second {
+		if currentGlobalProc == s.lastReconProc && s.cachedRecon.PendingCount == 0 && elapsed < 3*time.Second {
 			return s.cachedDBCount, s.cachedRecon
 		}
-		if s.cachedDBCount >= 50_000 && currentGlobalProc != s.lastReconProc && elapsed < 10*time.Second {
+		if s.cachedDBCount >= 50_000 && currentGlobalProc != s.lastReconProc && elapsed < 5*time.Second {
 			return s.cachedDBCount, s.cachedRecon
 		}
 	}
 
-	dbCount, report := s.runLedgerReconciliationSinglePass(ctx)
+	dbCount, report, err := s.runLedgerReconciliationSinglePass(ctx)
+	if err != nil {
+		if !s.lastReconAt.IsZero() {
+			return s.cachedDBCount, s.cachedRecon
+		}
+		return 0, report
+	}
+
 	s.cachedDBCount = dbCount
 	s.cachedRecon = report
 	s.lastReconAt = time.Now()
@@ -423,9 +646,9 @@ func (s *DashboardServer) getReconciliationAndCount(ctx context.Context, current
 	return dbCount, report
 }
 
-func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context) (int64, LedgerReconciliationReport) {
+func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context) (int64, LedgerReconciliationReport, error) {
 	report := LedgerReconciliationReport{
-		IsBalanced:      true,
+		IsBalanced:      false,
 		TotalLedgerUSDT: "0",
 		TotalLedgerBTC:  "0",
 		TotalLedgerIRT:  "0",
@@ -435,22 +658,34 @@ func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context)
 	var totalCount int64
 
 	const unifiedReconQuery = `
-		WITH expected AS (
+		WITH all_deposits AS (
 			SELECT
 				user_id,
 				currency,
 				COUNT(*) AS tx_count,
-				SUM(amount) AS expected_amount
+				COUNT(*) FILTER (WHERE is_settled = TRUE) AS settled_tx_count,
+				COUNT(*) FILTER (WHERE is_settled = FALSE) AS pending_tx_count,
+				COALESCE(SUM(amount) FILTER (WHERE is_settled = TRUE), 0) AS settled_amount
 			FROM deposits
 			GROUP BY user_id, currency
 		),
 		summary AS (
 			SELECT
 				COALESCE(SUM(tx_count), 0)::BIGINT AS total_count,
-				COALESCE(SUM(CASE WHEN currency = 'USDT' THEN expected_amount END), 0)::TEXT AS total_usdt,
-				COALESCE(SUM(CASE WHEN currency = 'BTC'  THEN expected_amount END), 0)::TEXT AS total_btc,
-				COALESCE(SUM(CASE WHEN currency = 'IRT'  THEN expected_amount END), 0)::TEXT AS total_irt
-			FROM expected
+				COALESCE(SUM(settled_tx_count), 0)::BIGINT AS settled_count,
+				COALESCE(SUM(pending_tx_count), 0)::BIGINT AS pending_count,
+				COALESCE(SUM(CASE WHEN currency = 'USDT' THEN settled_amount END), 0)::TEXT AS total_usdt,
+				COALESCE(SUM(CASE WHEN currency = 'BTC'  THEN settled_amount END), 0)::TEXT AS total_btc,
+				COALESCE(SUM(CASE WHEN currency = 'IRT'  THEN settled_amount END), 0)::TEXT AS total_irt
+			FROM all_deposits
+		),
+		expected AS (
+			SELECT
+				user_id,
+				currency,
+				settled_amount AS expected_amount
+			FROM all_deposits
+			WHERE settled_amount > 0
 		),
 		discrepancies AS (
 			SELECT
@@ -467,6 +702,8 @@ func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context)
 		)
 		SELECT
 			s.total_count,
+			s.settled_count,
+			s.pending_count,
 			s.total_usdt,
 			s.total_btc,
 			s.total_irt,
@@ -481,33 +718,35 @@ func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context)
 
 	rows, err := s.db.QueryContext(ctx, unifiedReconQuery)
 	if err != nil {
-		return 0, report
+		return 0, report, err
 	}
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var (
 			uid    sql.NullInt64
-			cur    sql.NullString
+			curr   sql.NullString
 			expBal sql.NullString
 			actBal sql.NullString
 			diff   sql.NullString
 		)
 		if err := rows.Scan(
 			&totalCount,
+			&report.SettledCount,
+			&report.PendingCount,
 			&report.TotalLedgerUSDT,
 			&report.TotalLedgerBTC,
 			&report.TotalLedgerIRT,
 			&uid,
-			&cur,
+			&curr,
 			&expBal,
 			&actBal,
 			&diff,
 		); err == nil {
-			if uid.Valid && cur.Valid {
+			if uid.Valid && curr.Valid {
 				report.Discrepancies = append(report.Discrepancies, LedgerDiscrepancyItem{
 					UserID:          int(uid.Int64),
-					Currency:        cur.String,
+					Currency:        curr.String,
 					ExpectedBalance: expBal.String,
 					ActualBalance:   actBal.String,
 					Difference:      diff.String,
@@ -515,10 +754,42 @@ func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context)
 			}
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return 0, report, err
+	}
 
 	report.DiscrepancyCount = len(report.Discrepancies)
 	report.IsBalanced = report.DiscrepancyCount == 0
-	return totalCount, report
+	return totalCount, report, nil
+}
+
+func (s *DashboardServer) handleTriggerSettlement(w http.ResponseWriter, r *http.Request) {
+	if s.db == nil {
+		http.Error(w, "database not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	var totalSettled int64
+	for {
+		var batchSettled int64
+		err := s.db.QueryRowContext(r.Context(), "SELECT settle_pending_deposits(100000)").Scan(&batchSettled)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		totalSettled += batchSettled
+		if batchSettled < 100000 {
+			break
+		}
+	}
+
+	s.invalidateReconCache()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"settled":       true,
+		"settled_count": totalSettled,
+	})
 }
 
 func (s *DashboardServer) fetchDLQMessages(ctx context.Context, limit int) (uint64, []DLQInspectorItem) {
@@ -543,7 +814,11 @@ func (s *DashboardServer) fetchDLQMessages(ctx context.Context, limit int) (uint
 	}
 
 	count := 0
-	for seq := info.State.LastSeq; seq >= info.State.FirstSeq && count < limit; seq-- {
+	probes := 0
+	const maxSequenceProbes = 64
+
+	for seq := info.State.LastSeq; seq >= info.State.FirstSeq && count < limit && probes < maxSequenceProbes; seq-- {
+		probes++
 		rawMsg, err := stream.GetMsg(ctx, seq)
 		if err == nil {
 			var parsed struct {
@@ -677,7 +952,8 @@ func (s *DashboardServer) handleReplayDLQ(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	replayMsgID := fmt.Sprintf("replay-dlq-%d-%s", req.DLQSequence, eventID)
+	payloadSum := sha256.Sum256(normalizedPayload)
+	replayMsgID := fmt.Sprintf("replay-dlq-%d-%s-%x", req.DLQSequence, eventID, payloadSum[:4])
 
 	ack, err := s.js.Publish(
 		r.Context(),
@@ -738,7 +1014,9 @@ func (s *DashboardServer) handleTogglePublisher(w http.ResponseWriter, _ *http.R
 	s.publishEnabled.Store(newState)
 
 	payload, _ := json.Marshal(map[string]bool{"publish_enabled": newState})
-	_ = s.nc.Publish("control.publisher", payload)
+	if s.nc != nil {
+		_ = s.nc.Publish("control.publisher", payload)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]bool{"publish_enabled": newState})
@@ -921,6 +1199,13 @@ func (s *DashboardServer) handleGatewayLoadGen(w http.ResponseWriter, r *http.Re
 }
 
 func (s *DashboardServer) handleUI(w http.ResponseWriter, _ *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     dashboardSessionCook,
+		Value:    s.uiSessionToken,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(dashboardHTML))
 }
@@ -1033,18 +1318,23 @@ const dashboardHTML = `<!DOCTYPE html>
             </span>
           </div>
           <p class="text-xs text-slate-500 mt-1.5 flex flex-wrap items-center gap-2 font-medium">
-            <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="shield" class="w-3.5 h-3.5 text-indigo-500"></i> REST Gateway & gRPC</span>
-            <span class="text-slate-300">&bull;</span>
+            <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="shield" class="w-3.5 h-3.5 text-indigo-500"></i> REST Gateway + gRPC</span>
+            <span class="text-slate-300">•</span>
             <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="network" class="w-3.5 h-3.5 text-sky-500"></i> NATS JetStream</span>
-            <span class="text-slate-300">&bull;</span>
+            <span class="text-slate-300">•</span>
+            <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="layers" class="w-3.5 h-3.5 text-teal-500"></i> Periodic PL/pgSQL Settlement</span>
+            <span class="text-slate-300">•</span>
             <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="shield-check" class="w-3.5 h-3.5 text-emerald-500"></i> Automated Ledger Audit</span>
-            <span class="text-slate-300">&bull;</span>
-            <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="rotate-ccw" class="w-3.5 h-3.5 text-amber-500"></i> DLQ Replay</span>
           </p>
         </div>
       </div>
 
       <div class="flex flex-wrap items-center gap-3 w-full xl:w-auto justify-end">
+        <button onclick="triggerSettlementNow()" class="group px-4 py-2.5 rounded-2xl text-xs font-bold transition-all duration-200 bg-teal-50 text-teal-800 border border-teal-200 hover:bg-teal-600 hover:text-white hover:border-teal-600 hover:shadow-lg hover:shadow-teal-500/20 flex items-center gap-2 cursor-pointer active:scale-95">
+          <i data-lucide="check-check" class="w-4 h-4 text-teal-600 group-hover:text-white transition-colors"></i>
+          <span>تسویه فوری دسته‌ای (Settle Now)</span>
+        </button>
+
         <button onclick="injectPoisonMessage()" class="group px-4 py-2.5 rounded-2xl text-xs font-bold transition-all duration-200 bg-amber-50 text-amber-800 border border-amber-200 hover:bg-amber-500 hover:text-white hover:border-amber-500 hover:shadow-lg hover:shadow-amber-500/20 flex items-center gap-2 cursor-pointer active:scale-95">
           <i data-lucide="flask-conical" class="w-4 h-4 text-amber-600 group-hover:text-white transition-colors"></i>
           <span>تزریق پیام خراب (Poison Pill)</span>
@@ -1147,12 +1437,25 @@ const dashboardHTML = `<!DOCTYPE html>
     <div id="loadgenResultBanner" class="hidden bg-slate-900 text-white rounded-2xl p-3.5 text-xs font-mono ltr-num mt-3"></div>
   </div>
 
-  <!-- Global Cluster Metric Cards -->
-  <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-7 gap-4 animate-section delay-1">
+  <!-- Global Cluster Metric Cards (2 Balanced Rows of 4 Cards) -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 gap-4 animate-section delay-1">
     
     <div class="glass-card metric-card p-4 rounded-2xl">
       <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-semibold text-slate-500">Active Replicas</span>
+        <span class="text-xs font-semibold text-slate-500">Publisher Replicas</span>
+        <div class="w-9 h-9 rounded-xl bg-purple-50 border border-purple-100 text-purple-600 flex items-center justify-center">
+          <i data-lucide="Layers" class="w-4 h-4"></i>
+        </div>
+      </div>
+      <div class="text-2xl font-black text-slate-800 ltr-num" id="pubReplicas">0</div>
+      <div class="mt-1 text-[11px] text-purple-600 font-medium flex items-center gap-1">
+        <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span> نودهای فعال انتشاردهنده (gRPC)
+      </div>
+    </div>
+
+    <div class="glass-card metric-card p-4 rounded-2xl">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs font-semibold text-slate-500">Depositor Replicas</span>
         <div class="w-9 h-9 rounded-xl bg-sky-50 border border-sky-100 text-sky-600 flex items-center justify-center">
           <i data-lucide="server" class="w-4 h-4"></i>
         </div>
@@ -1172,7 +1475,7 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
       <div class="text-2xl font-black text-slate-800 ltr-num" id="workers">0</div>
       <div class="mt-1 text-[11px] text-indigo-600 font-medium flex items-center gap-1">
-        <span class="w-1.5 h-1.5 rounded-full bg-indigo-500"></span> گوروتین‌های موازی
+        <span class="w-1.5 h-1.5 rounded-full bg-indigo-500"></span> گوروتین‌های موازی Depositor
       </div>
     </div>
 
@@ -1185,46 +1488,50 @@ const dashboardHTML = `<!DOCTYPE html>
       </div>
       <div class="text-2xl font-black text-emerald-600 ltr-num" id="processed">0</div>
       <div class="mt-1 text-[11px] text-emerald-600 font-medium flex items-center gap-1">
-        <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> پردازش موفق کل
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> کل پیام‌های ثبت‌شده (DB: <span id="dbTotal" class="ltr-num">0</span>)
       </div>
     </div>
 
     <div class="glass-card metric-card p-4 rounded-2xl">
       <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-semibold text-slate-500">Duplicates Blocked</span>
+        <span class="text-xs font-semibold text-slate-500">Settled (is_settled = TRUE)</span>
+        <div class="w-9 h-9 rounded-xl bg-teal-50 border border-teal-100 text-teal-600 flex items-center justify-center">
+          <i data-lucide="check-check" class="w-4 h-4"></i>
+        </div>
+      </div>
+      <div class="text-2xl font-black text-teal-600 ltr-num" id="dbSettled">0</div>
+      <div class="mt-1 text-[11px] text-teal-600 font-medium flex items-center gap-1">
+        <span class="w-1.5 h-1.5 rounded-full bg-teal-500"></span> تسویه‌شده در جدول balances
+      </div>
+    </div>
+
+    <div class="glass-card metric-card p-4 rounded-2xl">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs font-semibold text-slate-500">Pending (is_settled = FALSE)</span>
         <div class="w-9 h-9 rounded-xl bg-amber-50 border border-amber-100 text-amber-600 flex items-center justify-center">
+          <i data-lucide="clock" class="w-4 h-4"></i>
+        </div>
+      </div>
+      <div class="text-2xl font-black text-amber-600 ltr-num" id="dbPending">0</div>
+      <div class="mt-1 text-[11px] text-amber-600 font-medium flex items-center gap-1">
+        <span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span> منتظر اجرای سیکل ۵ ثانیه‌ای PL/pgSQL
+      </div>
+    </div>
+
+    <div class="glass-card metric-card p-4 rounded-2xl">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-xs font-semibold text-slate-500">Duplicates / DLQ</span>
+        <div class="w-9 h-9 rounded-xl bg-rose-50 border border-rose-100 text-rose-600 flex items-center justify-center">
           <i data-lucide="shield-ban" class="w-4 h-4"></i>
         </div>
       </div>
-      <div class="text-2xl font-black text-amber-600 ltr-num" id="duplicates">0</div>
-      <div class="mt-1 text-[11px] text-amber-600 font-medium flex items-center gap-1">
-        <span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span> مهار Idempotency
+      <div class="flex items-baseline gap-2">
+        <span class="text-2xl font-black text-amber-600 ltr-num" id="duplicates">0</span>
+        <span class="text-slate-300">/</span>
+        <span class="text-lg font-black text-rose-600 ltr-num" id="dlqCount">0</span>
       </div>
-    </div>
-
-    <div class="glass-card metric-card p-4 rounded-2xl">
-      <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-semibold text-slate-500">DLQ Messages</span>
-        <div class="w-9 h-9 rounded-xl bg-rose-50 border border-rose-100 text-rose-600 flex items-center justify-center">
-          <i data-lucide="alert-octagon" class="w-4 h-4"></i>
-        </div>
-      </div>
-      <div class="text-2xl font-black text-rose-600 ltr-num" id="dlqCount">0</div>
-      <div class="mt-1 text-[11px] text-rose-600 font-medium flex items-center gap-1">
-        <span class="w-1.5 h-1.5 rounded-full bg-rose-500"></span> صف پیام‌های معیوب
-      </div>
-    </div>
-
-    <div class="glass-card metric-card p-4 rounded-2xl">
-      <div class="flex items-center justify-between mb-3">
-        <span class="text-xs font-semibold text-slate-500">DB Total Records</span>
-        <div class="w-9 h-9 rounded-xl bg-teal-50 border border-teal-100 text-teal-600 flex items-center justify-center">
-          <i data-lucide="database" class="w-4 h-4"></i>
-        </div>
-      </div>
-      <div class="text-2xl font-black text-teal-600 ltr-num" id="dbTotal">0</div>
-      <div class="mt-1 text-[11px] text-teal-600 font-medium flex items-center gap-1">
-        <span class="w-1.5 h-1.5 rounded-full bg-teal-500"></span> رکوردهای PostgreSQL
+      <div class="mt-1 text-[11px] text-slate-500 font-medium flex items-center gap-1">
+        <span class="w-1.5 h-1.5 rounded-full bg-rose-500"></span> تکراری خنثی‌شده / صف DLQ
       </div>
     </div>
 
@@ -1235,8 +1542,8 @@ const dashboardHTML = `<!DOCTYPE html>
           <i data-lucide="scale" class="w-4 h-4"></i>
         </div>
       </div>
-      <div class="text-sm font-extrabold text-emerald-600 mt-1" id="reconBadge">Verified OK</div>
-      <div class="mt-1.5 text-[11px] text-slate-500 font-medium">تراز حسابداری لحظه‌ای</div>
+      <div class="text-base font-extrabold text-emerald-600 mt-1" id="reconBadge">Verified OK</div>
+      <div class="mt-1.5 text-[11px] text-slate-500 font-medium">تراز تراکنش‌های تسویه‌شده</div>
     </div>
 
   </div>
@@ -1251,7 +1558,7 @@ const dashboardHTML = `<!DOCTYPE html>
         <div>
           <h2 class="font-extrabold text-slate-900 text-base">موتور مغایرت‌گیری خودکار حسابداری (Automated Ledger Reconciliation)</h2>
           <p class="text-xs text-slate-500 mt-1">
-            بررسی مستمر انطباق SUM(deposits.amount) با balances.balance از طریق FULL OUTER JOIN
+            بررسی مستمر انطباق SUM(deposits.amount) برای رکوردهای تسویه‌شده (is_settled = TRUE) با جدول balances
           </p>
         </div>
       </div>
@@ -1266,7 +1573,7 @@ const dashboardHTML = `<!DOCTYPE html>
           <div class="w-10 h-10 rounded-xl bg-emerald-500 text-white flex items-center justify-center font-black text-sm shadow-sm shadow-emerald-500/20">USDT</div>
           <div>
             <span class="text-xs font-bold text-slate-700 block">تتر (Tether USD)</span>
-            <span class="text-[11px] text-slate-400">مجموع کل واریزهای دفتر کل</span>
+            <span class="text-[11px] text-slate-400">مجموع تسویه‌شده در دفتر کل</span>
           </div>
         </div>
         <span id="ledgerUSDT" class="text-base font-extrabold text-emerald-700 ltr-num bg-white px-3 py-1.5 rounded-xl border border-emerald-100">0 USDT</span>
@@ -1277,7 +1584,7 @@ const dashboardHTML = `<!DOCTYPE html>
           <div class="w-10 h-10 rounded-xl bg-amber-500 text-white flex items-center justify-center font-black text-sm shadow-sm shadow-amber-500/20">BTC</div>
           <div>
             <span class="text-xs font-bold text-slate-700 block">بیت‌کوین (Bitcoin)</span>
-            <span class="text-[11px] text-slate-400">مجموع کل واریزهای دفتر کل</span>
+            <span class="text-[11px] text-slate-400">مجموع تسویه‌شده در دفتر کل</span>
           </div>
         </div>
         <span id="ledgerBTC" class="text-base font-extrabold text-amber-700 ltr-num bg-white px-3 py-1.5 rounded-xl border border-amber-100">0 BTC</span>
@@ -1288,7 +1595,7 @@ const dashboardHTML = `<!DOCTYPE html>
           <div class="w-10 h-10 rounded-xl bg-sky-500 text-white flex items-center justify-center font-black text-xs shadow-sm shadow-sky-500/20">IRT</div>
           <div>
             <span class="text-xs font-bold text-slate-700 block">تومان ایران (IRT)</span>
-            <span class="text-[11px] text-slate-400">مجموع کل واریزهای دفتر کل</span>
+            <span class="text-[11px] text-slate-400">مجموع تسویه‌شده در دفتر کل</span>
           </div>
         </div>
         <span id="ledgerIRT" class="text-base font-extrabold text-sky-700 ltr-num bg-white px-3 py-1.5 rounded-xl border border-sky-100">0 IRT</span>
@@ -1311,6 +1618,71 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Publisher & Depositor Live Replicas Grid -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 animate-section delay-3">
+
+    <!-- Active Publisher Replicas Table -->
+    <div class="glass-card rounded-3xl p-5 md:p-6 flex flex-col">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-2xl bg-purple-50 border border-purple-200/80 text-purple-600 flex items-center justify-center shrink-0">
+            <i data-lucide="server-cog" class="w-5 h-5"></i>
+          </div>
+          <div>
+            <h2 class="font-extrabold text-slate-900 text-sm md:text-base">وضعیت نودهای Publisher (gRPC + Health :8090)</h2>
+            <p class="text-xs text-slate-500 mt-0.5">کشف خودکار از طریق DNS سرویس (tasks.publisher)</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto border border-slate-200/90 rounded-2xl bg-white flex-1">
+        <table class="w-full text-right text-xs">
+          <thead class="text-slate-600 bg-slate-50/90 border-b border-slate-200 font-bold">
+            <tr>
+              <th class="py-3 px-3.5">شناسه نمونه</th>
+              <th class="py-3 px-3.5">وضعیت سلامت</th>
+              <th class="py-3 px-3.5">پردازش‌شده (gRPC)</th>
+              <th class="py-3 px-3.5">در حال اجرا</th>
+              <th class="py-3 px-3.5">آپتایم</th>
+            </tr>
+          </thead>
+          <tbody id="publisherRows" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Active Depositor Replicas Table -->
+    <div class="glass-card rounded-3xl p-5 md:p-6 flex flex-col">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-2xl bg-sky-50 border border-sky-200/80 text-sky-600 flex items-center justify-center shrink-0">
+            <i data-lucide="radio" class="w-5 h-5"></i>
+          </div>
+          <div>
+            <h2 class="font-extrabold text-slate-900 text-sm md:text-base">وضعیت نودهای Depositor (Worker Pool)</h2>
+            <p class="text-xs text-slate-500 mt-0.5">دریافت تله‌متری زنده از طریق NATS</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="overflow-x-auto border border-slate-200/90 rounded-2xl bg-white flex-1">
+        <table class="w-full text-right text-xs">
+          <thead class="text-slate-600 bg-slate-50/90 border-b border-slate-200 font-bold">
+            <tr>
+              <th class="py-3 px-3.5">شناسه نمونه</th>
+              <th class="py-3 px-3.5">تعداد Worker</th>
+              <th class="py-3 px-3.5">سرعت (TPS)</th>
+              <th class="py-3 px-3.5">ثبت‌شده</th>
+              <th class="py-3 px-3.5">تکراری / خطا</th>
+            </tr>
+          </thead>
+          <tbody id="replicaRows" class="divide-y divide-slate-100"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
   <!-- DLQ Inspector & Replay Panel -->
   <div class="glass-card rounded-3xl p-5 md:p-6 animate-section delay-3">
     <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center mb-5 gap-3">
@@ -1319,7 +1691,7 @@ const dashboardHTML = `<!DOCTYPE html>
           <i data-lucide="bug" class="w-5 h-5"></i>
         </div>
         <div>
-          <h2 class="font-extrabold text-slate-900 text-base">بازرس صف پیام‌های مرده و بازپخش (DLQ Inspector & Replay)</h2>
+          <h2 class="font-extrabold text-slate-900 text-base">بازرس صف پیام‌های مرده و بازپخش (DLQ Inspector + Replay)</h2>
           <p class="text-xs text-slate-500 mt-1">
             ثبت متادیتای کامل استریم مبدا با شناسه قطعی ضدتکرار
           </p>
@@ -1344,37 +1716,6 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Replicas Live Telemetry Table -->
-  <div class="glass-card rounded-3xl p-5 md:p-6 animate-section delay-3">
-    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-5 gap-3">
-      <div class="flex items-center gap-3.5">
-        <div class="w-11 h-11 rounded-2xl bg-sky-50 border border-sky-200/80 text-sky-600 flex items-center justify-center shrink-0">
-          <i data-lucide="radio" class="w-5 h-5"></i>
-        </div>
-        <div>
-          <h2 class="font-extrabold text-slate-900 text-base">وضعیت لحظه‌ای نمونه‌های مقیاس‌شده (Active Depositor Replicas)</h2>
-          <p class="text-xs text-slate-500 mt-0.5">دریافت تله‌متری زنده از طریق NATS</p>
-        </div>
-      </div>
-    </div>
-
-    <div class="overflow-x-auto border border-slate-200/90 rounded-2xl bg-white">
-      <table class="w-full text-right text-xs">
-        <thead class="text-slate-600 bg-slate-50/90 border-b border-slate-200 font-bold">
-          <tr>
-            <th class="py-3.5 px-4">شناسه نمونه</th>
-            <th class="py-3.5 px-4">تعداد Worker</th>
-            <th class="py-3.5 px-4">سرعت (TPS)</th>
-            <th class="py-3.5 px-4">پردازش‌شده</th>
-            <th class="py-3.5 px-4">تکراری خنثی‌شده</th>
-            <th class="py-3.5 px-4">خطا / تلاش مجدد</th>
-          </tr>
-        </thead>
-        <tbody id="replicaRows" class="divide-y divide-slate-100"></tbody>
-      </table>
-    </div>
-  </div>
-
   <!-- Chart & Recent Activity Grid -->
   <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-section delay-4">
     
@@ -1386,7 +1727,7 @@ const dashboardHTML = `<!DOCTYPE html>
           </div>
           <div>
             <h2 class="font-extrabold text-slate-900 text-base">نمودار زنده سرعت خوشه (Global TPS Stream)</h2>
-            <p class="text-xs text-slate-500">نرخ تراکنش‌های پردازش‌شده در ثانیه</p>
+            <p class="text-xs text-slate-500">نرخ تراکنش‌های ثبت‌شده در ثانیه</p>
           </div>
         </div>
         <span class="text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-lg border border-indigo-100 ltr-num">Real-time 1s</span>
@@ -1404,7 +1745,7 @@ const dashboardHTML = `<!DOCTYPE html>
           </div>
           <div>
             <h2 class="font-extrabold text-slate-900 text-base">آخرین تراکنش‌های ثبت‌شده</h2>
-            <p class="text-xs text-slate-500">۱۵ واریز آخر در دیتابیس</p>
+            <p class="text-xs text-slate-500">۱۵ واریز آخر در دیتابیس همراه با وضعیت تسویه</p>
           </div>
         </div>
       </div>
@@ -1412,10 +1753,11 @@ const dashboardHTML = `<!DOCTYPE html>
         <table class="w-full text-right text-xs">
           <thead class="text-slate-600 bg-slate-50/95 sticky top-0 border-b border-slate-200 font-bold z-10 backdrop-blur-sm">
             <tr>
-              <th class="py-3 px-3.5">شناسه پیام</th>
-              <th class="py-3 px-3.5">کاربر</th>
-              <th class="py-3 px-3.5">مبلغ</th>
-              <th class="py-3 px-3.5">زمان</th>
+              <th class="py-3 px-3">شناسه پیام</th>
+              <th class="py-3 px-3">کاربر</th>
+              <th class="py-3 px-3">مبلغ</th>
+              <th class="py-3 px-3">تسویه</th>
+              <th class="py-3 px-3">زمان</th>
             </tr>
           </thead>
           <tbody id="recentDepositsRows" class="divide-y divide-slate-100"></tbody>
@@ -1434,7 +1776,7 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
         <div>
           <h2 class="font-extrabold text-slate-900 text-base">موجودی لحظه‌ای کیف‌پول کاربران در PostgreSQL (جدول balances)</h2>
-          <p class="text-xs text-slate-500 mt-0.5">به‌روزرسانی اتمیک تراز مالی کاربران در تراکنش‌های دیتابیس</p>
+          <p class="text-xs text-slate-500 mt-0.5">به‌روزرسانی دسته‌ای دوره‌ای (هر ۵ ثانیه یک‌بار برای هر کاربر) توسط تابع PL/pgSQL</p>
         </div>
       </div>
     </div>
@@ -1469,7 +1811,7 @@ const dashboardHTML = `<!DOCTYPE html>
           <h3 class="text-base font-extrabold text-slate-900">اصلاح و بازپخش پیام DLQ</h3>
         </div>
       </div>
-      <button onclick="closeReplayModal()" class="w-8 h-8 rounded-xl bg-slate-100 text-slate-500 hover:bg-rose-50 hover:text-rose-600 flex items-center justify-center text-lg font-bold transition cursor-pointer">&times;</button>
+      <button onclick="closeReplayModal()" class="w-8 h-8 rounded-xl bg-slate-100 text-slate-500 hover:bg-rose-50 hover:text-rose-600 flex items-center justify-center text-lg font-bold transition cursor-pointer">×</button>
     </div>
 
     <input type="hidden" id="replaySeq" value="0" />
@@ -1494,14 +1836,20 @@ let lastGlobalProc = null;
 let lastTick = Date.now();
 let dlqCache = {};
 
+function setText(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.innerText = val;
+}
+
 function escapeHtml(str) {
     if (str === null || str === undefined) return '';
+    const amp = String.fromCharCode(38);
     return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+        .replaceAll(amp, amp + 'amp;')
+        .replaceAll('<', amp + 'lt;')
+        .replaceAll('>', amp + 'gt;')
+        .replaceAll('"', amp + 'quot;')
+        .replaceAll("'", amp + '#39;');
 }
 
 const ctx = document.getElementById('clusterChart').getContext('2d');
@@ -1584,28 +1932,48 @@ function getCurrencyBadge(cur, amount) {
     return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-50 text-sky-700 border border-sky-200/70 ltr-num font-bold">' + safeAmt + ' ' + safeCur + '</span>';
 }
 
+function getSettlementBadge(settled) {
+    if (settled) {
+        return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">تسویه‌شده</span>';
+    }
+    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200 animate-pulse">در انتظار</span>';
+}
+
+function getPubStatusBadge(pub) {
+    if (pub.ready && !pub.draining) {
+        return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 ltr-num">SERVING</span>';
+    }
+    if (pub.draining) {
+        return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200 ltr-num animate-pulse">DRAINING</span>';
+    }
+    return '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200 ltr-num">' + escapeHtml(pub.status) + '</span>';
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/stats');
     const d = await res.json();
     
-    document.getElementById('replicas').innerText = d.active_replicas;
-    document.getElementById('workers').innerText = d.total_workers;
-    document.getElementById('tps').innerText = d.global_tps.toFixed(1) + ' TPS';
-    document.getElementById('processed').innerText = d.global_processed.toLocaleString();
-    document.getElementById('duplicates').innerText = d.global_duplicates.toLocaleString();
-    document.getElementById('dlqCount').innerText = d.dlq_total_count.toLocaleString();
-    document.getElementById('dbTotal').innerText = d.db_total_deposits.toLocaleString();
+    setText('pubReplicas', d.publisher_replicas || 0);
+    setText('replicas', d.active_replicas || 0);
+    setText('workers', d.total_workers || 0);
+    setText('tps', (d.global_tps || 0).toFixed(1) + ' TPS');
+    setText('processed', (d.global_processed || 0).toLocaleString());
+    setText('duplicates', (d.global_duplicates || 0).toLocaleString());
+    setText('dlqCount', (d.dlq_total_count || 0).toLocaleString());
+    setText('dbTotal', (d.db_total_deposits || 0).toLocaleString());
+    setText('dbSettled', (d.db_settled_deposits || 0).toLocaleString());
+    setText('dbPending', (d.db_pending_deposits || 0).toLocaleString());
 
     if (d.gateway) {
-        document.getElementById('gwTotal').innerText = d.gateway.total_requests.toLocaleString();
-        document.getElementById('gw202').innerText = d.gateway.accepted_202.toLocaleString();
-        document.getElementById('gwDup').innerText = d.gateway.duplicates.toLocaleString();
-        document.getElementById('gw429').innerText = d.gateway.rate_limited_429.toLocaleString();
-        document.getElementById('gwRetry').innerText = d.gateway.grpc_retries.toLocaleString();
-        document.getElementById('gw401').innerText = d.gateway.unauthorized_401.toLocaleString();
-        document.getElementById('gw400').innerText = (d.gateway.bad_request_400 + d.gateway.payload_large_413).toLocaleString();
-        document.getElementById('gw5xx').innerText = d.gateway.upstream_error_5xx.toLocaleString();
+        setText('gwTotal', d.gateway.total_requests.toLocaleString());
+        setText('gw202', d.gateway.accepted_202.toLocaleString());
+        setText('gwDup', d.gateway.duplicates.toLocaleString());
+        setText('gw429', d.gateway.rate_limited_429.toLocaleString());
+        setText('gwRetry', d.gateway.grpc_retries.toLocaleString());
+        setText('gw401', d.gateway.unauthorized_401.toLocaleString());
+        setText('gw400', (d.gateway.bad_request_400 + d.gateway.payload_large_413).toLocaleString());
+        setText('gw5xx', d.gateway.upstream_error_5xx.toLocaleString());
 
         const readyBadge = document.getElementById('gwReadyBadge');
         if (d.gateway.online && d.gateway.ready) {
@@ -1616,14 +1984,14 @@ async function refresh() {
             readyBadge.innerText = '/readyz: 503 Unavailable';
         }
 
-        document.getElementById('gwMtlsBadge').innerText = d.gateway.mtls_enabled ? 'mTLS: Active' : 'mTLS: Inactive (Env Off)';
-        document.getElementById('gwRateBadge').innerText = 'Rate Limit: ' + d.gateway.rate_limit_rps + ' RPS (Burst ' + d.gateway.rate_limit_burst + ')';
+        setText('gwMtlsBadge', d.gateway.mtls_enabled ? 'mTLS: Active' : 'mTLS: Inactive (Env Off)');
+        setText('gwRateBadge', 'Rate Limit: ' + d.gateway.rate_limit_rps + ' RPS (Burst ' + d.gateway.rate_limit_burst + ')');
     }
 
     if (d.reconciliation) {
-        document.getElementById('ledgerUSDT').innerText = formatDec(d.reconciliation.total_ledger_usdt) + ' USDT';
-        document.getElementById('ledgerBTC').innerText = formatDec(d.reconciliation.total_ledger_btc) + ' BTC';
-        document.getElementById('ledgerIRT').innerText = formatDec(d.reconciliation.total_ledger_irt) + ' IRT';
+        setText('ledgerUSDT', formatDec(d.reconciliation.total_ledger_usdt) + ' USDT');
+        setText('ledgerBTC', formatDec(d.reconciliation.total_ledger_btc) + ' BTC');
+        setText('ledgerIRT', formatDec(d.reconciliation.total_ledger_irt) + ' IRT');
 
         const badge = document.getElementById('reconBadge');
         const statusBox = document.getElementById('reconStatusBox');
@@ -1631,13 +1999,13 @@ async function refresh() {
         const discRows = document.getElementById('discrepancyRows');
 
         if (d.reconciliation.is_balanced) {
-            badge.className = 'text-sm font-extrabold text-emerald-600 mt-1';
+            badge.className = 'text-base font-extrabold text-emerald-600 mt-1';
             badge.innerText = 'Verified OK';
             statusBox.className = 'px-4 py-2 rounded-2xl text-xs font-bold bg-emerald-50 border border-emerald-200 text-emerald-700 shadow-sm';
-            statusBox.innerText = 'انطباق ۱۰۰٪ دفتر کل و کیف‌پول‌ها (آخرین بررسی: ' + d.reconciliation.checked_at + ')';
+            statusBox.innerText = 'انطباق ۱۰۰٪ تراکنش‌های تسویه‌شده و کیف‌پول‌ها (در صف تسویه: ' + (d.db_pending_deposits || 0).toLocaleString() + ' | بررسی: ' + d.reconciliation.checked_at + ')';
             discContainer.classList.add('hidden');
         } else {
-            badge.className = 'text-sm font-extrabold text-rose-600 mt-1 animate-pulse';
+            badge.className = 'text-base font-extrabold text-rose-600 mt-1 animate-pulse';
             badge.innerText = 'Discrepancy (' + d.reconciliation.discrepancy_count + ')';
             statusBox.className = 'px-4 py-2 rounded-2xl text-xs font-bold bg-rose-50 border border-rose-200 text-rose-700 shadow-sm';
             statusBox.innerText = 'هشدار مغایرت حسابداری! تعداد: ' + d.reconciliation.discrepancy_count;
@@ -1652,6 +2020,21 @@ async function refresh() {
                 '</tr>';
             }).join('');
         }
+    }
+
+    const pubTbody = document.getElementById('publisherRows');
+    if (!d.publishers || d.publishers.length === 0) {
+        pubTbody.innerHTML = '<tr><td colspan="5" class="py-8 text-center text-slate-400 font-medium">هیچ نمونه Publisher یافت نشد...</td></tr>';
+    } else {
+        pubTbody.innerHTML = d.publishers.map(function(p) {
+            return '<tr class="hover:bg-slate-50/90 transition">' +
+            '<td class="py-3 px-3.5 font-mono text-purple-800 font-bold ltr-num">' + escapeHtml(p.instance_id) + '</td>' +
+            '<td class="py-3 px-3.5">' + getPubStatusBadge(p) + '</td>' +
+            '<td class="py-3 px-3.5 text-slate-900 font-bold ltr-num">' + Number(p.processed_requests || 0).toLocaleString() + '</td>' +
+            '<td class="py-3 px-3.5 text-indigo-600 font-bold ltr-num">' + Number(p.in_flight_requests || 0) + '</td>' +
+            '<td class="py-3 px-3.5 text-slate-500 font-medium ltr-num">' + Number(p.uptime_seconds || 0).toFixed(0) + 's</td>' +
+            '</tr>';
+        }).join('');
     }
 
     const dlqTbody = document.getElementById('dlqRows');
@@ -1687,31 +2070,31 @@ async function refresh() {
 
     const tbody = document.getElementById('replicaRows');
     if (!d.replicas || d.replicas.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="py-8 text-center text-slate-400 font-medium">هیچ نمونه فعالی متصل نیست...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="py-8 text-center text-slate-400 font-medium">هیچ نمونه Depositor متصل نیست...</td></tr>';
     } else {
         tbody.innerHTML = d.replicas.map(function(r) { 
           return '<tr class="hover:bg-slate-50/90 transition">' +
-          '<td class="py-3.5 px-4 font-mono text-sky-800 font-bold">' + escapeHtml(r.instance_id) + '</td>' +
-          '<td class="py-3.5 px-4 text-slate-700 font-bold">' + Number(r.worker_count) + ' Workers</td>' +
-          '<td class="py-3.5 px-4 text-emerald-600 font-extrabold ltr-num">' + Number(r.current_tps).toFixed(1) + ' /s</td>' +
-          '<td class="py-3.5 px-4 text-slate-900 font-bold ltr-num">' + Number(r.processed_total).toLocaleString() + '</td>' +
-          '<td class="py-3.5 px-4 text-amber-600 font-bold ltr-num">' + Number(r.duplicates_total).toLocaleString() + '</td>' +
-          '<td class="py-3.5 px-4 text-rose-600 font-bold ltr-num">' + Number(r.failed_total).toLocaleString() + '</td>' +
+          '<td class="py-3 px-3.5 font-mono text-sky-800 font-bold ltr-num">' + escapeHtml(r.instance_id) + '</td>' +
+          '<td class="py-3 px-3.5 text-slate-700 font-bold ltr-num">' + Number(r.worker_count) + ' Workers</td>' +
+          '<td class="py-3 px-3.5 text-emerald-600 font-extrabold ltr-num">' + Number(r.current_tps).toFixed(1) + ' /s</td>' +
+          '<td class="py-3 px-3.5 text-slate-900 font-bold ltr-num">' + Number(r.processed_total).toLocaleString() + '</td>' +
+          '<td class="py-3 px-3.5 ltr-num"><span class="text-amber-600 font-bold">' + Number(r.duplicates_total).toLocaleString() + '</span> / <span class="text-rose-600 font-bold">' + Number(r.failed_total).toLocaleString() + '</span></td>' +
           '</tr>';
         }).join('');
     }
 
     const recTbody = document.getElementById('recentDepositsRows');
     if (!d.recent_deposits || d.recent_deposits.length === 0) {
-        recTbody.innerHTML = '<tr><td colspan="4" class="py-8 text-center text-slate-400 font-medium">هنوز تراکنشی ثبت نشده...</td></tr>';
+        recTbody.innerHTML = '<tr><td colspan="5" class="py-8 text-center text-slate-400 font-medium">هنوز تراکنشی ثبت نشده...</td></tr>';
     } else {
         recTbody.innerHTML = d.recent_deposits.map(function(item) { 
             const shortID = escapeHtml((item.event_id || '').substring(0, 12));
             return '<tr class="hover:bg-slate-50/90 transition">' +
-            '<td class="py-2.5 px-3.5 font-mono text-indigo-600 font-semibold ltr-num">' + shortID + '...</td>' +
-            '<td class="py-2.5 px-3.5 text-slate-700 font-bold">#' + Number(item.user_id) + '</td>' +
-            '<td class="py-2.5 px-3.5">' + getCurrencyBadge(item.currency, item.amount) + '</td>' +
-            '<td class="py-2.5 px-3.5 text-slate-400 ltr-num text-[11px] font-medium">' + escapeHtml(item.processed_at) + '</td>' +
+            '<td class="py-2.5 px-3 font-mono text-indigo-600 font-semibold ltr-num">' + shortID + '...</td>' +
+            '<td class="py-2.5 px-3 text-slate-700 font-bold">#' + Number(item.user_id) + '</td>' +
+            '<td class="py-2.5 px-3">' + getCurrencyBadge(item.currency, item.amount) + '</td>' +
+            '<td class="py-2.5 px-3">' + getSettlementBadge(item.is_settled) + '</td>' +
+            '<td class="py-2.5 px-3 text-slate-400 ltr-num text-[11px] font-medium">' + escapeHtml(item.processed_at) + '</td>' +
             '</tr>';
         }).join('');
     }
@@ -1734,9 +2117,16 @@ async function refresh() {
     const now = Date.now();
     const dt = (now - lastTick) / 1000;
     if (lastGlobalProc !== null && dt >= 0.9) {
+        let displayTPS = d.global_tps || 0;
+        if (displayTPS === 0 && d.global_processed > lastGlobalProc) {
+            displayTPS = (d.global_processed - lastGlobalProc) / dt;
+            setText('tps', displayTPS.toFixed(1) + ' TPS');
+        }
+        lastGlobalProc = d.global_processed;
+
         const timeLabel = new Date().toLocaleTimeString('fa-IR');
         chartData.labels.push(timeLabel);
-        chartData.datasets[0].data.push(d.global_tps);
+        chartData.datasets[0].data.push(displayTPS);
 
         if (chartData.labels.length > 25) {
             chartData.labels.shift();
@@ -1746,10 +2136,25 @@ async function refresh() {
         lastTick = now;
     } else if (lastGlobalProc === null) {
         lastTick = now;
-        lastGlobalProc = d.global_processed;
+        lastGlobalProc = d.global_processed || 0;
     }
 
   } catch (e) {}
+}
+
+async function triggerSettlementNow() {
+  try {
+    const res = await fetch('/api/settlement/trigger', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok && data.settled) {
+      showToast('تسویه دسته‌ای انجام شد (' + Number(data.settled_count).toLocaleString() + ' تراکنش)', 'info');
+      refresh();
+    } else {
+      showToast('خطا در اجرای تسویه دسته‌ای', 'warn');
+    }
+  } catch (e) {
+    showToast('خطا در ارتباط با سرور تسویه', 'warn');
+  }
 }
 
 async function togglePublisher() {

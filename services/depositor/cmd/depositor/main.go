@@ -43,6 +43,7 @@ func main() {
 	log.Info("Depositor service starting",
 		zap.Int("worker_count", cfg.WorkerCount),
 		zap.Duration("retry_interval", cfg.RetryInterval),
+		zap.Duration("settlement_interval", cfg.SettlementInterval),
 		zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 		zap.Int("metrics_port", cfg.MetricsPort),
 	)
@@ -94,6 +95,9 @@ func main() {
 		log.Fatal("Failed to start worker consumer group", zap.Error(err))
 	}
 
+	settlementWorker := worker.NewSettlementWorker(repo, cfg.SettlementInterval, log)
+	settlementWorker.Start(workCtx)
+
 	natsBroker.OnReconnect(func(reconnCtx context.Context) {
 		newConsumer, err := natsBroker.CreateOrUpdateDepositConsumer(reconnCtx, cfg.WorkerCount*32)
 		if err != nil {
@@ -137,6 +141,10 @@ func main() {
 		<-waitDone
 		log.Info("Workers stopped")
 	}
+
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	settlementWorker.StopAndFlush(flushCtx)
+	flushCancel()
 
 	natsBroker.Close()
 	_ = repo.Close()

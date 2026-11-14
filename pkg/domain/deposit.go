@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
@@ -52,8 +53,10 @@ type LedgerDiscrepancy struct {
 }
 
 // ValidateEventID checks length (1..128) and allowed characters (alphanumeric and -_:. ).
-// ValidateEventID checks length (1..128) and allowed characters (alphanumeric and -_:. ).
 func ValidateEventID(eventID string) error {
+	if strings.TrimSpace(eventID) == "" {
+		return fmt.Errorf("event_id is required")
+	}
 	n := len(eventID)
 	if n < MinEventIDLen || n > MaxEventIDLen {
 		return fmt.Errorf("event_id length must be between %d and %d characters", MinEventIDLen, MaxEventIDLen)
@@ -66,7 +69,7 @@ func ValidateEventID(eventID string) error {
 			c == '-' || c == '_' || c == ':' || c == '.' {
 			continue
 		}
-		return fmt.Errorf("event_id contains invalid characters (must be alphanumeric or -_.)")
+		return fmt.Errorf("event_id contains invalid characters (must be alphanumeric or -_:.)")
 	}
 	return nil
 }
@@ -77,24 +80,24 @@ func ParseAndValidateAmount(rawAmount string) (decimal.Decimal, error) {
 	if trimmed == "" {
 		return decimal.Zero, fmt.Errorf("amount is required")
 	}
-	if strings.ContainsAny(trimmed, "eE") {
-		return decimal.Zero, fmt.Errorf("amount must be in standard decimal format without scientific notation")
-	}
 
 	amt, err := decimal.NewFromString(trimmed)
 	if err != nil {
 		return decimal.Zero, fmt.Errorf("amount must be a valid decimal string: %w", err)
 	}
+	if strings.ContainsAny(trimmed, "eE") {
+		return decimal.Zero, fmt.Errorf("amount must be in standard decimal format without scientific notation")
+	}
 	if !amt.IsPositive() {
 		return decimal.Zero, fmt.Errorf("amount must be strictly greater than zero")
 	}
 	if amt.Exponent() < -MaxDecimalScale {
-		return decimal.Zero, fmt.Errorf("amount cannot have more than %d decimal places", MaxDecimalScale)
+		return decimal.Zero, fmt.Errorf("amount precision exceeds maximum %d decimal places", MaxDecimalScale)
 	}
 	// NUMERIC(36, 18) allows at most 18 integer digits
 	maxAllowed := decimal.New(1, MaxDecimalPrecision-MaxDecimalScale)
 	if amt.GreaterThanOrEqual(maxAllowed) {
-		return decimal.Zero, fmt.Errorf("amount exceeds maximum allowed precision")
+		return decimal.Zero, fmt.Errorf("amount exceeds maximum allowed limit")
 	}
 	return amt, nil
 }
@@ -162,11 +165,18 @@ type rawDepositEventJSON struct {
 
 // ParseAndValidateDepositEvent parses raw JSON bytes and validates all domain rules.
 func ParseAndValidateDepositEvent(data []byte) (*DepositEvent, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, NewInvalidMessageError("", "empty message payload", nil)
+	}
+
 	var raw rawDepositEventJSON
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&raw); err != nil {
 		return nil, NewInvalidMessageError("", fmt.Sprintf("malformed JSON payload: %v", err), err)
+	}
+	if dec.More() || dec.Decode(&struct{}{}) != io.EOF {
+		return nil, NewInvalidMessageError(raw.EventID, "malformed JSON payload: unexpected trailing data", nil)
 	}
 
 	if len(raw.Amount) < 2 || raw.Amount[0] != '"' || raw.Amount[len(raw.Amount)-1] != '"' {

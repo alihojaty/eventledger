@@ -70,7 +70,6 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to initialize NATS JetStream broker", zap.Error(err))
 	}
-	healthMgr.SetNATSConnected(natsBroker.IsConnected())
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.PublisherGRPCPort))
 	if err != nil {
@@ -91,6 +90,7 @@ func main() {
 	if cfg.MTLSEnabled {
 		creds, err := tlscfg.ServerTransportCredentials(cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSCAFile)
 		if err != nil {
+			_ = lis.Close()
 			natsBroker.Close()
 			log.Fatal("Failed to configure publisher mTLS credentials", zap.Error(err))
 		}
@@ -103,6 +103,22 @@ func main() {
 
 	// Register unified HealthManager as the gRPC HealthServer
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthMgr)
+
+	go func() {
+		log.Info("Publisher gRPC server listening",
+			zap.Int("grpc_port", cfg.PublisherGRPCPort),
+			zap.Int("health_port", cfg.PublisherHealthPort),
+			zap.Duration("drain_delay", cfg.DrainDelay),
+			zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
+			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
+		)
+		if err := grpcSrv.Serve(lis); err != nil {
+			log.Error("gRPC server stopped with error", zap.Error(err))
+		}
+	}()
+
+	// Mark ready only AFTER gRPC listener is active and serving
+	healthMgr.SetNATSConnected(natsBroker.IsConnected())
 
 	// Background NATS connectivity monitor updating the single HealthManager
 	go func() {
@@ -134,19 +150,6 @@ func main() {
 					zap.String("health_status", snap.Status),
 				)
 			}
-		}
-	}()
-
-	go func() {
-		log.Info("Publisher gRPC server listening",
-			zap.Int("grpc_port", cfg.PublisherGRPCPort),
-			zap.Int("health_port", cfg.PublisherHealthPort),
-			zap.Duration("drain_delay", cfg.DrainDelay),
-			zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
-			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
-		)
-		if err := grpcSrv.Serve(lis); err != nil {
-			log.Error("gRPC server stopped with error", zap.Error(err))
 		}
 	}()
 

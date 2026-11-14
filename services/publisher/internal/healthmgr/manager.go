@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 )
 
 type StateCode int32
@@ -143,7 +145,6 @@ func (m *Manager) transitionTo(next StateCode) {
 		select {
 		case ch <- grpcStatus:
 		default:
-			// Drop oldest unread notification and push latest state
 			select {
 			case <-ch:
 			default:
@@ -195,9 +196,10 @@ func (m *Manager) Watch(_ *grpc_health_v1.HealthCheckRequest, stream grpc_health
 	m.mu.Lock()
 	if m.watchClosed {
 		m.mu.Unlock()
-		return stream.Send(&grpc_health_v1.HealthCheckResponse{
-			Status: m.grpcStatusForState(m.CurrentState()),
+		_ = stream.Send(&grpc_health_v1.HealthCheckResponse{
+			Status: grpc_health_v1.HealthCheckResponse_NOT_SERVING,
 		})
+		return status.Error(codes.Unavailable, "health watch closed for graceful shutdown")
 	}
 	m.nextWatchID++
 	id := m.nextWatchID

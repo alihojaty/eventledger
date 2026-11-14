@@ -19,7 +19,10 @@ import (
 
 // ServerTransportCredentials returns mTLS 1.3 gRPC server credentials for publisher.
 func ServerTransportCredentials(certFile, keyFile, caFile string) (credentials.TransportCredentials, error) {
-	if certFile != "" && keyFile != "" && caFile != "" {
+	if certFile != "" || keyFile != "" || caFile != "" {
+		if certFile == "" || keyFile == "" || caFile == "" {
+			return nil, fmt.Errorf("TLS_CERT_FILE, TLS_KEY_FILE, and TLS_CA_FILE must all be provided together")
+		}
 		return loadFileCredentials(certFile, keyFile, caFile, true)
 	}
 
@@ -44,7 +47,10 @@ func ServerTransportCredentials(certFile, keyFile, caFile string) (credentials.T
 
 // ClientTransportCredentials returns mTLS 1.3 gRPC client credentials for gateway.
 func ClientTransportCredentials(certFile, keyFile, caFile string) (credentials.TransportCredentials, error) {
-	if certFile != "" && keyFile != "" && caFile != "" {
+	if certFile != "" || keyFile != "" || caFile != "" {
+		if certFile == "" || keyFile == "" || caFile == "" {
+			return nil, fmt.Errorf("TLS_CERT_FILE, TLS_KEY_FILE, and TLS_CA_FILE must all be provided together")
+		}
 		return loadFileCredentials(certFile, keyFile, caFile, false)
 	}
 
@@ -62,6 +68,7 @@ func ClientTransportCredentials(certFile, keyFile, caFile string) (credentials.T
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{cliCert},
 		RootCAs:      caPool,
+		ServerName:   "publisher",
 	}
 	return credentials.NewTLS(tlsCfg), nil
 }
@@ -93,6 +100,7 @@ func loadFileCredentials(certFile, keyFile, caFile string, isServer bool) (crede
 		MinVersion:   tls.VersionTLS13,
 		Certificates: []tls.Certificate{pair},
 		RootCAs:      caPool,
+		ServerName:   "publisher",
 	}), nil
 }
 

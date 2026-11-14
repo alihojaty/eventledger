@@ -130,6 +130,7 @@ services:
       NATS_URL: nats://nats:4222
       WORKER_COUNT: "32"
       RETRY_INTERVAL: 5s
+      SETTLEMENT_INTERVAL: 5s
       SHUTDOWN_TIMEOUT: 15s
       METRICS_PORT: "8080"
       LOG_LEVEL: info

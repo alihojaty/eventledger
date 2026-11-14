@@ -89,13 +89,10 @@ func DeterministicDeposit(seq int64) (int, string, string, decimal.Decimal) {
 	var amountStr string
 	switch cur {
 	case "USDT":
-		// 10.25, 20.25, ..., 70.25
 		amountStr = fmt.Sprintf("%d0.25", tier)
 	case "BTC":
-		// 0.00100000, 0.00200000, ..., 0.00700000
 		amountStr = fmt.Sprintf("0.00%d00000", tier)
 	case "IRT":
-		// 100000, 200000, ..., 700000
 		amountStr = fmt.Sprintf("%d00000", tier)
 	}
 
@@ -105,37 +102,61 @@ func DeterministicDeposit(seq int64) (int, string, string, decimal.Decimal) {
 // ComputeExpectedBalances calculates the exact expected balance per user and currency
 // for sequences 1..totalReqs in O(420) constant time and O(1) memory.
 func ComputeExpectedBalances(totalReqs int64) map[int]map[string]decimal.Decimal {
-	res := make(map[int]map[string]decimal.Decimal, numUsers)
+	res, _ := ComputeExpectedBalancesAndCounts(1, totalReqs)
+	return res
+}
+
+// ComputeExpectedBalancesAndCounts calculates both exact expected balance delta and transaction count
+// per user and currency for sequences fromSeq..toSeq in O(420) constant time.
+func ComputeExpectedBalancesAndCounts(fromSeq, toSeq int64) (map[int]map[string]decimal.Decimal, map[int]map[string]int64) {
+	balances := make(map[int]map[string]decimal.Decimal, numUsers)
+	counts := make(map[int]map[string]int64, numUsers)
 	for u := 1; u <= numUsers; u++ {
-		res[u] = map[string]decimal.Decimal{
+		balances[u] = map[string]decimal.Decimal{
 			"USDT": decimal.Zero,
 			"BTC":  decimal.Zero,
 			"IRT":  decimal.Zero,
 		}
-	}
-
-	if totalReqs <= 0 {
-		return res
-	}
-
-	fullCycles := totalReqs / cyclePeriod
-	remainder := totalReqs % cyclePeriod
-
-	for r := int64(0); r < cyclePeriod; r++ {
-		count := fullCycles
-		if r < remainder {
-			count++
+		counts[u] = map[string]int64{
+			"USDT": 0,
+			"BTC":  0,
+			"IRT":  0,
 		}
-		if count == 0 {
-			continue
-		}
-		seq := r + 1
-		u, cur, _, amt := DeterministicDeposit(seq)
-		totalForResidue := amt.Mul(decimal.NewFromInt(count))
-		res[u][cur] = res[u][cur].Add(totalForResidue)
 	}
 
-	return res
+	if toSeq < fromSeq || toSeq <= 0 {
+		return balances, counts
+	}
+
+	addPrefix := func(limit int64, sign int64) {
+		if limit <= 0 {
+			return
+		}
+		fullCycles := limit / cyclePeriod
+		remainder := limit % cyclePeriod
+		for r := int64(0); r < cyclePeriod; r++ {
+			c := fullCycles
+			if r < remainder {
+				c++
+			}
+			if c == 0 {
+				continue
+			}
+			seq := r + 1
+			u, cur, _, amt := DeterministicDeposit(seq)
+			deltaCount := c * sign
+			deltaAmt := amt.Mul(decimal.NewFromInt(deltaCount))
+			balances[u][cur] = balances[u][cur].Add(deltaAmt)
+			counts[u][cur] += deltaCount
+		}
+	}
+
+	addPrefix(toSeq, 1)
+	if fromSeq > 1 {
+		addPrefix(fromSeq-1, -1)
+	}
+
+	return balances, counts
 }
 
 func main() {
@@ -217,14 +238,13 @@ func main() {
 	_, _ = fmt.Fprintf(tlWriter, "[%s] LOADGEN_START run_id=%s from=%d to=%d total_to_send=%d concurrency=%d\n",
 		start.UTC().Format(time.RFC3339), *runID, *fromSeq, *totalReqs, expectedToExecute, *concurrency)
 
-	// پیش‌محاسبهٔ کل ۴۲۰ حالت قطعی بدنهٔ درخواست در حافظه (O(420))
 	var prebuiltBodies [cyclePeriod][]byte
 	for i := int64(0); i < cyclePeriod; i++ {
 		u, cur, amt, _ := DeterministicDeposit(i + 1)
 		prebuiltBodies[i] = []byte(fmt.Sprintf(`{"user_id":%d,"currency":%q,"amount":%q}`, u, cur, amt))
 	}
 	sameKeyBody := []byte(`{"user_id":7,"currency":"USDT","amount":"125.50"}`)
-	// Background time-series logger (every 5 seconds) for RPS & 5xx correlation with chaos.sh
+
 	doneMonitor := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -284,15 +304,18 @@ func main() {
 				}
 
 				backoff := *initialBackoff
+				e2eStart := time.Now()
 
 				for attempt := 1; ; attempt++ {
 					if ctx.Err() != nil {
+						hist.Record(time.Since(e2eStart))
 						finalFailures.Add(1)
 						return
 					}
 
 					req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(bodyBytes))
 					if err != nil {
+						hist.Record(time.Since(e2eStart))
 						finalFailures.Add(1)
 						break
 					}
@@ -300,11 +323,7 @@ func main() {
 					req.Header.Set("X-API-Key", *apiKey)
 					req.Header.Set("Idempotency-Key", idemKey)
 
-					reqStart := time.Now()
 					resp, err := client.Do(req)
-					latency := time.Since(reqStart)
-					hist.Record(latency)
-
 					if err != nil {
 						networkErr.Add(1)
 						totalRetryAttempts.Add(1)
@@ -317,6 +336,7 @@ func main() {
 					_ = resp.Body.Close()
 
 					if resp.StatusCode == http.StatusAccepted {
+						hist.Record(time.Since(e2eStart))
 						if attempt == 1 {
 							firstTrySuccess.Add(1)
 						} else {
@@ -338,7 +358,6 @@ func main() {
 						s5 := serverErr5xx.Add(1)
 						w5 := window5xx.Add(1)
 						totalRetryAttempts.Add(1)
-						// Log first 5 occurrences per 5s window with exact timestamp for timeline correlation
 						if w5 <= 5 {
 							_, _ = fmt.Fprintf(tlWriter, "[%s] GATEWAY_5XX status=%d key=%s attempt=%d total_5xx=%d\n",
 								time.Now().UTC().Format(time.RFC3339Nano), resp.StatusCode, idemKey, attempt, s5)
@@ -348,7 +367,7 @@ func main() {
 						continue
 					}
 
-					// Non-retryable 4xx error
+					hist.Record(time.Since(e2eStart))
 					finalFailures.Add(1)
 					break
 				}
@@ -388,14 +407,15 @@ func main() {
 	fmt.Printf("====================================================================\n")
 
 	if !*sameKey {
-		expectedMap := ComputeExpectedBalances(*totalReqs)
-		fmt.Printf("\n=== Expected Cumulative Balance Per User & Currency (Seq 1..%d) ===\n", *totalReqs)
-		fmt.Printf("%-8s | %-20s | %-20s | %-20s\n", "User ID", "USDT", "BTC", "IRT")
-		fmt.Printf("---------+----------------------+----------------------+---------------------\n")
+		expectedMap, countMap := ComputeExpectedBalancesAndCounts(*fromSeq, *totalReqs)
+		fmt.Printf("\n=== Expected Added Balance & Tx Count Per User (Seq %d..%d) ===\n", *fromSeq, *totalReqs)
+		fmt.Printf("%-7s | %-28s | %-28s | %-28s\n", "User ID", "USDT Added (Tx Count)", "BTC Added (Tx Count)", "IRT Added (Tx Count)")
+		fmt.Printf("--------+------------------------------+------------------------------+-----------------------------\n")
 
 		totalUSDT := decimal.Zero
 		totalBTC := decimal.Zero
 		totalIRT := decimal.Zero
+		var totalTxUSDT, totalTxBTC, totalTxIRT int64
 
 		users := make([]int, 0, numUsers)
 		for u := range expectedMap {
@@ -407,17 +427,40 @@ func main() {
 			usdt := expectedMap[u]["USDT"]
 			btc := expectedMap[u]["BTC"]
 			irt := expectedMap[u]["IRT"]
+			cUSDT := countMap[u]["USDT"]
+			cBTC := countMap[u]["BTC"]
+			cIRT := countMap[u]["IRT"]
+
 			totalUSDT = totalUSDT.Add(usdt)
 			totalBTC = totalBTC.Add(btc)
 			totalIRT = totalIRT.Add(irt)
+			totalTxUSDT += cUSDT
+			totalTxBTC += cBTC
+			totalTxIRT += cIRT
 
-			fmt.Printf("%-8d | %-20s | %-20s | %-20s\n",
-				u, usdt.StringFixed(2), btc.StringFixed(8), irt.StringFixed(0))
+			fmt.Printf("%-7d | +%-16s (%6d tx) | +%-16s (%6d tx) | +%-15s (%6d tx)\n",
+				u,
+				usdt.StringFixed(2), cUSDT,
+				btc.StringFixed(8), cBTC,
+				irt.StringFixed(0), cIRT,
+			)
 		}
-		fmt.Printf("---------+----------------------+----------------------+---------------------\n")
-		fmt.Printf("%-8s | %-20s | %-20s | %-20s\n",
-			"TOTAL", totalUSDT.StringFixed(2), totalBTC.StringFixed(8), totalIRT.StringFixed(0))
-		fmt.Printf("====================================================================\n")
+		fmt.Printf("--------+------------------------------+------------------------------+-----------------------------\n")
+		fmt.Printf("%-7s | +%-16s (%6d tx) | +%-16s (%6d tx) | +%-15s (%6d tx)\n",
+			"TOTAL",
+			totalUSDT.StringFixed(2), totalTxUSDT,
+			totalBTC.StringFixed(8), totalTxBTC,
+			totalIRT.StringFixed(0), totalTxIRT,
+		)
+		fmt.Printf("====================================================================================================\n")
+
+		u7 := expectedMap[7]
+		c7 := countMap[7]
+		fmt.Printf("\n📌 راهنمای بررسی دستی (نمونه: کاربر شماره ۷ در این تست run-%s):\n", *runID)
+		fmt.Printf("   • موجودی تتر (USDT)   : +%s واحد اضافه شده (طی %d تراکنش)\n", u7["USDT"].StringFixed(2), c7["USDT"])
+		fmt.Printf("   • موجودی بیت کوین (BTC): +%s واحد اضافه شده (طی %d تراکنش)\n", u7["BTC"].StringFixed(8), c7["BTC"])
+		fmt.Printf("   • موجودی تومان (IRT)  : +%s تومان اضافه شده (طی %d تراکنش)\n", u7["IRT"].StringFixed(0), c7["IRT"])
+		fmt.Printf("====================================================================================================\n")
 	}
 
 	if finalFailures.Load() > 0 {

@@ -128,6 +128,10 @@ func TestEndToEnd_CrashRecovery_ZeroDataLossAndZeroDoubleSpend(t *testing.T) {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
 
+	settlementWorker := worker.NewSettlementWorker(realRepo, 50*time.Millisecond, nopLogger)
+	settlementWorker.Start(ctx)
+	defer settlementWorker.StopAndFlush(ctx)
+
 	var wg1 sync.WaitGroup
 	proc1 := worker.NewProcessor(ctx, &wg1, flakyRepo, natsBroker, 300*time.Millisecond, nopLogger, metrics.NewCollector())
 	group1 := worker.NewConsumerGroup(2, consumer1, proc1, nopLogger)
@@ -147,6 +151,7 @@ func TestEndToEnd_CrashRecovery_ZeroDataLossAndZeroDoubleSpend(t *testing.T) {
 
 	group1.DrainAll()
 	wg1.Wait()
+	_, _ = realRepo.SettlePendingDeposits(ctx)
 
 	midBalance, err := realRepo.GetBalance(ctx, targetUserID, domain.CurrencyUSDT)
 	if err != nil {
@@ -176,6 +181,7 @@ func TestEndToEnd_CrashRecovery_ZeroDataLossAndZeroDoubleSpend(t *testing.T) {
 
 	group2.DrainAll()
 	wg2.Wait()
+	_, _ = realRepo.SettlePendingDeposits(ctx)
 
 	finalBalance, err := realRepo.GetBalance(ctx, targetUserID, domain.CurrencyUSDT)
 	if err != nil {

@@ -15,9 +15,10 @@ import (
 )
 
 const (
-	maxBatchSize   = 64
-	batchWaitDelay = 200 * time.Microsecond
-	batchFlushers  = 4
+	maxBatchSize         = 128
+	batchWaitDelay       = 200 * time.Microsecond
+	batchFlushers        = 4
+	settlementBatchLimit = 100_000
 )
 
 type DepositRepository interface {
@@ -27,6 +28,7 @@ type DepositRepository interface {
 }
 
 type batchRequest struct {
+	ctx   context.Context
 	event *domain.DepositEvent
 	errCh chan error
 }
@@ -41,14 +43,21 @@ type PostgresRepository struct {
 }
 
 func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) (*PostgresRepository, error) {
+	repairDirtyMigrationsIfNeeded(ctx, databaseURL)
+
 	db, err := dbx.ConnectAndMigrate(ctx, databaseURL, migrationsPath, logger)
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureBatchSettlementSchema(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to ensure batch settlement schema: %w", err)
+	}
+
 	r := &PostgresRepository{
 		db:      db,
 		logger:  logger,
-		batchCh: make(chan *batchRequest, 1024),
+		batchCh: make(chan *batchRequest, 2048),
 		stopCh:  make(chan struct{}),
 	}
 	for i := 0; i < batchFlushers; i++ {
@@ -58,12 +67,127 @@ func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath stri
 	return r, nil
 }
 
+func repairDirtyMigrationsIfNeeded(ctx context.Context, databaseURL string) {
+	for _, drv := range []string{"pgx", "postgres"} {
+		db, err := sql.Open(drv, databaseURL)
+		if err != nil {
+			continue
+		}
+		cCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, _ = db.ExecContext(cCtx, `UPDATE schema_migrations SET dirty = FALSE WHERE dirty = TRUE`)
+		cancel()
+		_ = db.Close()
+	}
+}
+
+func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
+	const ddl = `
+		ALTER TABLE deposits
+			ADD COLUMN IF NOT EXISTS is_settled BOOLEAN NOT NULL DEFAULT FALSE;
+
+		ALTER TABLE deposits SET (
+			fillfactor = 85,
+			autovacuum_vacuum_scale_factor = 0.02,
+			autovacuum_vacuum_threshold = 1000,
+			autovacuum_vacuum_cost_delay = 2,
+			autovacuum_vacuum_cost_limit = 2000,
+			autovacuum_analyze_scale_factor = 0.02
+		);
+
+		ALTER TABLE balances SET (
+			fillfactor = 70,
+			autovacuum_vacuum_scale_factor = 0.01,
+			autovacuum_vacuum_threshold = 50,
+			autovacuum_vacuum_cost_delay = 0
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_deposits_unsettled_pending
+			ON deposits (processed_at ASC)
+			WITH (fillfactor = 90)
+			WHERE is_settled = FALSE;
+
+		CREATE OR REPLACE FUNCTION settle_pending_deposits(p_batch_limit INTEGER DEFAULT 100000)
+		RETURNS BIGINT
+		LANGUAGE plpgsql
+		AS $$
+		DECLARE
+			v_settled_count BIGINT := 0;
+		BEGIN
+			PERFORM pg_advisory_xact_lock(778899);
+
+			IF p_batch_limit IS NULL OR p_batch_limit <= 0 THEN
+				p_batch_limit := 100000;
+			END IF;
+
+			WITH claimed AS (
+				SELECT ctid
+				FROM deposits
+				WHERE is_settled = FALSE
+				ORDER BY processed_at ASC
+				LIMIT p_batch_limit
+				FOR UPDATE SKIP LOCKED
+			),
+			settled_rows AS (
+				UPDATE deposits d
+				SET is_settled = TRUE
+				FROM claimed c
+				WHERE d.ctid = c.ctid
+				RETURNING d.user_id, d.currency, d.amount
+			),
+			agg_balances AS (
+				SELECT
+					user_id,
+					currency,
+					SUM(amount) AS total_amount,
+					COUNT(*) AS tx_count
+				FROM settled_rows
+				GROUP BY user_id, currency
+				ORDER BY user_id ASC, currency ASC
+			),
+			upserted AS (
+				INSERT INTO balances (user_id, currency, balance, updated_at)
+				SELECT user_id, currency, total_amount, NOW()
+				FROM agg_balances
+				ON CONFLICT (user_id, currency)
+				DO UPDATE SET
+					balance = balances.balance + EXCLUDED.balance,
+					updated_at = NOW()
+			)
+			SELECT COALESCE(SUM(tx_count), 0)::BIGINT
+			INTO v_settled_count
+			FROM agg_balances;
+
+			RETURN v_settled_count;
+		END;
+		$$;
+	`
+	schemaCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	conn, err := db.Conn(schemaCtx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(schemaCtx, "SELECT pg_advisory_lock(887766)"); err != nil {
+		return err
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock(887766)")
+	}()
+
+	_, err = conn.ExecContext(schemaCtx, ddl)
+	return err
+}
+
 func (r *PostgresRepository) ProcessDeposit(ctx context.Context, event *domain.DepositEvent) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
 	req := &batchRequest{
+		ctx:   ctx,
 		event: event,
 		errCh: make(chan error, 1),
 	}
@@ -154,12 +278,24 @@ func (r *PostgresRepository) batchFlusherLoop() {
 }
 
 func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
-	n := len(batch)
+	if len(batch) == 0 {
+		return
+	}
+
+	activeBatch := make([]*batchRequest, 0, len(batch))
+	for _, req := range batch {
+		if req.ctx != nil && req.ctx.Err() != nil {
+			req.errCh <- req.ctx.Err()
+			continue
+		}
+		activeBatch = append(activeBatch, req)
+	}
+
+	n := len(activeBatch)
 	if n == 0 {
 		return
 	}
 
-	// Deduplicate identical event_ids within the same in-memory micro-batch
 	uniqueEventIDs := make([]string, 0, n)
 	userIDs := make([]int64, 0, n)
 	currencies := make([]string, 0, n)
@@ -169,7 +305,7 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 	seenInBatch := make(map[string]int, n)
 	duplicateInBatch := make([]bool, n)
 
-	for i, req := range batch {
+	for i, req := range activeBatch {
 		ev := req.event
 		if _, exists := seenInBatch[ev.EventID]; exists {
 			duplicateInBatch[i] = true
@@ -183,47 +319,30 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 		createdAts = append(createdAts, ev.CreatedAt)
 	}
 
-	const batchCTE = `
-		WITH input_rows AS (
-			SELECT
-				UNNEST($1::text[]) AS event_id,
-				UNNEST($2::int8[])::int4 AS user_id,
-				UNNEST($3::text[]) AS currency,
-				UNNEST($4::text[])::numeric(36, 18) AS amount,
-				UNNEST($5::timestamptz[]) AS created_at
-		),
-		ins AS (
-			INSERT INTO deposits (event_id, user_id, currency, amount, created_at)
-			SELECT event_id, user_id, currency, amount, created_at
-			FROM input_rows
-			ON CONFLICT (event_id) DO NOTHING
-			RETURNING event_id, user_id, currency, amount
-		),
-		agg_balances AS (
-			SELECT user_id, currency, SUM(amount) AS total_amount
-			FROM ins
-			GROUP BY user_id, currency
-			ORDER BY user_id, currency
-		),
-		upd AS (
-			INSERT INTO balances (user_id, currency, balance, updated_at)
-			SELECT user_id, currency, total_amount, NOW()
-			FROM agg_balances
-			ON CONFLICT (user_id, currency)
-			DO UPDATE SET
-				balance = balances.balance + EXCLUDED.balance,
-				updated_at = NOW()
-		)
-		SELECT event_id FROM ins
+	const insertDepositsQuery = `
+		INSERT INTO deposits (event_id, user_id, currency, amount, is_settled, created_at)
+		SELECT
+			UNNEST($1::text[]),
+			UNNEST($2::int8[])::int4,
+			UNNEST($3::text[]),
+			UNNEST($4::text[])::numeric(36, 18),
+			FALSE,
+			UNNEST($5::timestamptz[])
+		ON CONFLICT (event_id) DO NOTHING
+		RETURNING event_id
 	`
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	parentCtx := activeBatch[0].ctx
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
 	defer cancel()
 
-	rows, err := r.db.QueryContext(ctx, batchCTE, uniqueEventIDs, userIDs, currencies, amounts, createdAts)
+	rows, err := r.db.QueryContext(ctx, insertDepositsQuery, uniqueEventIDs, userIDs, currencies, amounts, createdAts)
 	if err != nil {
-		for _, req := range batch {
-			req.errCh <- fmt.Errorf("failed to execute atomic deposit transaction: %w", err)
+		for _, req := range activeBatch {
+			req.errCh <- fmt.Errorf("failed to execute deposit ingestion batch: %w", err)
 		}
 		return
 	}
@@ -237,13 +356,13 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		for _, req := range batch {
-			req.errCh <- fmt.Errorf("error reading batch transaction result: %w", err)
+		for _, req := range activeBatch {
+			req.errCh <- fmt.Errorf("error reading deposit ingestion result: %w", err)
 		}
 		return
 	}
 
-	for i, req := range batch {
+	for i, req := range activeBatch {
 		if duplicateInBatch[i] {
 			req.errCh <- domain.ErrDuplicateEvent
 			continue
@@ -254,6 +373,32 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 			req.errCh <- domain.ErrDuplicateEvent
 		}
 	}
+}
+
+func (r *PostgresRepository) SettlePendingDeposits(ctx context.Context) (int64, error) {
+	var totalSettled int64
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return totalSettled, err
+		}
+
+		qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		var batchSettled int64
+		err := r.db.QueryRowContext(qCtx, "SELECT settle_pending_deposits($1)", settlementBatchLimit).Scan(&batchSettled)
+		cancel()
+
+		if err != nil {
+			return totalSettled, fmt.Errorf("failed to execute settle_pending_deposits PL/pgSQL function: %w", err)
+		}
+
+		totalSettled += batchSettled
+		if batchSettled < int64(settlementBatchLimit) {
+			break
+		}
+	}
+
+	return totalSettled, nil
 }
 
 func (r *PostgresRepository) GetBalance(ctx context.Context, userID int, currency string) (decimal.Decimal, error) {
@@ -396,6 +541,7 @@ func (r *PostgresRepository) ReconcileLedger(ctx context.Context) ([]domain.Ledg
 				currency,
 				SUM(amount) AS expected_amount
 			FROM deposits
+			WHERE is_settled = TRUE
 			GROUP BY user_id, currency
 		)
 		SELECT

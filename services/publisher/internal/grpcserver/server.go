@@ -28,8 +28,9 @@ const (
 )
 
 type pubIdemShard struct {
-	mu      sync.Mutex
-	entries map[string]string
+	mu       sync.Mutex
+	current  map[string]string
+	previous map[string]string
 }
 
 type Server struct {
@@ -51,7 +52,7 @@ func NewServer(b broker.Broker, logger *zap.Logger, hm ...*healthmgr.Manager) *S
 		logger: logger,
 	}
 	for i := 0; i < pubIdemShards; i++ {
-		s.idemShards[i].entries = make(map[string]string, 256)
+		s.idemShards[i].current = make(map[string]string, 256)
 	}
 	return s
 }
@@ -64,16 +65,19 @@ func (s *Server) checkOrRememberPayload(eventID, fingerprint string) bool {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if existing, ok := shard.entries[eventID]; ok {
+	if existing, ok := shard.current[eventID]; ok {
 		return existing == fingerprint
 	}
-	if len(shard.entries) >= pubMaxIdemPerShard {
-		for k := range shard.entries {
-			delete(shard.entries, k)
-			break
+	if shard.previous != nil {
+		if existing, ok := shard.previous[eventID]; ok {
+			return existing == fingerprint
 		}
 	}
-	shard.entries[eventID] = fingerprint
+	if len(shard.current) >= pubMaxIdemPerShard {
+		shard.previous = shard.current
+		shard.current = make(map[string]string, pubMaxIdemPerShard)
+	}
+	shard.current[eventID] = fingerprint
 	return true
 }
 
@@ -83,7 +87,10 @@ func (s *Server) forgetPayload(eventID string) {
 	shard := &s.idemShards[h.Sum32()%pubIdemShards]
 
 	shard.mu.Lock()
-	delete(shard.entries, eventID)
+	delete(shard.current, eventID)
+	if shard.previous != nil {
+		delete(shard.previous, eventID)
+	}
 	shard.mu.Unlock()
 }
 
@@ -160,7 +167,6 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 
 	ack, err := s.broker.PublishDeposit(ctx, event.EventID, payload)
 	if err != nil {
-		s.forgetPayload(event.EventID)
 		log.Error("Failed to publish deposit event to NATS JetStream",
 			zap.String("event_id", event.EventID),
 			zap.Error(err),
@@ -168,6 +174,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, status.Error(codes.DeadlineExceeded, "timed out publishing event to broker")
 		}
+		s.forgetPayload(event.EventID)
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return nil, status.Error(codes.Canceled, "request canceled before broker ack")
 		}

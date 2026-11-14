@@ -6,6 +6,8 @@ services:
       - "-c"
       - "synchronous_commit=on"
       - "-c"
+      - "max_connections=300"
+      - "-c"
       - "commit_delay=100"
       - "-c"
       - "commit_siblings=5"
@@ -61,6 +63,7 @@ services:
       NATS_URL: ${NATS_URL_DOCKER:-nats://nats:4222}
       WORKER_COUNT: ${WORKER_COUNT:-3}
       RETRY_INTERVAL: ${RETRY_INTERVAL:-5s}
+      SETTLEMENT_INTERVAL: ${SETTLEMENT_INTERVAL:-5s}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
       METRICS_PORT: ${METRICS_PORT:-8080}
       LOG_LEVEL: ${LOG_LEVEL:-info}

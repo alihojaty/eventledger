@@ -12,7 +12,10 @@ import (
 	"google.golang.org/grpc/resolver"
 )
 
-const Scheme = "swarmdns"
+const (
+	Scheme             = "swarmdns"
+	minResolveInterval = 250 * time.Millisecond
+)
 
 type Builder struct {
 	refreshInterval time.Duration
@@ -89,8 +92,9 @@ type swarmDNSResolver struct {
 	resolveNowCh chan struct{}
 	wg           sync.WaitGroup
 
-	mu       sync.Mutex
-	knownIPs map[string]time.Time
+	mu          sync.Mutex
+	knownIPs    map[string]time.Time
+	lastResolve time.Time
 }
 
 func (r *swarmDNSResolver) ResolveNow(_ resolver.ResolveNowOptions) {
@@ -108,7 +112,7 @@ func (r *swarmDNSResolver) Close() {
 func (r *swarmDNSResolver) loop() {
 	defer r.wg.Done()
 
-	r.resolve()
+	r.resolve(true)
 
 	ticker := time.NewTicker(r.refreshInterval)
 	defer ticker.Stop()
@@ -118,9 +122,9 @@ func (r *swarmDNSResolver) loop() {
 		case <-r.ctx.Done():
 			return
 		case <-ticker.C:
-			r.resolve()
+			r.resolve(true)
 		case <-r.resolveNowCh:
-			r.resolve()
+			r.resolve(false)
 		}
 	}
 }
@@ -138,7 +142,15 @@ func (r *swarmDNSResolver) lookupCandidateIPs() ([]string, error) {
 	return net.DefaultResolver.LookupHost(lookupCtx, r.host)
 }
 
-func (r *swarmDNSResolver) resolve() {
+func (r *swarmDNSResolver) resolve(force bool) {
+	r.mu.Lock()
+	if !force && time.Since(r.lastResolve) < minResolveInterval {
+		r.mu.Unlock()
+		return
+	}
+	r.lastResolve = time.Now()
+	r.mu.Unlock()
+
 	now := time.Now()
 	ips, err := r.lookupCandidateIPs()
 

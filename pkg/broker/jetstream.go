@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
@@ -42,6 +43,7 @@ type NATSBroker struct {
 	logger *zap.Logger
 
 	mu                 sync.Mutex
+	reconnecting       atomic.Bool
 	onReconnectHooks   []func(ctx context.Context)
 	hasConsumerConfig  bool
 	savedMaxAckPending int
@@ -120,6 +122,11 @@ func (b *NATSBroker) OnReconnect(fn func(ctx context.Context)) {
 }
 
 func (b *NATSBroker) handleReconnected() {
+	if !b.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	defer b.reconnecting.Store(false)
+
 	b.mu.Lock()
 	hasConsumer := b.hasConsumerConfig
 	maxAck := b.savedMaxAckPending
@@ -133,7 +140,7 @@ func (b *NATSBroker) handleReconnected() {
 		}
 		reconnCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err := b.setupStreams(reconnCtx)
-		if err == nil && hasConsumer {
+		if err == nil && hasConsumer && len(hooks) == 0 {
 			_, err = b.CreateOrUpdateDepositConsumerWithAckWait(reconnCtx, maxAck, ackWait)
 		}
 		cancel()
@@ -222,19 +229,12 @@ func (b *NATSBroker) PublishDeposit(ctx context.Context, eventID string, payload
 		opts = append(opts, jetstream.WithMsgID(eventID))
 	}
 
-	future, err := b.js.PublishAsync(SubjectDepositEvents, payload, opts...)
+	ack, err := b.js.Publish(ctx, SubjectDepositEvents, payload, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, err)
 	}
 
-	select {
-	case ack := <-future.Ok():
-		return ack, nil
-	case pubErr := <-future.Err():
-		return nil, fmt.Errorf("failed to publish deposit event (id=%s): %w", eventID, pubErr)
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return ack, nil
 }
 
 func (b *NATSBroker) PublishDepositAsync(eventID string, payload []byte) (jetstream.PubAckFuture, error) {
@@ -277,6 +277,12 @@ func (b *NATSBroker) JetStream() jetstream.JetStream {
 
 func (b *NATSBroker) Close() {
 	if b.nc != nil {
+		if b.js != nil {
+			select {
+			case <-b.js.PublishAsyncComplete():
+			case <-time.After(1 * time.Second):
+			}
+		}
 		_ = b.nc.FlushTimeout(2 * time.Second)
 		b.nc.Close()
 		b.logger.Info("Message Broker connection closed")

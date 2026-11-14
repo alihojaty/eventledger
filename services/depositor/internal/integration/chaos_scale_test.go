@@ -145,6 +145,10 @@ func TestChaos_DatabaseKilledMidStream_ZeroDataLoss(t *testing.T) {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
 
+	settlementWorker := worker.NewSettlementWorker(realRepo, 100*time.Millisecond, nopLogger)
+	settlementWorker.Start(ctx)
+	defer settlementWorker.StopAndFlush(ctx)
+
 	var inFlightWg sync.WaitGroup
 	proc := worker.NewProcessor(ctx, &inFlightWg, chaosRepo, natsBroker, 150*time.Millisecond, nopLogger, collector)
 	group := worker.NewConsumerGroup(8, consumer, proc, nopLogger)
@@ -188,6 +192,10 @@ func TestChaos_DatabaseKilledMidStream_ZeroDataLoss(t *testing.T) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	if _, err := realRepo.SettlePendingDeposits(ctx); err != nil {
+		t.Fatalf("failed to flush pending settlements: %v", err)
 	}
 
 	finalBalance, err := realRepo.GetBalance(ctx, 1, domain.CurrencyUSDT)
@@ -238,9 +246,13 @@ func TestChaos_NATSConnectionKilledAfterDBCommit_NoDoubleSpend(t *testing.T) {
 	msgAttempt1 := &flakyAckMsg{data: payload, failAck: true}
 	proc.HandleMessage(1, msgAttempt1)
 
+	if _, err := realRepo.SettlePendingDeposits(ctx); err != nil {
+		t.Fatalf("failed to settle after attempt 1: %v", err)
+	}
+
 	balAfterAttempt1, _ := realRepo.GetBalance(ctx, 5, domain.CurrencyBTC)
 	if !balAfterAttempt1.Equal(ev.Amount) {
-		t.Fatalf("expected balance %s after DB commit, got %s", ev.Amount, balAfterAttempt1)
+		t.Fatalf("expected balance %s after DB commit & settle, got %s", ev.Amount, balAfterAttempt1)
 	}
 
 	msgAttempt2 := &flakyAckMsg{data: payload, failAck: false}
@@ -249,6 +261,8 @@ func TestChaos_NATSConnectionKilledAfterDBCommit_NoDoubleSpend(t *testing.T) {
 	if !msgAttempt2.acked {
 		t.Fatalf("expected redelivered duplicate message to be ACKed")
 	}
+
+	_, _ = realRepo.SettlePendingDeposits(ctx)
 
 	balAfterRedelivery, _ := realRepo.GetBalance(ctx, 5, domain.CurrencyBTC)
 	if !balAfterRedelivery.Equal(ev.Amount) {
@@ -485,6 +499,9 @@ func TestScale_EndToEnd_HighVolume_PostgresAndNATS(t *testing.T) {
 		t.Fatalf("failed to create consumer: %v", err)
 	}
 
+	settlementWorker := worker.NewSettlementWorker(realRepo, 5*time.Second, nopLogger)
+	settlementWorker.Start(ctx)
+
 	var inFlightWg sync.WaitGroup
 	proc := worker.NewProcessor(ctx, &inFlightWg, realRepo, natsBroker, 2*time.Second, nopLogger, collector)
 	group := worker.NewConsumerGroup(32, consumer, proc, nopLogger)
@@ -495,6 +512,7 @@ func TestScale_EndToEnd_HighVolume_PostgresAndNATS(t *testing.T) {
 	defer func() {
 		group.DrainAll()
 		inFlightWg.Wait()
+		settlementWorker.StopAndFlush(ctx)
 	}()
 
 	startTime := time.Now()
@@ -532,6 +550,11 @@ func TestScale_EndToEnd_HighVolume_PostgresAndNATS(t *testing.T) {
 		t.Fatalf("expected %d processed messages, got %d", totalEvents, snap.MessagesProcessed)
 	}
 
+	// تسویه نهایی تمام تراکنش‌های باقی‌مانده در پنجره آخر
+	if _, err := realRepo.SettlePendingDeposits(ctx); err != nil {
+		t.Fatalf("failed final batch settlement: %v", err)
+	}
+
 	totalDBBalance := decimal.Zero
 	for u := 1; u <= 20; u++ {
 		bal, err := realRepo.GetBalance(ctx, u, domain.CurrencyUSDT)
@@ -547,6 +570,6 @@ func TestScale_EndToEnd_HighVolume_PostgresAndNATS(t *testing.T) {
 	}
 
 	totalElapsed := time.Since(startTime)
-	t.Logf("E2E HIGH-VOLUME SUCCESS: %d ACID transactions committed in %v (%.0f TPS) | Verified DB Total: %s USDT",
+	t.Logf("E2E HIGH-VOLUME SUCCESS: %d ACID transactions ingested & batch-settled in %v (%.0f TPS) | Verified DB Total: %s USDT",
 		totalEvents, totalElapsed.Round(time.Millisecond), float64(totalEvents)/totalElapsed.Seconds(), totalDBBalance.String())
 }

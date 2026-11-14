@@ -82,13 +82,39 @@ func TestProcessDeposit_DuplicateEvent_Idempotency(t *testing.T) {
 		t.Fatalf("expected domain.ErrDuplicateEvent on duplicate event, got: %v", err)
 	}
 
+	// پیش از اجرای تسویه دوره‌ای، موجودی کاربر هنوز تغییر نکرده است (is_settled = FALSE)
+	preSettleBal, err := repo.GetBalance(ctx, 7, domain.CurrencyUSDT)
+	if err != nil {
+		t.Fatalf("failed to get pre-settlement balance: %v", err)
+	}
+	if !preSettleBal.Equal(decimal.Zero) {
+		t.Fatalf("expected pre-settlement balance to be 0, got %s", preSettleBal.String())
+	}
+
+	// اجرای تابع PL/pgSQL تسویه دسته‌ای
+	settled, err := repo.SettlePendingDeposits(ctx)
+	if err != nil {
+		t.Fatalf("failed to settle pending deposits: %v", err)
+	}
+	if settled != 1 {
+		t.Fatalf("expected 1 settled deposit, got %d", settled)
+	}
+
 	balance, err := repo.GetBalance(ctx, 7, domain.CurrencyUSDT)
 	if err != nil {
 		t.Fatalf("failed to get balance: %v", err)
 	}
-
 	if !balance.Equal(amount) {
 		t.Errorf("expected balance to be %s, but got %s", amount.String(), balance.String())
+	}
+
+	// اجرای مجدد تسویه نباید رکوردهای is_settled = TRUE را دوباره اعمال کند
+	settledAgain, err := repo.SettlePendingDeposits(ctx)
+	if err != nil {
+		t.Fatalf("failed on second settlement call: %v", err)
+	}
+	if settledAgain != 0 {
+		t.Fatalf("expected 0 settled deposits on second call, got %d", settledAgain)
 	}
 }
 
@@ -142,6 +168,14 @@ func TestProcessDeposit_ConcurrentDuplicateEvent_ExactlyOnceEffect(t *testing.T)
 	}
 	if dupCount.Load() != goroutines-1 {
 		t.Fatalf("expected %d duplicate detections, got %d", goroutines-1, dupCount.Load())
+	}
+
+	settled, err := repo.SettlePendingDeposits(ctx)
+	if err != nil {
+		t.Fatalf("failed to settle pending deposits: %v", err)
+	}
+	if settled != 1 {
+		t.Fatalf("expected exactly 1 settled deposit, got %d", settled)
 	}
 
 	balance, err := repo.GetBalance(ctx, 12, domain.CurrencyUSDT)
@@ -198,6 +232,15 @@ func TestProcessDeposit_1000ConcurrentDeposits_NoLostUpdates(t *testing.T) {
 		t.Fatalf("unexpected error during concurrent deposits: %v", err)
 	}
 
+	// تمام ۱۰۰۰ تراکنش کاربر ۷ فقط با یک آپدیت دسته‌ای در PL/pgSQL روی موجودی اعمال می‌شوند
+	settled, err := repo.SettlePendingDeposits(ctx)
+	if err != nil {
+		t.Fatalf("failed to settle 1000 concurrent deposits: %v", err)
+	}
+	if settled != concurrentDeposits {
+		t.Fatalf("expected %d settled deposits, got %d", concurrentDeposits, settled)
+	}
+
 	actualBalance, err := repo.GetBalance(ctx, targetUserID, targetCurrency)
 	if err != nil {
 		t.Fatalf("failed to fetch final balance: %v", err)
@@ -208,7 +251,7 @@ func TestProcessDeposit_1000ConcurrentDeposits_NoLostUpdates(t *testing.T) {
 			expectedFinalBalance.String(), actualBalance.String())
 	}
 
-	t.Logf("SUCCESS: 1000 concurrent deposits processed accurately. Final balance: %s %s",
+	t.Logf("SUCCESS: 1000 concurrent deposits ingested and batch-settled accurately. Final balance: %s %s",
 		actualBalance.String(), targetCurrency)
 }
 
@@ -226,6 +269,10 @@ func TestProcessDeposit_UserAndCurrencyIsolation(t *testing.T) {
 		if err := repo.ProcessDeposit(ctx, ev); err != nil {
 			t.Fatalf("failed to process event %s: %v", ev.EventID, err)
 		}
+	}
+
+	if _, err := repo.SettlePendingDeposits(ctx); err != nil {
+		t.Fatalf("failed to settle deposits: %v", err)
 	}
 
 	u7USDT, _ := repo.GetBalance(ctx, 7, domain.CurrencyUSDT)

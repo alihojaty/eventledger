@@ -85,7 +85,7 @@ func (cg *ConsumerGroup) RebindConsumer(newConsumer jetstream.Consumer) {
 			)
 			continue
 		}
-		oldCtx.Stop()
+		oldCtx.Drain()
 		cg.members[workerID] = consumeCtx
 		cg.logger.Info("Worker rebound to NATS consumer after reconnect", zap.Int("worker_id", workerID))
 	}

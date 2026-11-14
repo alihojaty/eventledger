@@ -2,6 +2,7 @@ package domain
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -73,7 +74,7 @@ func TestParseAndValidateDepositEvent(t *testing.T) {
 				"created_at": "2026-10-04T10:00:00Z"
 			}`,
 			wantErr:        true,
-			expectedReason: "malformed JSON payload",
+			expectedReason: "amount must be a valid decimal string",
 		},
 		{
 			name: "Invalid - Empty event_id",
@@ -185,6 +186,9 @@ func TestParseAndValidateDepositEvent(t *testing.T) {
 				var invalidErr *InvalidMessageError
 				if !errors.As(err, &invalidErr) {
 					t.Fatalf("expected error of type *InvalidMessageError, got %T (%v)", err, err)
+				}
+				if !strings.Contains(invalidErr.Reason, tt.expectedReason) {
+					t.Errorf("expected error reason containing %q, got %q", tt.expectedReason, invalidErr.Reason)
 				}
 				return
 			}

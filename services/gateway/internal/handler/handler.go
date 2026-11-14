@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -148,11 +149,16 @@ type GatewayHandler struct {
 	pubClient    depositv1.DepositPublisherServiceClient
 	healthClient grpc_health_v1.HealthClient
 	apiKey       string
+	apiKeyHash   [32]byte
 	reqTimeout   time.Duration
 	limiter      *ratelimit.KeyRateLimiter
 	idemGuard    *idempotencyPayloadGuard
 	mtlsEnabled  bool
 	logger       *zap.Logger
+
+	readyCacheMu     sync.Mutex
+	cachedReady      bool
+	cachedReadyUntil time.Time
 
 	totalRequests    atomic.Uint64
 	accepted202      atomic.Uint64
@@ -177,6 +183,7 @@ func NewGatewayHandler(
 		pubClient:    pubClient,
 		healthClient: healthClient,
 		apiKey:       apiKey,
+		apiKeyHash:   sha256.Sum256([]byte(apiKey)),
 		reqTimeout:   reqTimeout,
 		idemGuard:    newIdempotencyPayloadGuard(),
 		logger:       logger,
@@ -234,10 +241,10 @@ func (h *GatewayHandler) requestIDAndLoggerMiddleware() gin.HandlerFunc {
 }
 
 func (h *GatewayHandler) authMiddleware() gin.HandlerFunc {
-	expected := []byte(h.apiKey)
 	return func(c *gin.Context) {
 		provided := c.GetHeader(HeaderAPIKey)
-		if len(expected) == 0 || subtle.ConstantTimeCompare([]byte(provided), expected) != 1 {
+		providedHash := sha256.Sum256([]byte(provided))
+		if len(h.apiKey) == 0 || subtle.ConstantTimeCompare(providedHash[:], h.apiKeyHash[:]) != 1 {
 			h.unauthorized401.Add(1)
 			respondError(c, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-API-Key header")
 			c.Abort()
@@ -289,7 +296,25 @@ func (h *GatewayHandler) isPublisherReady(ctx context.Context) bool {
 	defer cancel()
 
 	resp, err := h.healthClient.Check(checkCtx, &grpc_health_v1.HealthCheckRequest{})
-	return err == nil && resp.GetStatus() == grpc_health_v1.HealthCheckResponse_SERVING
+	ready := err == nil && resp.GetStatus() == grpc_health_v1.HealthCheckResponse_SERVING
+
+	h.readyCacheMu.Lock()
+	h.cachedReady = ready
+	h.cachedReadyUntil = time.Now().Add(1 * time.Second)
+	h.readyCacheMu.Unlock()
+
+	return ready
+}
+
+func (h *GatewayHandler) isPublisherReadyCached(ctx context.Context) bool {
+	h.readyCacheMu.Lock()
+	if time.Now().Before(h.cachedReadyUntil) {
+		ready := h.cachedReady
+		h.readyCacheMu.Unlock()
+		return ready
+	}
+	h.readyCacheMu.Unlock()
+	return h.isPublisherReady(ctx)
 }
 
 func (h *GatewayHandler) handleReadyz(c *gin.Context) {
@@ -308,7 +333,7 @@ func (h *GatewayHandler) handleStats(c *gin.Context) {
 		burst = h.limiter.Burst()
 	}
 	c.JSON(http.StatusOK, GatewayStatsSnapshot{
-		Ready:            h.isPublisherReady(c.Request.Context()),
+		Ready:            h.isPublisherReadyCached(c.Request.Context()),
 		MTLSEnabled:      h.mtlsEnabled,
 		RateLimitRPS:     rps,
 		RateLimitBurst:   burst,
@@ -391,7 +416,6 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 
 	fingerprint := fmt.Sprintf("%d:%s:%s", validatedEvent.UserID, validatedEvent.Currency, validatedEvent.Amount.String())
 	if !h.idemGuard.checkOrRemember(validatedEvent.EventID, fingerprint) {
-		h.badRequest400.Add(1)
 		respondError(c, http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", "Idempotency-Key was already used with different deposit parameters")
 		return
 	}
@@ -410,9 +434,11 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	if err != nil {
 		httpStatus, code, msg := mapGRPCErrorToHTTP(err)
 		if httpStatus >= 500 {
-			h.idemGuard.forget(validatedEvent.EventID)
+			if httpStatus != http.StatusGatewayTimeout {
+				h.idemGuard.forget(validatedEvent.EventID)
+			}
 			h.upstreamError5xx.Add(1)
-		} else if httpStatus == http.StatusBadRequest || httpStatus == http.StatusConflict {
+		} else if httpStatus == http.StatusBadRequest {
 			h.badRequest400.Add(1)
 		}
 		log.Warn("gRPC call to publisher failed",

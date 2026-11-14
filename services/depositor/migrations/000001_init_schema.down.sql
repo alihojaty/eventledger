@@ -1,2 +1,3 @@
+DROP FUNCTION IF EXISTS settle_pending_deposits(INTEGER);
 DROP TABLE IF EXISTS balances;
 DROP TABLE IF EXISTS deposits;

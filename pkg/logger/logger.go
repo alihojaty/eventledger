@@ -9,7 +9,6 @@ import (
 )
 
 func New(level string) (*zap.Logger, error) {
-
 	var zapLevel zapcore.Level
 	if err := zapLevel.UnmarshalText([]byte(strings.ToLower(strings.TrimSpace(level)))); err != nil {
 		zapLevel = zapcore.InfoLevel
@@ -17,10 +16,8 @@ func New(level string) (*zap.Logger, error) {
 
 	cfg := zap.NewProductionConfig()
 	cfg.Level = zap.NewAtomicLevelAt(zapLevel)
-	cfg.Sampling = &zap.SamplingConfig{
-		Initial:    20,
-		Thereafter: 5000,
-	}
+	// Disable aggressive log sampling so critical audit, DLQ, and graceful shutdown logs are never dropped.
+	cfg.Sampling = nil
 
 	cfg.EncoderConfig.TimeKey = "timestamp"
 	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
