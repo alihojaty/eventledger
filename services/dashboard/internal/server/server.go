@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,7 @@ const (
 	streamDepositsDLQ    = "DEPOSITS_DLQ"
 	maxDashboardBodySize = 32 * 1024 // 32 KB
 	dashboardSessionCook = "dashboard_session"
+	gatewaySnapGraceTTL  = 6 * time.Second
 )
 
 type DepositorTelemetry struct {
@@ -106,6 +108,11 @@ type GatewayTelemetry struct {
 	GRPCRetries      uint64  `json:"grpc_retries"`
 }
 
+type cachedGatewaySnap struct {
+	snap     GatewayTelemetry
+	lastSeen time.Time
+}
+
 type AggregatedResponse struct {
 	PublisherReplicas int                        `json:"publisher_replicas"`
 	ActiveReplicas    int                        `json:"active_replicas"`
@@ -164,6 +171,9 @@ type DashboardServer struct {
 	httpClient     *http.Client
 	publishEnabled atomic.Bool
 	loadgenRunning atomic.Bool
+
+	gwCacheMu sync.Mutex
+	gwSnaps   map[string]cachedGatewaySnap
 
 	reconMu       sync.Mutex
 	cachedRecon   LedgerReconciliationReport
@@ -229,6 +239,7 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 		uiSessionToken: sessionToken,
 		uiSessionHash:  sha256.Sum256([]byte(sessionToken)),
 		httpClient:     &http.Client{Timeout: 3 * time.Second},
+		gwSnaps:        make(map[string]cachedGatewaySnap),
 		cachedRecon: LedgerReconciliationReport{
 			IsBalanced:      true,
 			TotalLedgerUSDT: "0",
@@ -277,19 +288,28 @@ func (s *DashboardServer) guardPost(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		if providedKey := r.Header.Get("X-API-Key"); providedKey != "" && s.apiKey != "" {
+		authenticated := false
+		if providedKey := r.Header.Get("X-API-Key"); providedKey != "" {
+			if s.apiKey == "" {
+				http.Error(w, "invalid X-API-Key", http.StatusUnauthorized)
+				return
+			}
 			providedHash := sha256.Sum256([]byte(providedKey))
 			if subtle.ConstantTimeCompare(providedHash[:], s.apiKeyHash[:]) != 1 {
 				http.Error(w, "invalid X-API-Key", http.StatusUnauthorized)
 				return
 			}
+			authenticated = true
 		} else if cookie, err := r.Cookie(dashboardSessionCook); err == nil && cookie.Value != "" {
 			cookieHash := sha256.Sum256([]byte(cookie.Value))
 			if subtle.ConstantTimeCompare(cookieHash[:], s.uiSessionHash[:]) != 1 {
 				http.Error(w, "invalid dashboard session", http.StatusUnauthorized)
 				return
 			}
-		} else if s.apiKey != "" && r.Header.Get("Origin") != "" {
+			authenticated = true
+		}
+
+		if s.apiKey != "" && !authenticated {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
@@ -306,6 +326,10 @@ func (s *DashboardServer) invalidateReconCache() {
 }
 
 func (s *DashboardServer) StartNATSListener(ctx context.Context) error {
+	if s.nc == nil {
+		return errors.New("nats connection is nil")
+	}
+
 	_, err := s.nc.Subscribe("telemetry.depositor", func(msg *nats.Msg) {
 		var tel DepositorTelemetry
 		if err := json.Unmarshal(msg.Data, &tel); err != nil {
@@ -376,7 +400,7 @@ func (s *DashboardServer) fetchPublisherTelemetry(ctx context.Context) []Publish
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 600*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 800*time.Millisecond)
 			defer reqCancel()
 
 			statsURL := fmt.Sprintf("http://%s/stats", net.JoinHostPort(targetIP, s.publisherPort))
@@ -413,14 +437,19 @@ func (s *DashboardServer) fetchPublisherTelemetry(ctx context.Context) []Publish
 }
 
 // fetchGatewayTelemetry discovers all Gateway replicas via Swarm DNS (tasks.gateway)
-// and aggregates their counters so multi-replica Gateway deployments never oscillate.
+// and aggregates their counters while retaining a short grace cache per replica IP so
+// transient scrape hiccups under heavy load never cause counter oscillation.
 func (s *DashboardServer) fetchGatewayTelemetry(ctx context.Context) GatewayTelemetry {
 	lookupCtx, cancel := context.WithTimeout(ctx, 600*time.Millisecond)
 	defer cancel()
 
 	var targetURLs []string
 	if s.gatewayHost != "" && s.gatewayHost != "localhost" && net.ParseIP(s.gatewayHost) == nil {
-		if ips, err := net.DefaultResolver.LookupHost(lookupCtx, "tasks."+s.gatewayHost); err == nil && len(ips) > 0 {
+		ips, err := net.DefaultResolver.LookupHost(lookupCtx, "tasks."+s.gatewayHost)
+		if err != nil || len(ips) == 0 {
+			ips, _ = net.DefaultResolver.LookupHost(lookupCtx, s.gatewayHost)
+		}
+		if len(ips) > 0 {
 			seen := make(map[string]struct{}, len(ips))
 			for _, ip := range ips {
 				if _, ok := seen[ip]; !ok {
@@ -434,18 +463,24 @@ func (s *DashboardServer) fetchGatewayTelemetry(ctx context.Context) GatewayTele
 		targetURLs = []string{s.gatewayURL + "/stats"}
 	}
 
-	var (
-		mu  sync.Mutex
-		wg  sync.WaitGroup
-		agg GatewayTelemetry
-	)
+	sort.Strings(targetURLs)
 
-	for _, u := range targetURLs {
+	type scrapeResult struct {
+		url  string
+		snap GatewayTelemetry
+		ok   bool
+	}
+
+	results := make([]scrapeResult, len(targetURLs))
+	var wg sync.WaitGroup
+
+	for i, u := range targetURLs {
+		idx := i
 		statsURL := u
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			reqCtx, reqCancel := context.WithTimeout(ctx, 800*time.Millisecond)
+			reqCtx, reqCancel := context.WithTimeout(ctx, 1200*time.Millisecond)
 			defer reqCancel()
 
 			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, statsURL, nil)
@@ -465,33 +500,60 @@ func (s *DashboardServer) fetchGatewayTelemetry(ctx context.Context) GatewayTele
 			if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
 				return
 			}
-
-			mu.Lock()
-			agg.Online = true
-			if snap.Ready {
-				agg.Ready = true
-			}
-			if snap.MTLSEnabled {
-				agg.MTLSEnabled = true
-			}
-			if snap.RateLimitRPS > 0 {
-				agg.RateLimitRPS = snap.RateLimitRPS
-				agg.RateLimitBurst = snap.RateLimitBurst
-			}
-			agg.TotalRequests += snap.TotalRequests
-			agg.Accepted202 += snap.Accepted202
-			agg.Duplicates += snap.Duplicates
-			agg.BadRequest400 += snap.BadRequest400
-			agg.Unauthorized401 += snap.Unauthorized401
-			agg.PayloadLarge413 += snap.PayloadLarge413
-			agg.RateLimited429 += snap.RateLimited429
-			agg.UpstreamError5xx += snap.UpstreamError5xx
-			agg.GRPCRetries += snap.GRPCRetries
-			mu.Unlock()
+			snap.Online = true
+			results[idx] = scrapeResult{url: statsURL, snap: snap, ok: true}
 		}()
 	}
 
 	wg.Wait()
+
+	now := time.Now()
+	var agg GatewayTelemetry
+
+	s.gwCacheMu.Lock()
+	defer s.gwCacheMu.Unlock()
+
+	activeSet := make(map[string]struct{}, len(targetURLs))
+	for i, u := range targetURLs {
+		activeSet[u] = struct{}{}
+		if results[i].ok {
+			s.gwSnaps[u] = cachedGatewaySnap{
+				snap:     results[i].snap,
+				lastSeen: now,
+			}
+		}
+	}
+
+	for u, cached := range s.gwSnaps {
+		_, stillInDNS := activeSet[u]
+		if !stillInDNS || now.Sub(cached.lastSeen) > gatewaySnapGraceTTL {
+			delete(s.gwSnaps, u)
+			continue
+		}
+
+		snap := cached.snap
+		agg.Online = true
+		if snap.Ready {
+			agg.Ready = true
+		}
+		if snap.MTLSEnabled {
+			agg.MTLSEnabled = true
+		}
+		if snap.RateLimitRPS > 0 {
+			agg.RateLimitRPS = snap.RateLimitRPS
+			agg.RateLimitBurst = snap.RateLimitBurst
+		}
+		agg.TotalRequests += snap.TotalRequests
+		agg.Accepted202 += snap.Accepted202
+		agg.Duplicates += snap.Duplicates
+		agg.BadRequest400 += snap.BadRequest400
+		agg.Unauthorized401 += snap.Unauthorized401
+		agg.PayloadLarge413 += snap.PayloadLarge413
+		agg.RateLimited429 += snap.RateLimited429
+		agg.UpstreamError5xx += snap.UpstreamError5xx
+		agg.GRPCRetries += snap.GRPCRetries
+	}
+
 	return agg
 }
 
@@ -516,6 +578,22 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		return replicasList[i].InstanceID < replicasList[j].InstanceID
 	})
 
+	// Fetch Gateway and Publisher telemetry concurrently with database/NATS queries
+	var (
+		gwTelemetry    GatewayTelemetry
+		publishersList []PublisherTelemetry
+		telemetryWg    sync.WaitGroup
+	)
+	telemetryWg.Add(2)
+	go func() {
+		defer telemetryWg.Done()
+		gwTelemetry = s.fetchGatewayTelemetry(r.Context())
+	}()
+	go func() {
+		defer telemetryWg.Done()
+		publishersList = s.fetchPublisherTelemetry(r.Context())
+	}()
+
 	var dbCount int64
 	var recentDeposits []RecentDepositItem
 	var balances []UserBalanceRow
@@ -535,7 +613,7 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 				sub.event_id,
 				sub.user_id,
 				sub.currency,
-				ROUND(sub.amount, 8)::TEXT,
+				TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM sub.amount::TEXT)),
 				sub.is_settled,
 				TO_CHAR(sub.processed_at, 'YYYY-MM-DD HH24:MI:SS')
 			FROM (
@@ -580,6 +658,7 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dlqTotal, dlqItems := s.fetchDLQMessages(r.Context(), 15)
+	telemetryWg.Wait()
 
 	if recentDeposits == nil {
 		recentDeposits = []RecentDepositItem{}
@@ -587,9 +666,6 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	if balances == nil {
 		balances = []UserBalanceRow{}
 	}
-
-	gwTelemetry := s.fetchGatewayTelemetry(r.Context())
-	publishersList := s.fetchPublisherTelemetry(r.Context())
 
 	resp := AggregatedResponse{
 		PublisherReplicas: len(publishersList),
@@ -1035,8 +1111,21 @@ func (s *DashboardServer) handleGatewaySendSingle(w http.ResponseWriter, r *http
 		return
 	}
 
-	bodyStr := fmt.Sprintf(`{"user_id":%d,"currency":%q,"amount":%q}`, input.UserID, input.Currency, input.Amount)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.gatewayURL+"/v1/deposits", strings.NewReader(bodyStr))
+	bodyBytes, err := json.Marshal(struct {
+		UserID   int    `json:"user_id"`
+		Currency string `json:"currency"`
+		Amount   string `json:"amount"`
+	}{
+		UserID:   input.UserID,
+		Currency: input.Currency,
+		Amount:   input.Amount,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.gatewayURL+"/v1/deposits", bytes.NewReader(bodyBytes))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1915,14 +2004,30 @@ function showToast(message, type) {
     }, 2600);
 }
 
+// String-based decimal formatter: preserves exact up-to-18 fractional digits without IEEE-754 float64 rounding
 function formatDec(str) {
-    if (!str || str === '0') return '0';
-    return Number(str).toLocaleString('en-US', { maximumFractionDigits: 8 });
+    if (str === null || str === undefined) return '0';
+    let s = String(str).trim();
+    if (s === '' || s === '0') return '0';
+    let sign = '';
+    if (s.startsWith('-')) {
+        sign = '-';
+        s = s.slice(1);
+    }
+    const parts = s.split('.');
+    const intPart = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    if (parts.length > 1) {
+        const frac = parts[1].replace(/0+$/, '');
+        if (frac.length > 0) {
+            return sign + intPart + '.' + frac;
+        }
+    }
+    return sign + intPart;
 }
 
 function getCurrencyBadge(cur, amount) {
     const safeCur = escapeHtml(cur);
-    const safeAmt = escapeHtml(amount);
+    const safeAmt = escapeHtml(formatDec(amount));
     if (cur === 'USDT') {
         return '<span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 border border-emerald-200/70 ltr-num font-bold">' + safeAmt + ' USDT</span>';
     }
@@ -2014,9 +2119,9 @@ async function refresh() {
                 return '<tr class="hover:bg-rose-50/40 transition">' +
                 '<td class="py-2.5 px-4 font-bold text-slate-800">کاربر #' + Number(item.user_id) + '</td>' +
                 '<td class="py-2.5 px-4 font-bold text-amber-700">' + escapeHtml(item.currency) + '</td>' +
-                '<td class="py-2.5 px-4 ltr-num text-emerald-700 font-semibold">' + formatDec(item.expected_balance) + '</td>' +
-                '<td class="py-2.5 px-4 ltr-num text-rose-700 font-semibold">' + formatDec(item.actual_balance) + '</td>' +
-                '<td class="py-2.5 px-4 ltr-num font-extrabold text-rose-600">' + formatDec(item.difference) + '</td>' +
+                '<td class="py-2.5 px-4 ltr-num text-emerald-700 font-semibold">' + escapeHtml(formatDec(item.expected_balance)) + '</td>' +
+                '<td class="py-2.5 px-4 ltr-num text-rose-700 font-semibold">' + escapeHtml(formatDec(item.actual_balance)) + '</td>' +
+                '<td class="py-2.5 px-4 ltr-num font-extrabold text-rose-600">' + escapeHtml(formatDec(item.difference)) + '</td>' +
                 '</tr>';
             }).join('');
         }
@@ -2106,9 +2211,9 @@ async function refresh() {
         balTbody.innerHTML = d.balances.map(function(b) { 
             return '<tr class="hover:bg-slate-50/90 transition">' +
             '<td class="py-3.5 px-4 font-extrabold text-slate-800">کاربر #' + Number(b.user_id) + '</td>' +
-            '<td class="py-3.5 px-4"><span class="text-emerald-700 font-bold text-xs ltr-num">' + formatDec(b.usdt) + ' USDT</span></td>' +
-            '<td class="py-3.5 px-4"><span class="text-amber-700 font-bold text-xs ltr-num">' + formatDec(b.btc) + ' BTC</span></td>' +
-            '<td class="py-3.5 px-4"><span class="text-sky-700 font-bold text-xs ltr-num">' + formatDec(b.irt) + ' IRT</span></td>' +
+            '<td class="py-3.5 px-4"><span class="text-emerald-700 font-bold text-xs ltr-num">' + escapeHtml(formatDec(b.usdt)) + ' USDT</span></td>' +
+            '<td class="py-3.5 px-4"><span class="text-amber-700 font-bold text-xs ltr-num">' + escapeHtml(formatDec(b.btc)) + ' BTC</span></td>' +
+            '<td class="py-3.5 px-4"><span class="text-sky-700 font-bold text-xs ltr-num">' + escapeHtml(formatDec(b.irt)) + ' IRT</span></td>' +
             '<td class="py-3.5 px-4 text-slate-400 text-xs ltr-num font-medium">' + escapeHtml(b.updated_at) + '</td>' +
             '</tr>';
         }).join('');

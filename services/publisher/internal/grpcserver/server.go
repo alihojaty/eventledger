@@ -27,10 +27,15 @@ const (
 	pubMaxIdemPerShard   = 4096
 )
 
+type pubIdemEntry struct {
+	fingerprint string
+	committed   bool
+}
+
 type pubIdemShard struct {
 	mu       sync.Mutex
-	current  map[string]string
-	previous map[string]string
+	current  map[string]pubIdemEntry
+	previous map[string]pubIdemEntry
 }
 
 type Server struct {
@@ -52,46 +57,93 @@ func NewServer(b broker.Broker, logger *zap.Logger, hm ...*healthmgr.Manager) *S
 		logger: logger,
 	}
 	for i := 0; i < pubIdemShards; i++ {
-		s.idemShards[i].current = make(map[string]string, 256)
+		s.idemShards[i].current = make(map[string]pubIdemEntry, 256)
 	}
 	return s
 }
 
-func (s *Server) checkOrRememberPayload(eventID, fingerprint string) bool {
+func (s *Server) shardFor(eventID string) *pubIdemShard {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(eventID))
-	shard := &s.idemShards[h.Sum32()%pubIdemShards]
+	return &s.idemShards[h.Sum32()%pubIdemShards]
+}
+
+func (s *Server) checkOrRememberPayload(eventID, fingerprint string) bool {
+	shard := s.shardFor(eventID)
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if existing, ok := shard.current[eventID]; ok {
-		return existing == fingerprint
+		return existing.fingerprint == fingerprint
 	}
 	if shard.previous != nil {
 		if existing, ok := shard.previous[eventID]; ok {
-			return existing == fingerprint
+			if existing.fingerprint != fingerprint {
+				return false
+			}
+			if len(shard.current) >= pubMaxIdemPerShard {
+				shard.previous = shard.current
+				shard.current = make(map[string]pubIdemEntry, pubMaxIdemPerShard)
+			}
+			shard.current[eventID] = existing
+			return true
 		}
 	}
 	if len(shard.current) >= pubMaxIdemPerShard {
 		shard.previous = shard.current
-		shard.current = make(map[string]string, pubMaxIdemPerShard)
+		shard.current = make(map[string]pubIdemEntry, pubMaxIdemPerShard)
 	}
-	shard.current[eventID] = fingerprint
+	shard.current[eventID] = pubIdemEntry{
+		fingerprint: fingerprint,
+		committed:   false,
+	}
 	return true
 }
 
-func (s *Server) forgetPayload(eventID string) {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(eventID))
-	shard := &s.idemShards[h.Sum32()%pubIdemShards]
+func (s *Server) markPayloadCommitted(eventID, fingerprint string) {
+	shard := s.shardFor(eventID)
 
 	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, ok := shard.current[eventID]; ok {
+		existing.committed = true
+		shard.current[eventID] = existing
+		return
+	}
+	if shard.previous != nil {
+		if existing, ok := shard.previous[eventID]; ok {
+			existing.committed = true
+			shard.previous[eventID] = existing
+			return
+		}
+	}
+	shard.current[eventID] = pubIdemEntry{
+		fingerprint: fingerprint,
+		committed:   true,
+	}
+}
+
+func (s *Server) forgetPayloadIfUncommitted(eventID string) {
+	shard := s.shardFor(eventID)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, ok := shard.current[eventID]; ok && existing.committed {
+		return
+	}
+	if shard.previous != nil {
+		if existing, ok := shard.previous[eventID]; ok && existing.committed {
+			return
+		}
+	}
+
 	delete(shard.current, eventID)
 	if shard.previous != nil {
 		delete(shard.previous, eventID)
 	}
-	shard.mu.Unlock()
 }
 
 func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
@@ -105,7 +157,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 	defer func() {
 		if s.health != nil {
 			completedAt := s.health.RecordRequestEnd(succeeded)
-			if draining {
+			if draining && req != nil {
 				s.logger.Info("In-flight deposit request completed during drain/shutdown",
 					zap.String("event_id", req.GetEventId()),
 					zap.Time("received_at", receivedAt),
@@ -119,15 +171,15 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 	reqID := extractRequestID(ctx)
 	log := s.logger.With(zap.String("request_id", reqID))
 
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
+	}
+
 	if draining {
 		log.Info("Deposit request arrived during DRAIN_DELAY window; processing normally",
 			zap.String("event_id", req.GetEventId()),
 			zap.Time("received_at", receivedAt),
 		)
-	}
-
-	if req == nil {
-		return nil, status.Error(codes.InvalidArgument, "request cannot be nil")
 	}
 
 	var createdAt time.Time
@@ -160,7 +212,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 
 	payload, err := json.Marshal(event)
 	if err != nil {
-		s.forgetPayload(event.EventID)
+		s.forgetPayloadIfUncommitted(event.EventID)
 		log.Error("Failed to marshal validated deposit event", zap.Error(err))
 		return nil, status.Error(codes.Internal, "failed to serialize deposit event")
 	}
@@ -174,13 +226,14 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, status.Error(codes.DeadlineExceeded, "timed out publishing event to broker")
 		}
-		s.forgetPayload(event.EventID)
+		s.forgetPayloadIfUncommitted(event.EventID)
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return nil, status.Error(codes.Canceled, "request canceled before broker ack")
 		}
 		return nil, status.Error(codes.Unavailable, "message broker is currently unavailable")
 	}
 
+	s.markPayloadCommitted(event.EventID, fingerprint)
 	succeeded = true
 	log.Info("Deposit event published via gRPC",
 		zap.String("event_id", event.EventID),

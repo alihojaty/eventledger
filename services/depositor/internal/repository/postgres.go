@@ -18,6 +18,7 @@ const (
 	maxBatchSize         = 128
 	batchWaitDelay       = 200 * time.Microsecond
 	batchFlushers        = 4
+	batchQueryTimeout    = 10 * time.Second
 	settlementBatchLimit = 100_000
 )
 
@@ -43,8 +44,6 @@ type PostgresRepository struct {
 }
 
 func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath string, logger *zap.Logger) (*PostgresRepository, error) {
-	repairDirtyMigrationsIfNeeded(ctx, databaseURL)
-
 	db, err := dbx.ConnectAndMigrate(ctx, databaseURL, migrationsPath, logger)
 	if err != nil {
 		return nil, err
@@ -65,19 +64,6 @@ func NewPostgresRepository(ctx context.Context, databaseURL, migrationsPath stri
 		go r.batchFlusherLoop()
 	}
 	return r, nil
-}
-
-func repairDirtyMigrationsIfNeeded(ctx context.Context, databaseURL string) {
-	for _, drv := range []string{"pgx", "postgres"} {
-		db, err := sql.Open(drv, databaseURL)
-		if err != nil {
-			continue
-		}
-		cCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, _ = db.ExecContext(cCtx, `UPDATE schema_migrations SET dirty = FALSE WHERE dirty = TRUE`)
-		cancel()
-		_ = db.Close()
-	}
 }
 
 func ensureBatchSettlementSchema(ctx context.Context, db *sql.DB) error {
@@ -200,12 +186,9 @@ func (r *PostgresRepository) ProcessDeposit(ctx context.Context, event *domain.D
 		return errors.New("repository is closing")
 	}
 
-	select {
-	case err := <-req.errCh:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	// Once queued into batchCh, wait for the exact ground-truth outcome from executeBatch
+	// so a caller never mistakes an already-committed row for a client-side context timeout.
+	return <-req.errCh
 }
 
 func (r *PostgresRepository) batchFlusherLoop() {
@@ -277,6 +260,37 @@ func (r *PostgresRepository) batchFlusherLoop() {
 	}
 }
 
+// newBatchQueryContext creates a bounded context for a batch SQL query that is NOT
+// poisoned if a single request's context expires, but immediately cancels if ALL
+// requests in activeBatch are canceled (e.g., on global SHUTDOWN_TIMEOUT).
+func newBatchQueryContext(activeBatch []*batchRequest, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	doneCh := make(chan struct{})
+
+	go func() {
+		for _, req := range activeBatch {
+			if req.ctx == nil {
+				return
+			}
+			select {
+			case <-req.ctx.Done():
+				// This request canceled; check if remaining requests in the batch are also canceled
+			case <-doneCh:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+		// Every single request in activeBatch has been canceled
+		cancel()
+	}()
+
+	return ctx, func() {
+		close(doneCh)
+		cancel()
+	}
+}
+
 func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 	if len(batch) == 0 {
 		return
@@ -332,11 +346,7 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 		RETURNING event_id
 	`
 
-	parentCtx := activeBatch[0].ctx
-	if parentCtx == nil {
-		parentCtx = context.Background()
-	}
-	ctx, cancel := context.WithTimeout(parentCtx, 10*time.Second)
+	ctx, cancel := newBatchQueryContext(activeBatch, batchQueryTimeout)
 	defer cancel()
 
 	rows, err := r.db.QueryContext(ctx, insertDepositsQuery, uniqueEventIDs, userIDs, currencies, amounts, createdAts)
@@ -351,9 +361,13 @@ func (r *PostgresRepository) executeBatch(batch []*batchRequest) {
 	insertedSet := make(map[string]struct{}, len(uniqueEventIDs))
 	for rows.Next() {
 		var id string
-		if scanErr := rows.Scan(&id); scanErr == nil {
-			insertedSet[id] = struct{}{}
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			for _, req := range activeBatch {
+				req.errCh <- fmt.Errorf("failed to scan inserted event_id: %w", scanErr)
+			}
+			return
 		}
+		insertedSet[id] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		for _, req := range activeBatch {
@@ -498,7 +512,7 @@ func (r *PostgresRepository) GetRecentProcessedDeposits(ctx context.Context, lim
 				event_id,
 				user_id,
 				currency,
-				ROUND(amount, 4)::TEXT AS amount,
+				TRIM(TRAILING '.' FROM TRIM(TRAILING '0' FROM amount::TEXT)) AS amount,
 				TO_CHAR(processed_at, 'HH24:MI:SS.MS') AS processed_at,
 				processed_at AS raw_processed_at
 			FROM deposits

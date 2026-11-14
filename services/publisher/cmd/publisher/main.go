@@ -63,6 +63,8 @@ func main() {
 		)
 		if err := httpHealthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("Publisher HTTP health server stopped with error", zap.Error(err))
+			healthMgr.SetDraining()
+			stopSignals()
 		}
 	}()
 
@@ -112,8 +114,10 @@ func main() {
 			zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
 		)
-		if err := grpcSrv.Serve(lis); err != nil {
-			log.Error("gRPC server stopped with error", zap.Error(err))
+		if err := grpcSrv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			log.Error("gRPC server stopped with error; triggering shutdown", zap.Error(err))
+			healthMgr.SetDraining()
+			stopSignals()
 		}
 	}()
 

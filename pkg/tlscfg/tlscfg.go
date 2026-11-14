@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/credentials"
@@ -26,7 +27,7 @@ func ServerTransportCredentials(certFile, keyFile, caFile string) (credentials.T
 		return loadFileCredentials(certFile, keyFile, caFile, true)
 	}
 
-	caCert, caPriv, caPool, err := deterministicDevCA()
+	caCert, caPriv, caPool, err := sharedOrDevCA()
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +55,7 @@ func ClientTransportCredentials(certFile, keyFile, caFile string) (credentials.T
 		return loadFileCredentials(certFile, keyFile, caFile, false)
 	}
 
-	caCert, caPriv, caPool, err := deterministicDevCA()
+	caCert, caPriv, caPool, err := sharedOrDevCA()
 	if err != nil {
 		return nil, err
 	}
@@ -104,9 +105,40 @@ func loadFileCredentials(certFile, keyFile, caFile string, isServer bool) (crede
 	}), nil
 }
 
-func deterministicDevCA() (*x509.Certificate, ed25519.PrivateKey, *x509.CertPool, error) {
-	seed := sha256.Sum256([]byte("reliable-deposit-processor-internal-mtls-ca-v1"))
-	caPriv := ed25519.NewKeyFromSeed(seed[:])
+func resolveCASeed() ([]byte, error) {
+	if seedFile := strings.TrimSpace(os.Getenv("TLS_CA_SEED_FILE")); seedFile != "" {
+		b, err := os.ReadFile(seedFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading TLS_CA_SEED_FILE: %w", err)
+		}
+		trimmed := strings.TrimSpace(string(b))
+		if trimmed == "" {
+			return nil, fmt.Errorf("TLS_CA_SEED_FILE %s is empty", seedFile)
+		}
+		sum := sha256.Sum256([]byte(trimmed))
+		return sum[:], nil
+	}
+
+	if envSeed := strings.TrimSpace(os.Getenv("TLS_CA_SEED")); envSeed != "" {
+		sum := sha256.Sum256([]byte(envSeed))
+		return sum[:], nil
+	}
+
+	if strings.EqualFold(os.Getenv("TLS_REQUIRE_EXTERNAL_CERTS"), "true") {
+		return nil, fmt.Errorf("TLS_CERT_FILE/TLS_KEY_FILE/TLS_CA_FILE or TLS_CA_SEED_FILE is required when TLS_REQUIRE_EXTERNAL_CERTS=true")
+	}
+
+	// Fallback only for local unit tests / dev mode when no external cert files or secret seeds are configured
+	sum := sha256.Sum256([]byte("reliable-deposit-processor-internal-mtls-ca-v1"))
+	return sum[:], nil
+}
+
+func sharedOrDevCA() (*x509.Certificate, ed25519.PrivateKey, *x509.CertPool, error) {
+	seed, err := resolveCASeed()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caPriv := ed25519.NewKeyFromSeed(seed)
 	caPub := caPriv.Public().(ed25519.PublicKey)
 
 	tpl := &x509.Certificate{
@@ -160,7 +192,14 @@ func issueLeafCert(caCert *x509.Certificate, caPriv ed25519.PrivateKey, cn strin
 
 	if isServer {
 		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
-		tpl.DNSNames = []string{"publisher", "localhost", "bufnet"}
+		tpl.DNSNames = []string{
+			"publisher",
+			"tasks.publisher",
+			"deposit_publisher",
+			"tasks.deposit_publisher",
+			"localhost",
+			"bufnet",
+		}
 		tpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
 	} else {
 		tpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}

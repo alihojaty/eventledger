@@ -36,6 +36,7 @@ const (
 	MetadataKeyRequestID   = "x-request-id"
 	idemShards             = 32
 	maxIdemEntriesPerShard = 4096
+	readyCacheTTL          = 1 * time.Second
 )
 
 type ErrorBody struct {
@@ -76,10 +77,15 @@ type GatewayStatsSnapshot struct {
 	GRPCRetries      uint64  `json:"grpc_retries"`
 }
 
+type idemEntry struct {
+	fingerprint string
+	committed   bool
+}
+
 type idemShard struct {
 	mu       sync.Mutex
-	current  map[string]string
-	previous map[string]string
+	current  map[string]idemEntry
+	previous map[string]idemEntry
 }
 
 type idempotencyPayloadGuard struct {
@@ -89,46 +95,97 @@ type idempotencyPayloadGuard struct {
 func newIdempotencyPayloadGuard() *idempotencyPayloadGuard {
 	g := &idempotencyPayloadGuard{}
 	for i := 0; i < idemShards; i++ {
-		g.shards[i].current = make(map[string]string, 256)
+		g.shards[i].current = make(map[string]idemEntry, 256)
 	}
 	return g
 }
 
-func (g *idempotencyPayloadGuard) checkOrRemember(eventID, fingerprint string) bool {
+func (g *idempotencyPayloadGuard) shardFor(eventID string) *idemShard {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(eventID))
-	shard := &g.shards[h.Sum32()%idemShards]
+	return &g.shards[h.Sum32()%idemShards]
+}
+
+func (g *idempotencyPayloadGuard) checkOrRemember(eventID, fingerprint string) bool {
+	shard := g.shardFor(eventID)
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if existing, ok := shard.current[eventID]; ok {
-		return existing == fingerprint
+		return existing.fingerprint == fingerprint
 	}
 	if shard.previous != nil {
 		if existing, ok := shard.previous[eventID]; ok {
-			return existing == fingerprint
+			if existing.fingerprint != fingerprint {
+				return false
+			}
+			// Promote active key into current generation while preserving committed state
+			if len(shard.current) >= maxIdemEntriesPerShard {
+				shard.previous = shard.current
+				shard.current = make(map[string]idemEntry, maxIdemEntriesPerShard)
+			}
+			shard.current[eventID] = existing
+			return true
 		}
 	}
 	if len(shard.current) >= maxIdemEntriesPerShard {
 		shard.previous = shard.current
-		shard.current = make(map[string]string, maxIdemEntriesPerShard)
+		shard.current = make(map[string]idemEntry, maxIdemEntriesPerShard)
 	}
-	shard.current[eventID] = fingerprint
+	shard.current[eventID] = idemEntry{
+		fingerprint: fingerprint,
+		committed:   false,
+	}
 	return true
 }
 
-func (g *idempotencyPayloadGuard) forget(eventID string) {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(eventID))
-	shard := &g.shards[h.Sum32()%idemShards]
+func (g *idempotencyPayloadGuard) markCommitted(eventID, fingerprint string) {
+	shard := g.shardFor(eventID)
 
 	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, ok := shard.current[eventID]; ok {
+		existing.committed = true
+		shard.current[eventID] = existing
+		return
+	}
+	if shard.previous != nil {
+		if existing, ok := shard.previous[eventID]; ok {
+			existing.committed = true
+			shard.previous[eventID] = existing
+			return
+		}
+	}
+	shard.current[eventID] = idemEntry{
+		fingerprint: fingerprint,
+		committed:   true,
+	}
+}
+
+// forgetIfUncommitted removes an idempotency key only if no request with this key
+// has succeeded yet. This prevents a concurrent failed retry from erasing an already
+// committed key's fingerprint.
+func (g *idempotencyPayloadGuard) forgetIfUncommitted(eventID string) {
+	shard := g.shardFor(eventID)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if existing, ok := shard.current[eventID]; ok && existing.committed {
+		return
+	}
+	if shard.previous != nil {
+		if existing, ok := shard.previous[eventID]; ok && existing.committed {
+			return
+		}
+	}
+
 	delete(shard.current, eventID)
 	if shard.previous != nil {
 		delete(shard.previous, eventID)
 	}
-	shard.mu.Unlock()
 }
 
 type GatewayOption func(*GatewayHandler)
@@ -156,9 +213,10 @@ type GatewayHandler struct {
 	mtlsEnabled  bool
 	logger       *zap.Logger
 
-	readyCacheMu     sync.Mutex
-	cachedReady      bool
-	cachedReadyUntil time.Time
+	readyProbeMu     sync.Mutex
+	cachedReady      atomic.Bool
+	cachedReadyUntil atomic.Int64
+	probingReady     atomic.Bool
 
 	totalRequests    atomic.Uint64
 	accepted202      atomic.Uint64
@@ -292,29 +350,46 @@ func (h *GatewayHandler) isPublisherReady(ctx context.Context) bool {
 	if h.healthClient == nil {
 		return false
 	}
+
+	h.readyProbeMu.Lock()
+	defer h.readyProbeMu.Unlock()
+
 	checkCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
 
 	resp, err := h.healthClient.Check(checkCtx, &grpc_health_v1.HealthCheckRequest{})
 	ready := err == nil && resp.GetStatus() == grpc_health_v1.HealthCheckResponse_SERVING
 
-	h.readyCacheMu.Lock()
-	h.cachedReady = ready
-	h.cachedReadyUntil = time.Now().Add(1 * time.Second)
-	h.readyCacheMu.Unlock()
-
+	h.cachedReady.Store(ready)
+	h.cachedReadyUntil.Store(time.Now().Add(readyCacheTTL).UnixNano())
 	return ready
 }
 
-func (h *GatewayHandler) isPublisherReadyCached(ctx context.Context) bool {
-	h.readyCacheMu.Lock()
-	if time.Now().Before(h.cachedReadyUntil) {
-		ready := h.cachedReady
-		h.readyCacheMu.Unlock()
-		return ready
+// isPublisherReadyNonBlocking returns the cached readiness state immediately so /stats
+// never blocks on network I/O, refreshing the state asynchronously when the TTL expires.
+func (h *GatewayHandler) isPublisherReadyNonBlocking(ctx context.Context) bool {
+	if h.healthClient == nil {
+		return false
 	}
-	h.readyCacheMu.Unlock()
-	return h.isPublisherReady(ctx)
+
+	untilNs := h.cachedReadyUntil.Load()
+	nowNs := time.Now().UnixNano()
+
+	// Perform a synchronous check only on the very first call before cache initialization
+	if untilNs == 0 {
+		return h.isPublisherReady(ctx)
+	}
+
+	if nowNs >= untilNs && h.probingReady.CompareAndSwap(false, true) {
+		go func() {
+			defer h.probingReady.Store(false)
+			bgCtx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond)
+			defer cancel()
+			_ = h.isPublisherReady(bgCtx)
+		}()
+	}
+
+	return h.cachedReady.Load()
 }
 
 func (h *GatewayHandler) handleReadyz(c *gin.Context) {
@@ -333,7 +408,7 @@ func (h *GatewayHandler) handleStats(c *gin.Context) {
 		burst = h.limiter.Burst()
 	}
 	c.JSON(http.StatusOK, GatewayStatsSnapshot{
-		Ready:            h.isPublisherReadyCached(c.Request.Context()),
+		Ready:            h.isPublisherReadyNonBlocking(c.Request.Context()),
 		MTLSEnabled:      h.mtlsEnabled,
 		RateLimitRPS:     rps,
 		RateLimitBurst:   burst,
@@ -435,10 +510,11 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		httpStatus, code, msg := mapGRPCErrorToHTTP(err)
 		if httpStatus >= 500 {
 			if httpStatus != http.StatusGatewayTimeout {
-				h.idemGuard.forget(validatedEvent.EventID)
+				h.idemGuard.forgetIfUncommitted(validatedEvent.EventID)
 			}
 			h.upstreamError5xx.Add(1)
 		} else if httpStatus == http.StatusBadRequest {
+			h.idemGuard.forgetIfUncommitted(validatedEvent.EventID)
 			h.badRequest400.Add(1)
 		}
 		log.Warn("gRPC call to publisher failed",
@@ -451,6 +527,7 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		return
 	}
 
+	h.idemGuard.markCommitted(validatedEvent.EventID, fingerprint)
 	h.accepted202.Add(1)
 	if grpcResp.GetDuplicate() {
 		h.duplicates.Add(1)

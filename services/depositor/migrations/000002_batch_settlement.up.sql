@@ -29,6 +29,7 @@ AS $$
 DECLARE
 v_settled_count BIGINT := 0;
 BEGIN
+    -- Serialize batch settlement across replicas to eliminate row-level lock contention on balances
     PERFORM pg_advisory_xact_lock(778899);
 
     IF p_batch_limit IS NULL OR p_batch_limit <= 0 THEN

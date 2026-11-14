@@ -23,6 +23,11 @@ const (
 	StateUnhealthy    StateCode = 3 // Shutting down (SIGTERM) or FORCE_UNHEALTHY=true
 )
 
+const (
+	ServiceNameDepositPublisher = "deposit.v1.DepositPublisherService"
+	ServiceNamePublisherShort   = "publisher"
+)
+
 func (s StateCode) String() string {
 	switch s {
 	case StateStarting:
@@ -181,8 +186,20 @@ func (m *Manager) grpcStatusForState(s StateCode) grpc_health_v1.HealthCheckResp
 	return grpc_health_v1.HealthCheckResponse_NOT_SERVING
 }
 
+func isKnownHealthService(service string) bool {
+	switch service {
+	case "", ServiceNameDepositPublisher, ServiceNamePublisherShort:
+		return true
+	default:
+		return false
+	}
+}
+
 // Check implements grpc_health_v1.HealthServer reading from the single state.
-func (m *Manager) Check(_ context.Context, _ *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+func (m *Manager) Check(_ context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+	if req != nil && !isKnownHealthService(req.GetService()) {
+		return nil, status.Errorf(codes.NotFound, "unknown service %q", req.GetService())
+	}
 	st := m.CurrentState()
 	return &grpc_health_v1.HealthCheckResponse{
 		Status: m.grpcStatusForState(st),
@@ -190,7 +207,11 @@ func (m *Manager) Check(_ context.Context, _ *grpc_health_v1.HealthCheckRequest)
 }
 
 // Watch implements grpc_health_v1.HealthServer streaming updates from the single state.
-func (m *Manager) Watch(_ *grpc_health_v1.HealthCheckRequest, stream grpc_health_v1.Health_WatchServer) error {
+func (m *Manager) Watch(req *grpc_health_v1.HealthCheckRequest, stream grpc_health_v1.Health_WatchServer) error {
+	if req != nil && !isKnownHealthService(req.GetService()) {
+		return status.Errorf(codes.NotFound, "unknown service %q", req.GetService())
+	}
+
 	ch := make(chan grpc_health_v1.HealthCheckResponse_ServingStatus, 4)
 
 	m.mu.Lock()
