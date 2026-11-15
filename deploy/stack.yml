@@ -395,3 +395,28 @@ services:
         delay: 3s
         max_attempts: 0
         window: 60s
+
+  grafana:
+    image: grafana/grafana-oss:11.2.0
+    networks:
+      - deposit_overlay
+    ports:
+      - target: 3000
+        published: 3030
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_USERS_DEFAULT_THEME: "light"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/deposit-overview.json"
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 3s
+        max_attempts: 0
+        window: 60s

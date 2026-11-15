@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -37,6 +38,7 @@ const (
 	maxDashboardBodySize = 32 * 1024 // 32 KB
 	dashboardSessionCook = "dashboard_session"
 	gatewaySnapGraceTTL  = 6 * time.Second
+	promCacheTTL         = 1500 * time.Millisecond
 	routeUnmatched       = "unmatched"
 )
 
@@ -112,6 +114,25 @@ type GatewayTelemetry struct {
 	GRPCRetries      uint64  `json:"grpc_retries"`
 }
 
+type PrometheusTelemetry struct {
+	Online               bool    `json:"online"`
+	TargetsUp            int     `json:"targets_up"`
+	TargetsTotal         int     `json:"targets_total"`
+	TSDBHeadSeries       int64   `json:"tsdb_head_series"`
+	GatewayReqRate1m     float64 `json:"gateway_req_rate_1m"`
+	GatewayErrorRatio1m  float64 `json:"gateway_error_ratio_1m"`
+	GatewayP50Ms         float64 `json:"gateway_p50_ms"`
+	GatewayP95Ms         float64 `json:"gateway_p95_ms"`
+	GatewayP99Ms         float64 `json:"gateway_p99_ms"`
+	PubAckP99Ms          float64 `json:"pub_ack_p99_ms"`
+	EventAgeP50Ms        float64 `json:"event_age_p50_ms"`
+	EventAgeP95Ms        float64 `json:"event_age_p95_ms"`
+	EventAgeP99Ms        float64 `json:"event_age_p99_ms"`
+	BatchIngestP99Ms     float64 `json:"batch_ingest_p99_ms"`
+	DepositorConsumerLag int64   `json:"depositor_consumer_lag"`
+	LastSettlementAgeSec float64 `json:"last_settlement_age_sec"`
+}
+
 type cachedGatewaySnap struct {
 	snap     GatewayTelemetry
 	lastSeen time.Time
@@ -131,6 +152,7 @@ type AggregatedResponse struct {
 	DLQTotalCount     uint64                     `json:"dlq_total_count"`
 	PublishEnabled    bool                       `json:"publish_enabled"`
 	Gateway           GatewayTelemetry           `json:"gateway"`
+	Prometheus        PrometheusTelemetry        `json:"prometheus"`
 	Reconciliation    LedgerReconciliationReport `json:"reconciliation"`
 	Publishers        []PublisherTelemetry       `json:"publishers"`
 	Replicas          []DepositorTelemetry       `json:"replicas"`
@@ -178,6 +200,7 @@ type DashboardServer struct {
 	gatewayPort    string
 	publisherHost  string
 	publisherPort  string
+	prometheusURL  string
 	apiKey         string
 	apiKeyHash     [32]byte
 	uiSessionToken string
@@ -189,6 +212,10 @@ type DashboardServer struct {
 
 	gwCacheMu sync.Mutex
 	gwSnaps   map[string]cachedGatewaySnap
+
+	promCacheMu sync.Mutex
+	cachedProm  PrometheusTelemetry
+	lastPromAt  time.Time
 
 	reconMu       sync.Mutex
 	cachedRecon   LedgerReconciliationReport
@@ -235,6 +262,11 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 		pubPort = "8090"
 	}
 
+	promURL := os.Getenv("PROMETHEUS_URL")
+	if promURL == "" {
+		promURL = "http://prometheus:9090"
+	}
+
 	tokenBytes := make([]byte, 32)
 	_, _ = rand.Read(tokenBytes)
 	sessionToken := hex.EncodeToString(tokenBytes)
@@ -249,6 +281,7 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 		gatewayPort:    gwPort,
 		publisherHost:  pubHost,
 		publisherPort:  pubPort,
+		prometheusURL:  strings.TrimRight(promURL, "/"),
 		apiKey:         key,
 		apiKeyHash:     sha256.Sum256([]byte(key)),
 		uiSessionToken: sessionToken,
@@ -420,6 +453,196 @@ func (s *DashboardServer) StartNATSListener(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+func sanitizeFloat(v float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+		return 0
+	}
+	return v
+}
+
+func (s *DashboardServer) queryPromScalar(ctx context.Context, baseURL, promQL string) (float64, bool) {
+	reqCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	defer cancel()
+
+	qURL := fmt.Sprintf("%s/api/v1/query?query=%s", baseURL, url.QueryEscape(promQL))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, qURL, nil)
+	if err != nil {
+		return 0, false
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		Data   struct {
+			Result []struct {
+				Value []any `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil || payload.Status != "success" {
+		return 0, false
+	}
+	if len(payload.Data.Result) == 0 || len(payload.Data.Result[0].Value) < 2 {
+		return 0, true
+	}
+	valStr, ok := payload.Data.Result[0].Value[1].(string)
+	if !ok {
+		return 0, true
+	}
+	parsed, err := strconv.ParseFloat(valStr, 64)
+	if err != nil {
+		return 0, true
+	}
+	return sanitizeFloat(parsed), true
+}
+
+func (s *DashboardServer) fetchPromTargetsCount(ctx context.Context, baseURL string) (int, int, bool) {
+	reqCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+"/api/v1/targets?state=active", nil)
+	if err != nil {
+		return 0, 0, false
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, false
+	}
+
+	var payload struct {
+		Status string `json:"status"`
+		Data   struct {
+			ActiveTargets []struct {
+				Health string `json:"health"`
+			} `json:"activeTargets"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil || payload.Status != "success" {
+		return 0, 0, false
+	}
+
+	total := len(payload.Data.ActiveTargets)
+	upCount := 0
+	for _, t := range payload.Data.ActiveTargets {
+		if strings.EqualFold(t.Health, "up") {
+			upCount++
+		}
+	}
+	return upCount, total, true
+}
+
+func (s *DashboardServer) fetchPrometheusTelemetry(ctx context.Context) PrometheusTelemetry {
+	s.promCacheMu.Lock()
+	if !s.lastPromAt.IsZero() && time.Since(s.lastPromAt) < promCacheTTL {
+		cached := s.cachedProm
+		s.promCacheMu.Unlock()
+		return cached
+	}
+	s.promCacheMu.Unlock()
+
+	baseURL := s.prometheusURL
+	upCount, totalTargets, ok := s.fetchPromTargetsCount(ctx, baseURL)
+	if !ok && baseURL != "http://localhost:9090" {
+		baseURL = "http://localhost:9090"
+		upCount, totalTargets, ok = s.fetchPromTargetsCount(ctx, baseURL)
+	}
+	if !ok {
+		return PrometheusTelemetry{Online: false}
+	}
+
+	type querySpec struct {
+		expr string
+		dest *float64
+		ms   bool
+	}
+
+	var (
+		tsdbSeries     float64
+		gwRate1m       float64
+		gwErrRatio1m   float64
+		gwP50          float64
+		gwP95          float64
+		gwP99          float64
+		pubAckP99      float64
+		eventAgeP50    float64
+		eventAgeP95    float64
+		eventAgeP99    float64
+		batchIngestP99 float64
+		consumerLag    float64
+		settlementAge  float64
+	)
+
+	specs := []querySpec{
+		{expr: `sum(prometheus_tsdb_head_series)`, dest: &tsdbSeries, ms: false},
+		{expr: `gateway:http_requests:rate1m`, dest: &gwRate1m, ms: false},
+		{expr: `gateway:http_errors:ratio1m * 100`, dest: &gwErrRatio1m, ms: false},
+		{expr: `histogram_quantile(0.50, sum by (le) (rate(gateway_http_request_duration_seconds_bucket{route="/v1/deposits"}[1m])))`, dest: &gwP50, ms: true},
+		{expr: `histogram_quantile(0.95, sum by (le) (rate(gateway_http_request_duration_seconds_bucket{route="/v1/deposits"}[1m])))`, dest: &gwP95, ms: true},
+		{expr: `gateway:http_request_duration_seconds:p99_1m`, dest: &gwP99, ms: true},
+		{expr: `publisher:jetstream_publish_duration_seconds:p99_1m`, dest: &pubAckP99, ms: true},
+		{expr: `histogram_quantile(0.50, sum by (le) (rate(depositor_event_age_seconds_bucket[1m])))`, dest: &eventAgeP50, ms: true},
+		{expr: `histogram_quantile(0.95, sum by (le) (rate(depositor_event_age_seconds_bucket[1m])))`, dest: &eventAgeP95, ms: true},
+		{expr: `depositor:event_age_seconds:p99_1m`, dest: &eventAgeP99, ms: true},
+		{expr: `histogram_quantile(0.99, sum by (le) (rate(depositor_ingest_batch_duration_seconds_bucket[1m])))`, dest: &batchIngestP99, ms: true},
+		{expr: `depositor:consumer_lag:messages`, dest: &consumerLag, ms: false},
+		{expr: `depositor:time_since_last_settlement:seconds`, dest: &settlementAge, ms: false},
+	}
+
+	var wg sync.WaitGroup
+	for i := range specs {
+		sp := specs[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, _ := s.queryPromScalar(ctx, baseURL, sp.expr)
+			if sp.ms {
+				val *= 1000.0
+			}
+			*sp.dest = sanitizeFloat(val)
+		}()
+	}
+	wg.Wait()
+
+	snap := PrometheusTelemetry{
+		Online:               true,
+		TargetsUp:            upCount,
+		TargetsTotal:         totalTargets,
+		TSDBHeadSeries:       int64(tsdbSeries),
+		GatewayReqRate1m:     gwRate1m,
+		GatewayErrorRatio1m:  gwErrRatio1m,
+		GatewayP50Ms:         gwP50,
+		GatewayP95Ms:         gwP95,
+		GatewayP99Ms:         gwP99,
+		PubAckP99Ms:          pubAckP99,
+		EventAgeP50Ms:        eventAgeP50,
+		EventAgeP95Ms:        eventAgeP95,
+		EventAgeP99Ms:        eventAgeP99,
+		BatchIngestP99Ms:     batchIngestP99,
+		DepositorConsumerLag: int64(consumerLag),
+		LastSettlementAgeSec: settlementAge,
+	}
+
+	s.promCacheMu.Lock()
+	s.cachedProm = snap
+	s.lastPromAt = time.Now()
+	s.promCacheMu.Unlock()
+
+	return snap
 }
 
 func (s *DashboardServer) fetchPublisherTelemetry(ctx context.Context) []PublisherTelemetry {
@@ -632,10 +855,11 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		gwTelemetry    GatewayTelemetry
+		promTelemetry  PrometheusTelemetry
 		publishersList []PublisherTelemetry
 		telemetryWg    sync.WaitGroup
 	)
-	telemetryWg.Add(2)
+	telemetryWg.Add(3)
 	go func() {
 		defer telemetryWg.Done()
 		gwTelemetry = s.fetchGatewayTelemetry(r.Context())
@@ -643,6 +867,10 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer telemetryWg.Done()
 		publishersList = s.fetchPublisherTelemetry(r.Context())
+	}()
+	go func() {
+		defer telemetryWg.Done()
+		promTelemetry = s.fetchPrometheusTelemetry(r.Context())
 	}()
 
 	var dbCount int64
@@ -732,6 +960,7 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		DLQTotalCount:     dlqTotal,
 		PublishEnabled:    s.publishEnabled.Load(),
 		Gateway:           gwTelemetry,
+		Prometheus:        promTelemetry,
 		Reconciliation:    reconReport,
 		Publishers:        publishersList,
 		Replicas:          replicasList,
@@ -1472,7 +1701,7 @@ const dashboardHTML = `<!DOCTYPE html>
             <span class="text-slate-300">•</span>
             <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="network" class="w-3.5 h-3.5 text-sky-500"></i> NATS JetStream</span>
             <span class="text-slate-300">•</span>
-            <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="layers" class="w-3.5 h-3.5 text-teal-500"></i> Periodic PL/pgSQL Settlement</span>
+            <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="flame" class="w-3.5 h-3.5 text-orange-500"></i> Prometheus TSDB</span>
             <span class="text-slate-300">•</span>
             <span class="inline-flex items-center gap-1 text-slate-600"><i data-lucide="shield-check" class="w-3.5 h-3.5 text-emerald-500"></i> Automated Ledger Audit</span>
           </p>
@@ -1506,6 +1735,77 @@ const dashboardHTML = `<!DOCTYPE html>
         </div>
       </div>
 
+    </div>
+  </div>
+
+  <!-- Live Prometheus Observability & Latency Quantiles Panel -->
+  <div class="glass-card rounded-3xl p-5 md:p-6 animate-section delay-1 border-orange-200/70">
+    <div class="flex flex-col lg:flex-row justify-between items-start lg:items-center mb-5 gap-3 pb-4 border-b border-slate-100">
+      <div class="flex items-start gap-3.5">
+        <div class="w-11 h-11 rounded-2xl bg-orange-50 border border-orange-200/80 text-orange-600 flex items-center justify-center shrink-0 mt-0.5">
+          <i data-lucide="flame" class="w-5 h-5"></i>
+        </div>
+        <div>
+          <div class="flex flex-wrap items-center gap-2">
+            <h2 class="font-extrabold text-slate-900 text-base">دیده‌بانی زنده پرومتئوس و صدک‌های تأخیر (Prometheus Live Metrics & Quantiles)</h2>
+            <span id="promOnlineBadge" class="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 ltr-num">
+              Prometheus: Connecting...
+            </span>
+            <span id="promSeriesBadge" class="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 ltr-num">
+              TSDB Series: 0
+            </span>
+          </div>
+          <p class="text-xs text-slate-500 mt-1">
+            استعلام خودکار کوئری‌های PromQL و Recording Rules از موتور Prometheus بدون نیاز به نوشتن دستی کوئری
+          </p>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap gap-2">
+        <a href="http://localhost:3030" target="_blank" rel="noopener" class="px-3.5 py-2 rounded-xl text-xs font-bold bg-orange-600 text-white hover:bg-orange-700 transition shadow-sm flex items-center gap-1.5">
+          <i data-lucide="bar-chart-3" class="w-3.5 h-3.5"></i>
+          <span>باز کردن داشبورد Grafana (:3030)</span>
+        </a>
+        <a href="http://localhost:9090/targets" target="_blank" rel="noopener" class="px-3.5 py-2 rounded-xl text-xs font-bold bg-slate-800 text-white hover:bg-slate-900 transition shadow-sm flex items-center gap-1.5">
+          <i data-lucide="target" class="w-3.5 h-3.5"></i>
+          <span>صفحه Targets پرومتئوس (:9090)</span>
+        </a>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+      <div class="bg-indigo-50/60 border border-indigo-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-indigo-700 block font-semibold">Gateway p50 / p95</span>
+        <span id="promGwP50P95" class="text-sm font-black text-indigo-900 ltr-num mt-1">0.0 / 0.0 ms</span>
+      </div>
+      <div class="bg-purple-50/60 border border-purple-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-purple-700 block font-semibold">Gateway p99 Latency</span>
+        <span id="promGwP99" class="text-base font-black text-purple-800 ltr-num mt-0.5">0.0 ms</span>
+      </div>
+      <div class="bg-sky-50/60 border border-sky-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-sky-700 block font-semibold">تأخیر کل مسیر (p50/p95)</span>
+        <span id="promAgeP50P95" class="text-sm font-black text-sky-900 ltr-num mt-1">0.0 / 0.0 ms</span>
+      </div>
+      <div class="bg-teal-50/60 border border-teal-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-teal-700 block font-semibold">تأخیر کل مسیر (p99 Age)</span>
+        <span id="promAgeP99" class="text-base font-black text-teal-800 ltr-num mt-0.5">0.0 ms</span>
+      </div>
+      <div class="bg-emerald-50/60 border border-emerald-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-emerald-700 block font-semibold">NATS PubAck (p99)</span>
+        <span id="promPubAckP99" class="text-base font-black text-emerald-800 ltr-num mt-0.5">0.0 ms</span>
+      </div>
+      <div class="bg-amber-50/60 border border-amber-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-amber-700 block font-semibold">SQL Batch Ingest (p99)</span>
+        <span id="promBatchP99" class="text-base font-black text-amber-800 ltr-num mt-0.5">0.0 ms</span>
+      </div>
+      <div class="bg-rose-50/60 border border-rose-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-rose-700 block font-semibold">Consumer Lag (NATS)</span>
+        <span id="promConsumerLag" class="text-base font-black text-rose-800 ltr-num mt-0.5">0 msgs</span>
+      </div>
+      <div class="bg-slate-100 border border-slate-200/80 p-3 rounded-2xl">
+        <span class="text-[11px] text-slate-600 block font-semibold">فاصله از آخرین تسویه</span>
+        <span id="promSettlementAge" class="text-base font-black text-slate-800 ltr-num mt-0.5">0.0 s</span>
+      </div>
     </div>
   </div>
 
@@ -1866,36 +2166,52 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Chart & Recent Activity Grid -->
+  <!-- Charts (TPS + Prometheus Latency Quantiles) & Recent Activity Grid -->
   <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 animate-section delay-4">
     
-    <div class="lg:col-span-7 glass-card rounded-3xl p-5 md:p-6 flex flex-col">
+    <div class="lg:col-span-4 glass-card rounded-3xl p-5 md:p-6 flex flex-col">
       <div class="flex items-center justify-between mb-4">
         <div class="flex items-center gap-3">
           <div class="w-10 h-10 rounded-2xl bg-indigo-50 border border-indigo-100 text-indigo-600 flex items-center justify-center">
             <i data-lucide="activity" class="w-5 h-5"></i>
           </div>
           <div>
-            <h2 class="font-extrabold text-slate-900 text-base">نمودار زنده سرعت خوشه (Global TPS Stream)</h2>
+            <h2 class="font-extrabold text-slate-900 text-sm md:text-base">نمودار زنده سرعت خوشه (TPS)</h2>
             <p class="text-xs text-slate-500">نرخ تراکنش‌های ثبت‌شده در ثانیه</p>
           </div>
         </div>
-        <span class="text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-lg border border-indigo-100 ltr-num">Real-time 1s</span>
       </div>
       <div class="relative flex-1 w-full min-h-[260px] bg-slate-50/50 rounded-2xl p-3 border border-slate-100">
         <canvas id="clusterChart"></canvas>
       </div>
     </div>
 
-    <div class="lg:col-span-5 glass-card rounded-3xl p-5 md:p-6 flex flex-col">
+    <div class="lg:col-span-4 glass-card rounded-3xl p-5 md:p-6 flex flex-col">
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-2xl bg-orange-50 border border-orange-100 text-orange-600 flex items-center justify-center">
+            <i data-lucide="timer" class="w-5 h-5"></i>
+          </div>
+          <div>
+            <h2 class="font-extrabold text-slate-900 text-sm md:text-base">نمودار صدک‌های تأخیر پرومتئوس (ms)</h2>
+            <p class="text-xs text-slate-500">Gateway p99 و End-to-End Event Age p99</p>
+          </div>
+        </div>
+      </div>
+      <div class="relative flex-1 w-full min-h-[260px] bg-slate-50/50 rounded-2xl p-3 border border-slate-100">
+        <canvas id="latencyChart"></canvas>
+      </div>
+    </div>
+
+    <div class="lg:col-span-4 glass-card rounded-3xl p-5 md:p-6 flex flex-col">
       <div class="flex items-center justify-between mb-4">
         <div class="flex items-center gap-3">
           <div class="w-10 h-10 rounded-2xl bg-emerald-50 border border-emerald-100 text-emerald-600 flex items-center justify-center">
             <i data-lucide="arrow-down-left" class="w-5 h-5"></i>
           </div>
           <div>
-            <h2 class="font-extrabold text-slate-900 text-base">آخرین تراکنش‌های ثبت‌شده</h2>
-            <p class="text-xs text-slate-500">۱۵ واریز آخر در دیتابیس همراه با وضعیت تسویه</p>
+            <h2 class="font-extrabold text-slate-900 text-sm md:text-base">آخرین تراکنش‌های ثبت‌شده</h2>
+            <p class="text-xs text-slate-500">۱۵ واریز آخر در دیتابیس</p>
           </div>
         </div>
       </div>
@@ -2034,17 +2350,69 @@ const clusterChart = new Chart(ctx, {
         animation: false,
         scales: {
             x: {
-                ticks: { color: '#64748b', font: { family: 'Vazirmatn', size: 11 } },
+                ticks: { color: '#64748b', font: { family: 'Vazirmatn', size: 10 } },
                 grid: { color: '#e2e8f0', borderDash: [4, 4] }
             },
             y: {
                 beginAtZero: true,
-                ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 11 } },
+                ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } },
                 grid: { color: '#e2e8f0', borderDash: [4, 4] }
             }
         },
         plugins: {
             legend: { display: false }
+        }
+    }
+});
+
+const latCtx = document.getElementById('latencyChart').getContext('2d');
+const latencyChartData = {
+    labels: [],
+    datasets: [
+        {
+            label: 'Gateway HTTP p99 (ms)',
+            data: [],
+            borderColor: '#ea580c',
+            borderWidth: 2,
+            pointRadius: 2,
+            fill: false,
+            tension: 0.35
+        },
+        {
+            label: 'E2E Event Age p99 (ms)',
+            data: [],
+            borderColor: '#0d9488',
+            borderWidth: 2,
+            pointRadius: 2,
+            fill: false,
+            tension: 0.35
+        }
+    ]
+};
+
+const latencyChart = new Chart(latCtx, {
+    type: 'line',
+    data: latencyChartData,
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        scales: {
+            x: {
+                ticks: { color: '#64748b', font: { family: 'Vazirmatn', size: 10 } },
+                grid: { color: '#e2e8f0', borderDash: [4, 4] }
+            },
+            y: {
+                beginAtZero: true,
+                ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 10 } },
+                grid: { color: '#e2e8f0', borderDash: [4, 4] }
+            }
+        },
+        plugins: {
+            legend: {
+                display: true,
+                labels: { font: { family: 'JetBrains Mono', size: 10 }, boxWidth: 10 }
+            }
         }
     }
 });
@@ -2129,6 +2497,26 @@ async function refresh() {
     setText('dbTotal', (d.db_total_deposits || 0).toLocaleString());
     setText('dbSettled', (d.db_settled_deposits || 0).toLocaleString());
     setText('dbPending', (d.db_pending_deposits || 0).toLocaleString());
+
+    if (d.prometheus) {
+        const promBadge = document.getElementById('promOnlineBadge');
+        if (d.prometheus.online) {
+            promBadge.className = 'px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 ltr-num';
+            promBadge.innerText = 'Targets UP: ' + d.prometheus.targets_up + '/' + d.prometheus.targets_total;
+        } else {
+            promBadge.className = 'px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-50 text-amber-700 border border-amber-200 ltr-num';
+            promBadge.innerText = 'Prometheus: Offline';
+        }
+        setText('promSeriesBadge', 'TSDB Series: ' + Number(d.prometheus.tsdb_head_series || 0).toLocaleString());
+        setText('promGwP50P95', Number(d.prometheus.gateway_p50_ms || 0).toFixed(1) + ' / ' + Number(d.prometheus.gateway_p95_ms || 0).toFixed(1) + ' ms');
+        setText('promGwP99', Number(d.prometheus.gateway_p99_ms || 0).toFixed(2) + ' ms');
+        setText('promAgeP50P95', Number(d.prometheus.event_age_p50_ms || 0).toFixed(1) + ' / ' + Number(d.prometheus.event_age_p95_ms || 0).toFixed(1) + ' ms');
+        setText('promAgeP99', Number(d.prometheus.event_age_p99_ms || 0).toFixed(1) + ' ms');
+        setText('promPubAckP99', Number(d.prometheus.pub_ack_p99_ms || 0).toFixed(2) + ' ms');
+        setText('promBatchP99', Number(d.prometheus.batch_ingest_p99_ms || 0).toFixed(2) + ' ms');
+        setText('promConsumerLag', Number(d.prometheus.depositor_consumer_lag || 0).toLocaleString() + ' msgs');
+        setText('promSettlementAge', Number(d.prometheus.last_settlement_age_sec || 0).toFixed(1) + ' s');
+    }
 
     if (d.gateway) {
         setText('gwTotal', d.gateway.total_requests.toLocaleString());
@@ -2298,6 +2686,19 @@ async function refresh() {
             chartData.datasets[0].data.shift();
         }
         clusterChart.update();
+
+        if (d.prometheus) {
+            latencyChartData.labels.push(timeLabel);
+            latencyChartData.datasets[0].data.push(Number(d.prometheus.gateway_p99_ms || 0));
+            latencyChartData.datasets[1].data.push(Number(d.prometheus.event_age_p99_ms || 0));
+            if (latencyChartData.labels.length > 25) {
+                latencyChartData.labels.shift();
+                latencyChartData.datasets[0].data.shift();
+                latencyChartData.datasets[1].data.shift();
+            }
+            latencyChart.update();
+        }
+
         lastTick = now;
     } else if (lastGlobalProc === null) {
         lastTick = now;
