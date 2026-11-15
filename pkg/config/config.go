@@ -29,7 +29,7 @@ type Config struct {
 	RetryInterval      time.Duration `env:"RETRY_INTERVAL" envDefault:"5s"`
 	SettlementInterval time.Duration `env:"SETTLEMENT_INTERVAL" envDefault:"5s"`
 	ShutdownTimeout    time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
-	MetricsPort        int           `env:"METRICS_PORT" envDefault:"8080"`
+	MetricsPort        int           `env:"METRICS_PORT" envDefault:"9090"`
 
 	PublishInterval     time.Duration `env:"PUBLISH_INTERVAL" envDefault:"1s"`
 	PublishEnabled      bool          `env:"PUBLISH_ENABLED" envDefault:"false"`
