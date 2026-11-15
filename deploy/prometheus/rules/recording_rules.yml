@@ -1,0 +1,48 @@
+groups:
+  - name: deposit_processor_recording_rules
+    interval: 5s
+    rules:
+      # Gateway golden signals
+      - record: gateway:http_requests:rate1m
+        expr: sum(rate(gateway_http_requests_total[1m]))
+
+      - record: gateway:http_errors:ratio1m
+        expr: |
+          sum(rate(gateway_http_requests_total{code=~"5.."}[1m]))
+          /
+          clamp_min(sum(rate(gateway_http_requests_total[1m])), 1e-9)
+
+      - record: gateway:http_request_duration_seconds:p99_1m
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(gateway_http_request_duration_seconds_bucket{route="/v1/deposits"}[1m])))
+
+      # Publisher golden signals & per-instance rate
+      - record: publisher:grpc_requests_by_instance:rate1m
+        expr: sum by (instance) (rate(grpc_server_handled_total{service="publisher",grpc_Method="PublishDeposit"}[1m]))
+
+      - record: publisher:jetstream_publish_errors:ratio1m
+        expr: |
+          sum(rate(publisher_jetstream_publish_total{result="error"}[1m]))
+          /
+          clamp_min(sum(rate(publisher_jetstream_publish_total[1m])), 1e-9)
+
+      - record: publisher:jetstream_publish_duration_seconds:p99_1m
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(publisher_jetstream_publish_duration_seconds_bucket[1m])))
+
+      # Depositor golden signals & end-to-end event age
+      - record: depositor:messages_processed:rate1m
+        expr: sum(rate(depositor_messages_total{result="processed"}[1m]))
+
+      - record: depositor:event_age_seconds:p99_1m
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(depositor_event_age_seconds_bucket[1m])))
+
+      - record: depositor:consumer_lag:messages
+        expr: |
+          sum(jetstream_consumer_num_pending{consumer_name="deposits_processor"})
+          +
+          sum(jetstream_consumer_num_ack_pending{consumer_name="deposits_processor"})
+
+      - record: depositor:time_since_last_settlement:seconds
+        expr: time() - max(depositor_settlement_last_success_timestamp_seconds)

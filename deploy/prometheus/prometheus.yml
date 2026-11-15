@@ -1,0 +1,88 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: "deposit-swarm"
+
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+scrape_configs:
+  # 1. Gateway replicas (discovered dynamically via Swarm DNS tasks.gateway)
+  - job_name: "gateway"
+    metrics_path: "/metrics"
+    dns_sd_configs:
+      - names:
+          - "tasks.gateway"
+        type: "A"
+        port: 9090
+        refresh_interval: 5s
+    relabel_configs:
+      - target_label: "service"
+        replacement: "gateway"
+
+  # 2. Publisher replicas (discovered dynamically via Swarm DNS tasks.publisher)
+  - job_name: "publisher"
+    metrics_path: "/metrics"
+    dns_sd_configs:
+      - names:
+          - "tasks.publisher"
+        type: "A"
+        port: 9090
+        refresh_interval: 5s
+    relabel_configs:
+      - target_label: "service"
+        replacement: "publisher"
+
+  # 3. Depositor replicas (discovered dynamically via Swarm DNS tasks.depositor)
+  - job_name: "depositor"
+    metrics_path: "/metrics"
+    dns_sd_configs:
+      - names:
+          - "tasks.depositor"
+        type: "A"
+        port: 9090
+        refresh_interval: 5s
+    relabel_configs:
+      - target_label: "service"
+        replacement: "depositor"
+
+  # 4. Dashboard service (discovered dynamically via Swarm DNS tasks.dashboard)
+  - job_name: "dashboard"
+    metrics_path: "/metrics"
+    dns_sd_configs:
+      - names:
+          - "tasks.dashboard"
+        type: "A"
+        port: 9090
+        refresh_interval: 5s
+    relabel_configs:
+      - target_label: "service"
+        replacement: "dashboard"
+
+  # 5. NATS & JetStream Exporter (exports consumer num_pending, num_ack_pending, redeliveries)
+  - job_name: "nats-exporter"
+    metrics_path: "/metrics"
+    dns_sd_configs:
+      - names:
+          - "tasks.nats-exporter"
+        type: "A"
+        port: 7777
+        refresh_interval: 10s
+    relabel_configs:
+      - target_label: "service"
+        replacement: "nats"
+
+  # 6. PostgreSQL Exporter (exports pg_stat_*, locks, and custom unsettled deposit count)
+  - job_name: "postgres-exporter"
+    metrics_path: "/metrics"
+    dns_sd_configs:
+      - names:
+          - "tasks.postgres-exporter"
+        type: "A"
+        port: 9187
+        refresh_interval: 10s
+    relabel_configs:
+      - target_label: "service"
+        replacement: "postgres"

@@ -1,0 +1,26 @@
+pg_deposits:
+  query: |
+    SELECT
+      (SELECT COUNT(*)::BIGINT FROM deposits WHERE is_settled = FALSE) AS unsettled_pending_count,
+      COALESCE((SELECT SUM(settled_count)::BIGINT FROM ledger_settled_summary), 0) AS settled_total_count,
+      (
+        WITH expected AS (
+          SELECT user_id, currency, settled_amount AS exp
+          FROM ledger_settled_summary
+          WHERE settled_amount > 0
+        )
+        SELECT COUNT(*)::BIGINT
+        FROM expected e
+        FULL OUTER JOIN balances b ON b.user_id = e.user_id AND b.currency = e.currency
+        WHERE COALESCE(e.exp, 0) IS DISTINCT FROM COALESCE(b.balance, 0)
+      ) AS ledger_discrepancy_count;
+  metrics:
+    - unsettled_pending_count:
+        usage: "GAUGE"
+        description: "Current number of ingested deposits waiting for periodic PL/pgSQL batch settlement (is_settled = FALSE)."
+    - settled_total_count:
+        usage: "GAUGE"
+        description: "Total number of settled deposits recorded in ledger_settled_summary."
+    - ledger_discrepancy_count:
+        usage: "GAUGE"
+        description: "Number of user/currency wallets where settled deposit sum differs from balances table (must be 0)."

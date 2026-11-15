@@ -9,6 +9,7 @@ networks:
 volumes:
   postgres_data:
   nats_data:
+  prometheus_data:
 
 secrets:
   deposit_api_key:
@@ -124,6 +125,7 @@ services:
         target: postgres_password
     stop_grace_period: 25s
     environment:
+      IMAGE_TAG: ${IMAGE_TAG}
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_USER: postgres
@@ -136,10 +138,11 @@ services:
       RETRY_INTERVAL: 5s
       SETTLEMENT_INTERVAL: 5s
       SHUTDOWN_TIMEOUT: 15s
-      METRICS_PORT: "8080"
+      METRICS_PORT: "9090"
       LOG_LEVEL: warn
     deploy:
       replicas: 4
+      endpoint_mode: dnsrr
       restart_policy:
         condition: any
         delay: 3s
@@ -165,17 +168,19 @@ services:
       - deposit_overlay
     stop_grace_period: 25s
     environment:
+      IMAGE_TAG: ${IMAGE_TAG}
       NATS_URL: nats://nats:4222
       PUBLISH_ENABLED: "false"
       PUBLISH_INTERVAL: 1s
       PUBLISHER_GRPC_PORT: "50051"
       PUBLISHER_HEALTH_PORT: "8090"
+      METRICS_PORT: "9090"
       DRAIN_DELAY: 6s
       SHUTDOWN_TIMEOUT: 10s
       FORCE_UNHEALTHY: "false"
       LOG_LEVEL: warn
     healthcheck:
-      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:8090/livez >/dev/null 2>&1 || exit 1" ]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/livez >/dev/null 2>&1 || exit 1"]
       interval: 2s
       timeout: 1s
       retries: 2
@@ -216,7 +221,9 @@ services:
         target: api_key
     stop_grace_period: 15s
     environment:
+      IMAGE_TAG: ${IMAGE_TAG}
       GATEWAY_PORT: "8081"
+      METRICS_PORT: "9090"
       PUBLISHER_GRPC_ADDR: publisher:50051
       DNS_REFRESH_INTERVAL: 2s
       API_KEY_FILE: /run/secrets/api_key
@@ -271,6 +278,7 @@ services:
         target: postgres_password
     stop_grace_period: 10s
     environment:
+      IMAGE_TAG: ${IMAGE_TAG}
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_USER: postgres
@@ -281,8 +289,9 @@ services:
       GATEWAY_URL: http://gateway:8081
       API_KEY_FILE: /run/secrets/api_key
       PORT: "8080"
+      METRICS_PORT: "9090"
     healthcheck:
-      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1" ]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -306,3 +315,83 @@ services:
         failure_action: pause
         monitor: 10s
         order: start-first
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.15.0
+    command:
+      - "-varz"
+      - "-connz"
+      - "-routez"
+      - "-subz"
+      - "-jsz=all"
+      - "-port=7777"
+      - "http://nats:8222"
+    networks:
+      - deposit_overlay
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 3s
+        max_attempts: 0
+        window: 60s
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    command:
+      - "--extend.query-path=/etc/postgres_exporter/queries.yml"
+    networks:
+      - deposit_overlay
+    secrets:
+      - source: deposit_postgres_password
+        target: postgres_password
+    volumes:
+      - ./prometheus/postgres_exporter_queries.yml:/etc/postgres_exporter/queries.yml:ro
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/deposits_db?sslmode=disable"
+      DATA_SOURCE_USER: "postgres"
+      DATA_SOURCE_PASS_FILE: "/run/secrets/postgres_password"
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 3s
+        max_attempts: 0
+        window: 60s
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--enable-feature=native-histograms,exemplar-storage"
+      - "--web.enable-lifecycle"
+    networks:
+      - deposit_overlay
+    ports:
+      - target: 9090
+        published: 9090
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+          - node.labels.stateful == true
+      restart_policy:
+        condition: any
+        delay: 3s
+        max_attempts: 0
+        window: 60s

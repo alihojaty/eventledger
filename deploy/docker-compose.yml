@@ -65,7 +65,7 @@ services:
       RETRY_INTERVAL: ${RETRY_INTERVAL:-5s}
       SETTLEMENT_INTERVAL: ${SETTLEMENT_INTERVAL:-5s}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
-      METRICS_PORT: ${METRICS_PORT:-8080}
+      METRICS_PORT: ${METRICS_PORT:-9090}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     deploy:
       replicas: 5
@@ -85,6 +85,7 @@ services:
       PUBLISH_INTERVAL: ${PUBLISH_INTERVAL:-1s}
       PUBLISHER_GRPC_PORT: 50051
       PUBLISHER_HEALTH_PORT: 8090
+      METRICS_PORT: 9090
       DRAIN_DELAY: ${DRAIN_DELAY:-6s}
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-10s}
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -100,6 +101,7 @@ services:
     stop_grace_period: 15s
     environment:
       GATEWAY_PORT: 8081
+      METRICS_PORT: 9090
       PUBLISHER_GRPC_ADDR: publisher:50051
       API_KEY: ${API_KEY:-dev-secret-api-key}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-3s}
@@ -134,10 +136,47 @@ services:
       GATEWAY_URL: http://gateway:8081
       API_KEY: ${API_KEY:-dev-secret-api-key}
       PORT: 8080
+      METRICS_PORT: 9090
     ports:
       - "8080:8080"
+    restart: unless-stopped
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:0.15.0
+    command: ["-varz", "-connz", "-routez", "-subz", "-jsz=all", "-port=7777", "http://nats:8222"]
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.16.0
+    command: ["--extend.query-path=/etc/postgres_exporter/queries.yml"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./prometheus/postgres_exporter_queries.yml:/etc/postgres_exporter/queries.yml:ro
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:postgres@postgres:5432/deposits_db?sslmode=disable"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--enable-feature=native-histograms,exemplar-storage"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
     restart: unless-stopped
 
 volumes:
   postgres_data:
   nats_data:
+  prometheus_data:
