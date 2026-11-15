@@ -365,7 +365,7 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
       - "--storage.tsdb.retention.time=7d"
-      - "--enable-feature=native-histograms,exemplar-storage"
+      - "--enable-feature=exemplar-storage"
       - "--web.enable-lifecycle"
     networks:
       - deposit_overlay
