@@ -14,11 +14,13 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/metricsx"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/tlscfg"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/generator"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/grpcserver"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/healthmgr"
+	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/metrics"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -49,8 +51,13 @@ func main() {
 	sigCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	// Single source of truth for /livez, /readyz, gRPC Health, and /stats
+	// Single source of truth for /livez, /readyz, gRPC Health, /stats, and Prometheus health gauges
 	healthMgr := healthmgr.NewManager(hostname, cfg.ForceUnhealthy, log)
+
+	promReg := metricsx.NewRegistry("publisher", nil, "")
+	pubMetrics := metrics.NewPublisherMetrics(promReg, healthMgr)
+	healthMgr.AttachMetrics(pubMetrics)
+	metricsSrv := metricsx.StartServer(cfg.MetricsPort, promReg, log)
 
 	httpHealthSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.PublisherHealthPort),
@@ -60,6 +67,7 @@ func main() {
 	go func() {
 		log.Info("Publisher HTTP health & stats server listening",
 			zap.Int("health_port", cfg.PublisherHealthPort),
+			zap.Int("metrics_port", cfg.MetricsPort),
 		)
 		if err := httpHealthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("Publisher HTTP health server stopped with error", zap.Error(err))
@@ -81,7 +89,8 @@ func main() {
 
 	var serverOpts []grpc.ServerOption
 	serverOpts = append(serverOpts,
-		grpcserver.UnaryInterceptors(log),
+		grpcserver.UnaryInterceptors(log, pubMetrics.GRPCServerMetrics.UnaryServerInterceptor()),
+		grpc.ChainStreamInterceptor(pubMetrics.GRPCServerMetrics.StreamServerInterceptor()),
 		grpc.InitialWindowSize(4*1024*1024),
 		grpc.InitialConnWindowSize(16*1024*1024),
 		grpc.WriteBufferSize(256*1024),
@@ -100,16 +109,18 @@ func main() {
 	}
 
 	grpcSrv := grpc.NewServer(serverOpts...)
-	pubGRPC := grpcserver.NewServer(natsBroker, log, healthMgr)
+	pubGRPC := grpcserver.NewServerWithMetrics(natsBroker, log, healthMgr, pubMetrics)
 	depositv1.RegisterDepositPublisherServiceServer(grpcSrv, pubGRPC)
 
 	// Register unified HealthManager as the gRPC HealthServer
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthMgr)
+	pubMetrics.GRPCServerMetrics.InitializeMetrics(grpcSrv)
 
 	go func() {
 		log.Info("Publisher gRPC server listening",
 			zap.Int("grpc_port", cfg.PublisherGRPCPort),
 			zap.Int("health_port", cfg.PublisherHealthPort),
+			zap.Int("metrics_port", cfg.MetricsPort),
 			zap.Duration("drain_delay", cfg.DrainDelay),
 			zap.Duration("shutdown_timeout", cfg.ShutdownTimeout),
 			zap.Bool("mtls_enabled", cfg.MTLSEnabled),
@@ -162,7 +173,7 @@ func main() {
 	go pub.Start(sigCtx)
 
 	// =========================================================================
-	// EXACT 6-STEP ORDERED GRACEFUL SHUTDOWN
+	// EXACT 6-STEP ORDERED GRACEFUL SHUTDOWN (+ METRICS SERVER LAST)
 	// =========================================================================
 
 	// Step 1: SIGTERM arrives and is logged
@@ -233,10 +244,15 @@ func main() {
 		zap.Time("nats_closed_at", time.Now().UTC()),
 	)
 
-	// Stop auxiliary HTTP health server right before process exit
+	// Stop auxiliary HTTP health server
 	httpCtx, httpCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	_ = httpHealthSrv.Shutdown(httpCtx)
 	httpCancel()
+
+	// Shut down Prometheus metrics server LAST
+	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	metricsSrv.Shutdown(metricsCtx)
+	metricsCancel()
 
 	// Step 6: Process exits cleanly
 	finalSnap := healthMgr.GetSnapshot()

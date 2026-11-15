@@ -19,8 +19,10 @@ import (
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
+	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/metrics"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/ratelimit"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc/codes"
@@ -36,6 +38,7 @@ const (
 	HeaderIdempotencyKey   = "Idempotency-Key"
 	HeaderRequestID        = "X-Request-ID"
 	MetadataKeyRequestID   = "x-request-id"
+	RouteUnmatched         = "unmatched"
 	idemShards             = 32
 	maxIdemEntriesPerShard = 4096
 	readyCacheTTL          = 1 * time.Second
@@ -233,6 +236,14 @@ func WithMTLSEnabled(enabled bool) GatewayOption {
 	}
 }
 
+func WithMetrics(m *metrics.GatewayMetrics) GatewayOption {
+	return func(h *GatewayHandler) {
+		if m != nil {
+			h.metrics = m
+		}
+	}
+}
+
 type GatewayHandler struct {
 	pubClient    depositv1.DepositPublisherServiceClient
 	healthClient grpc_health_v1.HealthClient
@@ -242,22 +253,13 @@ type GatewayHandler struct {
 	limiter      *ratelimit.KeyRateLimiter
 	idemGuard    *idempotencyPayloadGuard
 	mtlsEnabled  bool
+	metrics      *metrics.GatewayMetrics
 	logger       *zap.Logger
 
 	readyProbeMu     sync.Mutex
 	cachedReady      atomic.Bool
 	cachedReadyUntil atomic.Int64
 	probingReady     atomic.Bool
-
-	totalRequests    atomic.Uint64
-	accepted202      atomic.Uint64
-	duplicates       atomic.Uint64
-	badRequest400    atomic.Uint64
-	unauthorized401  atomic.Uint64
-	payloadLarge413  atomic.Uint64
-	rateLimited429   atomic.Uint64
-	upstreamError5xx atomic.Uint64
-	grpcRetries      atomic.Uint64
 }
 
 func NewGatewayHandler(
@@ -280,18 +282,27 @@ func NewGatewayHandler(
 	for _, opt := range opts {
 		opt(h)
 	}
+	if h.metrics == nil {
+		h.metrics = metrics.NewGatewayMetrics(prometheus.NewRegistry())
+	}
 	return h
 }
 
-func (h *GatewayHandler) IncGRPCRetry() {
-	h.grpcRetries.Add(1)
+func (h *GatewayHandler) Metrics() *metrics.GatewayMetrics {
+	return h.metrics
 }
 
+func (h *GatewayHandler) IncGRPCRetry() {
+	h.metrics.GRPCRetriesTotal.Inc()
+}
+
+// NewRouter creates the public HTTP router on port 8081.
+// Note: /metrics is intentionally NOT registered on the public router; it is served exclusively on METRICS_PORT.
 func (h *GatewayHandler) NewRouter() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(h.requestIDAndLoggerMiddleware())
+	r.Use(h.requestIDMetricsAndLoggerMiddleware())
 
 	r.GET("/healthz", h.handleHealthz)
 	r.GET("/readyz", h.handleReadyz)
@@ -306,31 +317,42 @@ func (h *GatewayHandler) NewRouter() *gin.Engine {
 	return r
 }
 
-func (h *GatewayHandler) requestIDAndLoggerMiddleware() gin.HandlerFunc {
+func (h *GatewayHandler) requestIDMetricsAndLoggerMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		infoEnabled := h.logger.Core().Enabled(zapcore.InfoLevel)
-		var start time.Time
-		if infoEnabled {
-			start = time.Now()
-		}
-
+		start := time.Now()
 		reqID := nextFastRequestID()
 		c.Set("request_id", reqID)
 		c.Header(HeaderRequestID, reqID)
 
-		if c.Request.URL.Path == "/v1/deposits" {
-			h.totalRequests.Add(1)
-		}
+		h.metrics.HTTPRequestsInFlight.Inc()
+		defer h.metrics.HTTPRequestsInFlight.Dec()
 
 		c.Next()
 
-		if infoEnabled {
+		duration := time.Since(start)
+		route := c.FullPath()
+		if route == "" {
+			route = RouteUnmatched
+		}
+		method := c.Request.Method
+		statusCode := c.Writer.Status()
+
+		h.metrics.HTTPRequestsTotal.WithLabelValues(method, route, strconv.Itoa(statusCode)).Inc()
+
+		obs := h.metrics.HTTPRequestDuration.WithLabelValues(method, route)
+		if exObs, ok := obs.(prometheus.ExemplarObserver); ok && reqID != "" {
+			exObs.ObserveWithExemplar(duration.Seconds(), prometheus.Labels{"request_id": reqID})
+		} else {
+			obs.Observe(duration.Seconds())
+		}
+
+		if h.logger.Core().Enabled(zapcore.InfoLevel) {
 			h.logger.Info("HTTP request processed",
 				zap.String("request_id", reqID),
-				zap.String("method", c.Request.Method),
-				zap.String("path", c.Request.URL.Path),
-				zap.Int("status", c.Writer.Status()),
-				zap.Duration("duration", time.Since(start)),
+				zap.String("method", method),
+				zap.String("route", route),
+				zap.Int("status", statusCode),
+				zap.Duration("duration", duration),
 			)
 		}
 	}
@@ -341,7 +363,7 @@ func (h *GatewayHandler) authMiddleware() gin.HandlerFunc {
 		provided := c.GetHeader(HeaderAPIKey)
 		providedHash := sha256.Sum256([]byte(provided))
 		if len(h.apiKey) == 0 || subtle.ConstantTimeCompare(providedHash[:], h.apiKeyHash[:]) != 1 {
-			h.unauthorized401.Add(1)
+			h.metrics.RecordDepositResult(metrics.ResultUnauthorized)
 			respondError(c, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid X-API-Key header")
 			c.Abort()
 			return
@@ -358,7 +380,7 @@ func (h *GatewayHandler) rateLimitMiddleware() gin.HandlerFunc {
 		}
 		apiKey := c.GetHeader(HeaderAPIKey)
 		if !h.limiter.Allow(apiKey) {
-			h.rateLimited429.Add(1)
+			h.metrics.RecordDepositResult(metrics.ResultRateLimited)
 			respondError(c, http.StatusTooManyRequests, "RATE_LIMITED", "rate limit exceeded for X-API-Key")
 			c.Abort()
 			return
@@ -370,7 +392,7 @@ func (h *GatewayHandler) rateLimitMiddleware() gin.HandlerFunc {
 func (h *GatewayHandler) bodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.ContentLength > maxBytes {
-			h.payloadLarge413.Add(1)
+			h.metrics.RecordDepositResult(metrics.ResultPayloadTooLarge)
 			respondError(c, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "request body exceeds 16KB limit")
 			c.Abort()
 			return
@@ -435,6 +457,7 @@ func (h *GatewayHandler) handleReadyz(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
+// handleStats reads all counters directly from the Prometheus metrics (single source of counting).
 func (h *GatewayHandler) handleStats(c *gin.Context) {
 	var rps float64
 	var burst int
@@ -442,20 +465,31 @@ func (h *GatewayHandler) handleStats(c *gin.Context) {
 		rps = h.limiter.RPS()
 		burst = h.limiter.Burst()
 	}
+
+	acceptedFresh := h.metrics.CountByResult(metrics.ResultAccepted)
+	duplicates := h.metrics.CountByResult(metrics.ResultDuplicate)
+	invalid := h.metrics.CountByResult(metrics.ResultInvalid)
+	unauthorized := h.metrics.CountByResult(metrics.ResultUnauthorized)
+	payloadLarge := h.metrics.CountByResult(metrics.ResultPayloadTooLarge)
+	rateLimited := h.metrics.CountByResult(metrics.ResultRateLimited)
+	upstreamUnavail := h.metrics.CountByResult(metrics.ResultUpstreamUnavailable)
+	upstreamTimeout := h.metrics.CountByResult(metrics.ResultUpstreamTimeout)
+	internalErr := h.metrics.CountByResult(metrics.ResultInternalError)
+
 	c.JSON(http.StatusOK, GatewayStatsSnapshot{
 		Ready:            h.isPublisherReadyNonBlocking(c.Request.Context()),
 		MTLSEnabled:      h.mtlsEnabled,
 		RateLimitRPS:     rps,
 		RateLimitBurst:   burst,
-		TotalRequests:    h.totalRequests.Load(),
-		Accepted202:      h.accepted202.Load(),
-		Duplicates:       h.duplicates.Load(),
-		BadRequest400:    h.badRequest400.Load(),
-		Unauthorized401:  h.unauthorized401.Load(),
-		PayloadLarge413:  h.payloadLarge413.Load(),
-		RateLimited429:   h.rateLimited429.Load(),
-		UpstreamError5xx: h.upstreamError5xx.Load(),
-		GRPCRetries:      h.grpcRetries.Load(),
+		TotalRequests:    h.metrics.TotalDepositRequests(),
+		Accepted202:      acceptedFresh + duplicates,
+		Duplicates:       duplicates,
+		BadRequest400:    invalid,
+		Unauthorized401:  unauthorized,
+		PayloadLarge413:  payloadLarge,
+		RateLimited429:   rateLimited,
+		UpstreamError5xx: upstreamUnavail + upstreamTimeout + internalErr,
+		GRPCRetries:      h.metrics.RetriesCount(),
 	})
 }
 
@@ -464,7 +498,7 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 
 	idempotencyKey := c.GetHeader(HeaderIdempotencyKey)
 	if err := domain.ValidateEventID(idempotencyKey); err != nil {
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "INVALID_IDEMPOTENCY_KEY", err.Error())
 		return
 	}
@@ -480,18 +514,18 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	if _, err := buf.ReadFrom(c.Request.Body); err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			h.payloadLarge413.Add(1)
+			h.metrics.RecordDepositResult(metrics.ResultPayloadTooLarge)
 			respondError(c, http.StatusRequestEntityTooLarge, "PAYLOAD_TOO_LARGE", "request body exceeds 16KB limit")
 			return
 		}
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "INVALID_BODY", "failed to read request body")
 		return
 	}
 
 	bodyBytes := bytes.TrimSpace(buf.Bytes())
 	if len(bodyBytes) == 0 {
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "INVALID_JSON", "request body cannot be empty")
 		return
 	}
@@ -500,19 +534,19 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	dec := json.NewDecoder(bytes.NewReader(bodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "INVALID_JSON", "malformed JSON or unknown fields")
 		return
 	}
 	if dec.More() || dec.Decode(&struct{}{}) != io.EOF {
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "INVALID_JSON", "unexpected trailing data after JSON object")
 		return
 	}
 
 	amountStr, err := domain.UnquoteJSONStringFast(req.Amount)
 	if err != nil {
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "VALIDATION_ERROR", "amount must be a valid string")
 		return
 	}
@@ -526,7 +560,7 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		createdAt,
 	)
 	if err != nil {
-		h.badRequest400.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
 		return
 	}
@@ -534,6 +568,7 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	normAmountStr := validatedEvent.Amount.String()
 	fingerprint := buildFingerprint(validatedEvent.UserID, validatedEvent.Currency, normAmountStr)
 	if !h.idemGuard.checkOrRemember(validatedEvent.EventID, fingerprint) {
+		h.metrics.RecordDepositResult(metrics.ResultInvalid)
 		respondError(c, http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", "Idempotency-Key was already used with different deposit parameters")
 		return
 	}
@@ -550,16 +585,11 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 		CreatedAt: timestamppb.New(validatedEvent.CreatedAt),
 	})
 	if err != nil {
-		httpStatus, code, msg := mapGRPCErrorToHTTP(err)
-		if httpStatus >= 500 {
-			if httpStatus != http.StatusGatewayTimeout {
-				h.idemGuard.forgetIfUncommitted(validatedEvent.EventID)
-			}
-			h.upstreamError5xx.Add(1)
-		} else if httpStatus == http.StatusBadRequest {
+		httpStatus, code, msg, metricResult := mapGRPCErrorToHTTPAndMetric(err)
+		if httpStatus != http.StatusGatewayTimeout {
 			h.idemGuard.forgetIfUncommitted(validatedEvent.EventID)
-			h.badRequest400.Add(1)
 		}
+		h.metrics.RecordDepositResult(metricResult)
 		h.logger.Warn("gRPC call to publisher failed",
 			zap.String("request_id", reqID),
 			zap.String("event_id", validatedEvent.EventID),
@@ -572,9 +602,10 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	}
 
 	h.idemGuard.markCommitted(validatedEvent.EventID, fingerprint)
-	h.accepted202.Add(1)
 	if grpcResp.GetDuplicate() {
-		h.duplicates.Add(1)
+		h.metrics.RecordDepositResult(metrics.ResultDuplicate)
+	} else {
+		h.metrics.RecordDepositResult(metrics.ResultAccepted)
 	}
 
 	if h.logger.Core().Enabled(zapcore.InfoLevel) {
@@ -594,28 +625,28 @@ func (h *GatewayHandler) handleCreateDeposit(c *gin.Context) {
 	})
 }
 
-func mapGRPCErrorToHTTP(err error) (int, string, string) {
+func mapGRPCErrorToHTTPAndMetric(err error) (int, string, string, string) {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return http.StatusGatewayTimeout, "GATEWAY_TIMEOUT", "request timed out waiting for publisher"
+		return http.StatusGatewayTimeout, "GATEWAY_TIMEOUT", "request timed out waiting for publisher", metrics.ResultUpstreamTimeout
 	}
 	st, ok := status.FromError(err)
 	if !ok {
-		return http.StatusInternalServerError, "INTERNAL_ERROR", "unexpected internal error"
+		return http.StatusInternalServerError, "INTERNAL_ERROR", "unexpected internal error", metrics.ResultInternalError
 	}
 
 	switch st.Code() {
 	case codes.InvalidArgument:
-		return http.StatusBadRequest, "VALIDATION_ERROR", st.Message()
+		return http.StatusBadRequest, "VALIDATION_ERROR", st.Message(), metrics.ResultInvalid
 	case codes.AlreadyExists:
-		return http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", st.Message()
+		return http.StatusConflict, "IDEMPOTENCY_KEY_CONFLICT", st.Message(), metrics.ResultInvalid
 	case codes.DeadlineExceeded:
-		return http.StatusGatewayTimeout, "GATEWAY_TIMEOUT", "request timed out waiting for publisher"
+		return http.StatusGatewayTimeout, "GATEWAY_TIMEOUT", "request timed out waiting for publisher", metrics.ResultUpstreamTimeout
 	case codes.Unavailable, codes.Canceled:
-		return http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "publisher or message broker is temporarily unavailable"
+		return http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "publisher or message broker is temporarily unavailable", metrics.ResultUpstreamUnavailable
 	case codes.ResourceExhausted:
-		return http.StatusTooManyRequests, "RATE_LIMITED", st.Message()
+		return http.StatusTooManyRequests, "RATE_LIMITED", st.Message(), metrics.ResultRateLimited
 	default:
-		return http.StatusBadGateway, "UPSTREAM_ERROR", "failed to process deposit upstream"
+		return http.StatusBadGateway, "UPSTREAM_ERROR", "failed to process deposit upstream", metrics.ResultInternalError
 	}
 }
 

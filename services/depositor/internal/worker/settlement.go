@@ -12,8 +12,13 @@ type DepositSettler interface {
 	SettlePendingDeposits(ctx context.Context) (int64, error)
 }
 
+type SettlementMetricsObserver interface {
+	RecordSettlementRun(settledCount int64, duration time.Duration, err error)
+}
+
 type SettlementWorker struct {
 	settler  DepositSettler
+	observer SettlementMetricsObserver
 	interval time.Duration
 	logger   *zap.Logger
 
@@ -22,12 +27,22 @@ type SettlementWorker struct {
 	wg       sync.WaitGroup
 }
 
-func NewSettlementWorker(settler DepositSettler, interval time.Duration, logger *zap.Logger) *SettlementWorker {
+func NewSettlementWorker(
+	settler DepositSettler,
+	interval time.Duration,
+	logger *zap.Logger,
+	observers ...SettlementMetricsObserver,
+) *SettlementWorker {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
+	var obs SettlementMetricsObserver
+	if len(observers) > 0 {
+		obs = observers[0]
+	}
 	return &SettlementWorker{
 		settler:  settler,
+		observer: obs,
 		interval: interval,
 		logger:   logger,
 		stopCh:   make(chan struct{}),
@@ -62,21 +77,29 @@ func (sw *SettlementWorker) Start(ctx context.Context) {
 func (sw *SettlementWorker) runCycle(ctx context.Context) {
 	start := time.Now()
 	settledCount, err := sw.settler.SettlePendingDeposits(ctx)
+	duration := time.Since(start)
 	if err != nil {
 		if ctx.Err() != nil {
 			return
 		}
+		if sw.observer != nil {
+			sw.observer.RecordSettlementRun(0, duration, err)
+		}
 		sw.logger.Error("Periodic batch settlement cycle failed",
 			zap.Error(err),
-			zap.Duration("duration", time.Since(start)),
+			zap.Duration("duration", duration),
 		)
 		return
+	}
+
+	if sw.observer != nil {
+		sw.observer.RecordSettlementRun(settledCount, duration, nil)
 	}
 
 	if settledCount > 0 {
 		sw.logger.Info("Periodic batch settlement cycle completed",
 			zap.Int64("settled_deposits", settledCount),
-			zap.Duration("duration", time.Since(start)),
+			zap.Duration("duration", duration),
 		)
 	}
 }
@@ -91,6 +114,10 @@ func (sw *SettlementWorker) StopAndFlush(ctx context.Context) {
 
 	start := time.Now()
 	settledCount, err := sw.settler.SettlePendingDeposits(ctx)
+	duration := time.Since(start)
+	if sw.observer != nil {
+		sw.observer.RecordSettlementRun(settledCount, duration, err)
+	}
 	if err != nil {
 		sw.logger.Warn("Final settlement flush on shutdown encountered an error",
 			zap.Error(err),
@@ -100,7 +127,7 @@ func (sw *SettlementWorker) StopAndFlush(ctx context.Context) {
 	if settledCount > 0 {
 		sw.logger.Info("Final settlement flush completed on shutdown",
 			zap.Int64("settled_deposits", settledCount),
-			zap.Duration("duration", time.Since(start)),
+			zap.Duration("duration", duration),
 		)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/metrics"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -57,8 +58,8 @@ type StatsSnapshot struct {
 	UptimeSeconds          float64 `json:"uptime_seconds"`
 }
 
-// Manager is the single source of truth for Publisher health (/livez, /readyz, and gRPC Health)
-// as well as per-instance request counters (/stats).
+// Manager is the single source of truth for Publisher health (/livez, /readyz, gRPC Health,
+// and Prometheus publisher_ready / publisher_draining / publisher_nats_connected gauges).
 type Manager struct {
 	grpc_health_v1.UnimplementedHealthServer
 
@@ -67,14 +68,13 @@ type Manager struct {
 	startedAt      time.Time
 	logger         *zap.Logger
 
-	// Single atomic health state read by /livez, /readyz, and gRPC Health Check/Watch
+	// Single atomic health state read by /livez, /readyz, gRPC Health Check/Watch, and Prometheus GaugeFuncs
 	state         atomic.Int32
 	draining      atomic.Bool
 	natsConnected atomic.Bool
 
-	// Request metrics
-	processedReqs      atomic.Uint64
-	inFlightReqs       atomic.Int64
+	// Timestamps of last request activity; actual request counts live solely in Prometheus metrics
+	promMetrics        *metrics.PublisherMetrics
 	lastReqReceivedNs  atomic.Int64
 	lastReqCompletedNs atomic.Int64
 
@@ -104,6 +104,12 @@ func NewManager(instanceID string, forceUnhealthy bool, logger *zap.Logger) *Man
 	}
 
 	return m
+}
+
+// AttachMetrics links the Prometheus PublisherMetrics so /stats reads ProcessedRequests and InFlightRequests
+// from the single Prometheus counter/gauge source.
+func (m *Manager) AttachMetrics(pm *metrics.PublisherMetrics) {
+	m.promMetrics = pm
 }
 
 // SetNATSConnected updates the unified health state based on NATS connectivity.
@@ -167,8 +173,16 @@ func (m *Manager) CurrentState() StateCode {
 	return StateCode(m.state.Load())
 }
 
+func (m *Manager) IsReady() bool {
+	return m.isReadyState(m.CurrentState())
+}
+
 func (m *Manager) IsDraining() bool {
 	return m.draining.Load()
+}
+
+func (m *Manager) IsNATSConnected() bool {
+	return m.natsConnected.Load()
 }
 
 func (m *Manager) isLiveState(s StateCode) bool {
@@ -265,23 +279,25 @@ func (m *Manager) CloseWatchers() {
 
 func (m *Manager) RecordRequestStart() time.Time {
 	now := time.Now().UTC()
-	m.inFlightReqs.Add(1)
 	m.lastReqReceivedNs.Store(now.UnixNano())
 	return now
 }
 
-func (m *Manager) RecordRequestEnd(succeeded bool) time.Time {
+func (m *Manager) RecordRequestEnd(_ bool) time.Time {
 	now := time.Now().UTC()
-	m.inFlightReqs.Add(-1)
-	if succeeded {
-		m.processedReqs.Add(1)
-	}
 	m.lastReqCompletedNs.Store(now.UnixNano())
 	return now
 }
 
 func (m *Manager) GetSnapshot() StatsSnapshot {
 	st := m.CurrentState()
+	var processed uint64
+	var inFlight int64
+	if m.promMetrics != nil {
+		processed = m.promMetrics.ProcessedCount()
+		inFlight = m.promMetrics.InFlightCount()
+	}
+
 	snap := StatsSnapshot{
 		InstanceID:        m.instanceID,
 		Status:            st.String(),
@@ -289,8 +305,8 @@ func (m *Manager) GetSnapshot() StatsSnapshot {
 		Ready:             m.isReadyState(st),
 		Draining:          m.draining.Load(),
 		NATSConnected:     m.natsConnected.Load(),
-		ProcessedRequests: m.processedReqs.Load(),
-		InFlightRequests:  m.inFlightReqs.Load(),
+		ProcessedRequests: processed,
+		InFlightRequests:  inFlight,
 		UptimeSeconds:     time.Since(m.startedAt).Seconds(),
 	}
 

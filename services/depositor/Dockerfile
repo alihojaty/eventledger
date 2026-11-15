@@ -17,12 +17,16 @@ COPY pkg/ ./pkg/
 COPY services/depositor/ ./services/depositor/
 
 WORKDIR /workspace/services/depositor
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -o /app/depositor ./cmd/depositor
+ARG GIT_REVISION=dev
+ARG SERVICE_VERSION=1.0.0
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -buildvcs=false \
+    -ldflags="-s -w -X github.com/alihojaty/reliable-deposit-processor/pkg/metricsx.Revision=${GIT_REVISION} -X github.com/alihojaty/reliable-deposit-processor/pkg/metricsx.Version=${SERVICE_VERSION}" \
+    -o /app/depositor ./cmd/depositor
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget
 COPY --from=builder /app/depositor /app/depositor
 COPY --from=builder /workspace/services/depositor/migrations /app/migrations
 
-EXPOSE 8080
+EXPOSE 9090
 ENTRYPOINT ["/app/depositor"]

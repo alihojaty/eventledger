@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
+	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/metrics"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
@@ -105,9 +107,10 @@ func TestProcessor_TemporaryDatabaseFailure_NakWithDelay(t *testing.T) {
 	repo := &mockRepo{processErr: errors.New("connection refused: database is down")}
 	mb := &mockBroker{}
 	retryDelay := 5 * time.Second
+	collector := metrics.NewCollector()
 
 	var wg sync.WaitGroup
-	proc := NewProcessor(context.Background(), &wg, repo, mb, retryDelay, testLogger, nil)
+	proc := NewProcessor(context.Background(), &wg, repo, mb, retryDelay, testLogger, collector)
 
 	validPayload := []byte(`{
 		"event_id": "evt-db-down-1",
@@ -130,6 +133,9 @@ func TestProcessor_TemporaryDatabaseFailure_NakWithDelay(t *testing.T) {
 	if msg.nakDelay != retryDelay {
 		t.Errorf("expected NakWithDelay duration %v, got %v", retryDelay, msg.nakDelay)
 	}
+	if got := testutil.ToFloat64(collector.MessagesTotal.WithLabelValues(metrics.ResultRetry)); got != 1 {
+		t.Errorf("expected depositor_messages_total{result=\"retry\"} == 1, got %v", got)
+	}
 
 	assertLogExists(t, recordedLogs, "Temporary failure")
 	assertLogExists(t, recordedLogs, "Retry started")
@@ -142,9 +148,10 @@ func TestProcessor_InvalidMessage_MovesToDLQThenAck(t *testing.T) {
 	var order []string
 	repo := &mockRepo{}
 	mb := &mockBroker{actionOrder: &order}
+	collector := metrics.NewCollector()
 
 	var wg sync.WaitGroup
-	proc := NewProcessor(context.Background(), &wg, repo, mb, 5*time.Second, testLogger, nil)
+	proc := NewProcessor(context.Background(), &wg, repo, mb, 5*time.Second, testLogger, collector)
 
 	invalidPayload := []byte(`{
 		"event_id": "evt-doge-99",
@@ -173,6 +180,9 @@ func TestProcessor_InvalidMessage_MovesToDLQThenAck(t *testing.T) {
 	if len(order) != 2 || order[0] != "PUBLISH_DLQ" || order[1] != "ACK" {
 		t.Fatalf("expected strict execution order [PUBLISH_DLQ, ACK], got %v", order)
 	}
+	if got := testutil.ToFloat64(collector.MessagesTotal.WithLabelValues(metrics.ResultDLQ)); got != 1 {
+		t.Errorf("expected depositor_messages_total{result=\"dlq\"} == 1, got %v", got)
+	}
 
 	assertLogExists(t, recordedLogs, "Invalid message")
 	assertLogExists(t, recordedLogs, "Message moved to DLQ")
@@ -181,9 +191,10 @@ func TestProcessor_InvalidMessage_MovesToDLQThenAck(t *testing.T) {
 func TestProcessor_InvalidMessage_DLQPublishFails_DoesNotAck(t *testing.T) {
 	repo := &mockRepo{}
 	mb := &mockBroker{dlqErr: errors.New("nats connection timeout")}
+	collector := metrics.NewCollector()
 
 	var wg sync.WaitGroup
-	proc := NewProcessor(context.Background(), &wg, repo, mb, 3*time.Second, zap.NewNop(), nil)
+	proc := NewProcessor(context.Background(), &wg, repo, mb, 3*time.Second, zap.NewNop(), collector)
 
 	msg := &mockMsg{data: []byte(`{corrupted_json`)}
 	proc.HandleMessage(1, msg)
@@ -195,6 +206,9 @@ func TestProcessor_InvalidMessage_DLQPublishFails_DoesNotAck(t *testing.T) {
 	if !msg.naked {
 		t.Fatalf("expected message to be NakWithDelay when PublishDLQ fails")
 	}
+	if got := testutil.ToFloat64(collector.MessagesTotal.WithLabelValues(metrics.ResultRetry)); got != 1 {
+		t.Errorf("expected depositor_messages_total{result=\"retry\"} == 1 when DLQ publish fails, got %v", got)
+	}
 }
 
 func TestProcessor_DuplicateEvent_AckWithoutBalanceChange(t *testing.T) {
@@ -203,9 +217,10 @@ func TestProcessor_DuplicateEvent_AckWithoutBalanceChange(t *testing.T) {
 
 	repo := &mockRepo{processErr: domain.ErrDuplicateEvent}
 	mb := &mockBroker{}
+	collector := metrics.NewCollector()
 
 	var wg sync.WaitGroup
-	proc := NewProcessor(context.Background(), &wg, repo, mb, 5*time.Second, testLogger, nil)
+	proc := NewProcessor(context.Background(), &wg, repo, mb, 5*time.Second, testLogger, collector)
 
 	validPayload := []byte(`{
 		"event_id": "evt-dup-77",
@@ -224,6 +239,9 @@ func TestProcessor_DuplicateEvent_AckWithoutBalanceChange(t *testing.T) {
 	}
 	if msg.naked {
 		t.Fatalf("expected duplicate message NOT to be NAKed")
+	}
+	if got := testutil.ToFloat64(collector.MessagesTotal.WithLabelValues(metrics.ResultDuplicate)); got != 1 {
+		t.Errorf("expected depositor_messages_total{result=\"duplicate\"} == 1, got %v", got)
 	}
 
 	assertLogExists(t, recordedLogs, "Duplicate message detected")

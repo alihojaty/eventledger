@@ -4,60 +4,87 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/metricsx"
+	"github.com/alihojaty/reliable-deposit-processor/services/dashboard/internal/metrics"
 	"github.com/alihojaty/reliable-deposit-processor/services/dashboard/internal/server"
 	_ "github.com/lib/pq"
 	"github.com/nats-io/nats.go"
+	"go.uber.org/zap"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	logLevel := getEnv("LOG_LEVEL", "info")
+	baseLog, err := logger.New(logLevel)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "dashboard-local"
+	}
+	log := baseLog.With(
+		zap.String("service", "dashboard"),
+		zap.String("instance_id", hostname),
+	)
+
 	natsURL := getEnv("NATS_URL", "nats://localhost:4222")
 	dbURL, err := resolveDatabaseURL()
 	if err != nil {
-		log.Fatalf("Failed to resolve database configuration: %v", err)
+		log.Fatal("Failed to resolve database configuration", zap.Error(err))
 	}
 	apiKey, err := resolveAPIKey()
 	if err != nil {
-		log.Fatalf("Failed to resolve API key configuration: %v", err)
+		log.Fatal("Failed to resolve API key configuration", zap.Error(err))
 	}
 	port := getEnv("PORT", "8080")
+	metricsPort, err := strconv.Atoi(getEnv("METRICS_PORT", "9090"))
+	if err != nil || metricsPort <= 0 {
+		metricsPort = 9090
+	}
 
-	nc := connectNATSWithRetry(ctx, natsURL)
+	nc := connectNATSWithRetry(ctx, natsURL, log)
 	if nc == nil {
 		return
 	}
-	defer nc.Close()
 
 	var db *sql.DB
 	if dbURL != "" {
 		db, err = sql.Open("postgres", dbURL)
 		if err != nil {
-			log.Printf("Warning: DB open failed: %v", err)
+			log.Warn("DB open failed", zap.Error(err))
 		} else {
 			db.SetMaxOpenConns(15)
 			db.SetMaxIdleConns(5)
 			db.SetConnMaxLifetime(5 * time.Minute)
 			db.SetConnMaxIdleTime(2 * time.Minute)
-			defer func() { _ = db.Close() }()
 		}
 	}
+
+	dbName := getEnv("DB_NAME", "deposits_db")
+	promReg := metricsx.NewRegistry("dashboard", db, dbName)
+	dashMetrics := metrics.NewDashboardMetrics(promReg)
+	metricsSrv := metricsx.StartServer(metricsPort, promReg, log)
 
 	gatewayURL := getEnv("GATEWAY_URL", "http://localhost:8081")
 
 	srv := server.NewDashboardServer(nc, db, gatewayURL, apiKey)
+	srv.SetMetrics(dashMetrics)
 	if err := srv.StartNATSListener(ctx); err != nil {
-		log.Printf("Warning: initial NATS listener registration delayed: %v", err)
+		log.Warn("Initial NATS listener registration delayed", zap.Error(err))
 	}
 
 	mux := http.NewServeMux()
@@ -74,19 +101,37 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Enterprise Cluster Dashboard listening on http://0.0.0.0:%s", port)
+		log.Info("Enterprise Cluster Dashboard listening",
+			zap.String("port", port),
+			zap.Int("metrics_port", metricsPort),
+		)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			log.Fatal("HTTP server error", zap.Error(err))
 		}
 	}()
 
 	<-ctx.Done()
+	log.Info("Shutdown signal received; stopping dashboard HTTP server")
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	cancel()
+
+	nc.Close()
+	if db != nil {
+		_ = db.Close()
+	}
+
+	// Shut down Prometheus metrics HTTP server LAST
+	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	metricsSrv.Shutdown(metricsCtx)
+	metricsCancel()
+
+	log.Info("Dashboard service stopped")
+	_ = log.Sync()
 }
 
-func connectNATSWithRetry(ctx context.Context, natsURL string) *nats.Conn {
+func connectNATSWithRetry(ctx context.Context, natsURL string, log *zap.Logger) *nats.Conn {
 	backoff := 500 * time.Millisecond
 	for {
 		nc, err := nats.Connect(
@@ -99,7 +144,7 @@ func connectNATSWithRetry(ctx context.Context, natsURL string) *nats.Conn {
 		if err == nil {
 			return nc
 		}
-		log.Printf("Waiting for NATS at %s: %v", natsURL, err)
+		log.Warn("Waiting for NATS", zap.String("nats_url", natsURL), zap.Error(err))
 		select {
 		case <-ctx.Done():
 			return nil

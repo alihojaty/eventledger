@@ -17,13 +17,17 @@ COPY pkg/ ./pkg/
 COPY services/dashboard/ ./services/dashboard/
 
 WORKDIR /workspace/services/dashboard
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -o /app/dashboard ./cmd/dashboard
+ARG GIT_REVISION=dev
+ARG SERVICE_VERSION=1.0.0
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -buildvcs=false \
+    -ldflags="-s -w -X github.com/alihojaty/reliable-deposit-processor/pkg/metricsx.Revision=${GIT_REVISION} -X github.com/alihojaty/reliable-deposit-processor/pkg/metricsx.Version=${SERVICE_VERSION}" \
+    -o /app/dashboard ./cmd/dashboard
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget
 
 WORKDIR /app
 COPY --from=builder /app/dashboard /app/dashboard
 
-EXPOSE 8080
+EXPOSE 8080 9090
 ENTRYPOINT ["/app/dashboard"]

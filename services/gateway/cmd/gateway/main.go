@@ -14,10 +14,12 @@ import (
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/metricsx"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/tlscfg"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/discovery"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/handler"
+	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/metrics"
 	"github.com/alihojaty/reliable-deposit-processor/services/gateway/internal/ratelimit"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -75,7 +77,13 @@ func main() {
 		zap.String("instance_id", hostname),
 	)
 
-	dnsBuilder := discovery.NewBuilder(cfg.DNSRefreshInterval, log)
+	promReg := metricsx.NewRegistry("gateway", nil, "")
+	gwMetrics := metrics.NewGatewayMetrics(promReg)
+	metricsSrv := metricsx.StartServer(cfg.MetricsPort, promReg, log)
+
+	dnsBuilder := discovery.NewBuilder(cfg.DNSRefreshInterval, log, func(count int) {
+		gwMetrics.PublisherEndpoints.Set(float64(count))
+	})
 	resolver.Register(dnsBuilder)
 
 	var gwHandler *handler.GatewayHandler
@@ -86,7 +94,8 @@ func main() {
 		grpc.WithInitialConnWindowSize(16 * 1024 * 1024),
 		grpc.WithWriteBufferSize(256 * 1024),
 		grpc.WithReadBufferSize(256 * 1024),
-		grpc.WithUnaryInterceptor(
+		grpc.WithChainUnaryInterceptor(
+			gwMetrics.GRPCClientMetrics.UnaryClientInterceptor(),
 			handler.RetryUnavailableInterceptor(
 				cfg.GRPCMaxAttempts,
 				cfg.GRPCRetryBackoff,
@@ -97,6 +106,9 @@ func main() {
 				},
 				log,
 			),
+		),
+		grpc.WithChainStreamInterceptor(
+			gwMetrics.GRPCClientMetrics.StreamClientInterceptor(),
 		),
 	}
 
@@ -133,11 +145,6 @@ func main() {
 		conns = append(conns, c)
 		pubClients = append(pubClients, depositv1.NewDepositPublisherServiceClient(c))
 	}
-	defer func() {
-		for _, c := range conns {
-			_ = c.Close()
-		}
-	}()
 
 	pubClient := &multiPublisherClient{clients: pubClients}
 	healthClient := grpc_health_v1.NewHealthClient(conns[0])
@@ -151,6 +158,7 @@ func main() {
 		log,
 		handler.WithRateLimiter(limiter),
 		handler.WithMTLSEnabled(cfg.MTLSEnabled),
+		handler.WithMetrics(gwMetrics),
 	)
 
 	srv := &http.Server{
@@ -169,6 +177,7 @@ func main() {
 	go func() {
 		log.Info("Gateway HTTP server started",
 			zap.Int("port", cfg.GatewayPort),
+			zap.Int("metrics_port", cfg.MetricsPort),
 			zap.String("publisher_grpc_target", targetAddr),
 			zap.Int("grpc_client_pool_size", grpcClientPoolSize),
 			zap.Duration("dns_refresh_interval", cfg.DNSRefreshInterval),
@@ -192,6 +201,15 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("Gateway HTTP server forced to shutdown", zap.Error(err))
 	}
+
+	for _, c := range conns {
+		_ = c.Close()
+	}
+
+	// Metrics HTTP server is shut down LAST
+	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	metricsSrv.Shutdown(metricsCtx)
+	metricsCancel()
 
 	log.Info("Gateway service stopped")
 	_ = log.Sync()

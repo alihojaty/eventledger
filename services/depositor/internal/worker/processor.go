@@ -32,16 +32,22 @@ type MetricsRecorder interface {
 	IncInvalid()
 	IncDLQ()
 	IncRetried()
+	IncUnackedShutdown()
+	ObserveProcessingDuration(d time.Duration)
+	ObserveEventAge(createdAt time.Time)
 }
 
 type noopMetrics struct{}
 
-func (noopMetrics) IncReceived()  {}
-func (noopMetrics) IncProcessed() {}
-func (noopMetrics) IncDuplicate() {}
-func (noopMetrics) IncInvalid()   {}
-func (noopMetrics) IncDLQ()       {}
-func (noopMetrics) IncRetried()   {}
+func (noopMetrics) IncReceived()                            {}
+func (noopMetrics) IncProcessed()                           {}
+func (noopMetrics) IncDuplicate()                           {}
+func (noopMetrics) IncInvalid()                             {}
+func (noopMetrics) IncDLQ()                                 {}
+func (noopMetrics) IncRetried()                             {}
+func (noopMetrics) IncUnackedShutdown()                     {}
+func (noopMetrics) ObserveProcessingDuration(time.Duration) {}
+func (noopMetrics) ObserveEventAge(time.Time)               {}
 
 type Processor struct {
 	workCtx       context.Context
@@ -89,9 +95,11 @@ func (p *Processor) InFlightCount() int64 {
 }
 
 func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
+	startTime := time.Now()
 	p.inFlightWg.Add(1)
 	p.inFlightCount.Add(1)
 	defer func() {
+		p.metrics.ObserveProcessingDuration(time.Since(startTime))
 		p.inFlightCount.Add(-1)
 		p.inFlightWg.Done()
 	}()
@@ -122,6 +130,7 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 	if err != nil {
 		// اگر کانتکست به دلیل اتمام مهلت SHUTDOWN_TIMEOUT لغو شده است، نه Ack بفرست و نه Nak
 		if p.workCtx.Err() != nil {
+			p.metrics.IncUnackedShutdown()
 			p.logger.Warn("Skipping ACK/NAK because shutdown timeout expired",
 				zap.Int("worker_id", workerID),
 				zap.String("event_id", event.EventID),
@@ -170,6 +179,7 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 
 	// اگر در حین Commit مهلت SHUTDOWN_TIMEOUT تمام شده باشد، طبق تسک ۳ نباید ACK ارسال شود
 	if p.workCtx.Err() != nil {
+		p.metrics.IncUnackedShutdown()
 		p.logger.Warn("Shutdown timeout expired before ACK; leaving message unacknowledged for redelivery",
 			zap.Int("worker_id", workerID),
 			zap.String("event_id", event.EventID),
@@ -177,8 +187,7 @@ func (p *Processor) HandleMessage(workerID int, msg JetStreamMessage) {
 		return
 	}
 
-	// Record processed metric immediately upon DB commit so redeliveries caused by
-	// a subsequent NATS ACK network blip do not lose the processed counter.
+	p.metrics.ObserveEventAge(event.CreatedAt)
 	p.metrics.IncProcessed()
 
 	if err := msg.Ack(); err != nil {

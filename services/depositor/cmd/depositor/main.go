@@ -12,6 +12,7 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/broker"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/config"
 	"github.com/alihojaty/reliable-deposit-processor/pkg/logger"
+	"github.com/alihojaty/reliable-deposit-processor/pkg/metricsx"
 	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/metrics"
 	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/repository"
 	"github.com/alihojaty/reliable-deposit-processor/services/depositor/internal/worker"
@@ -59,6 +60,12 @@ func main() {
 		log.Fatal("Failed to initialize PostgreSQL repository", zap.Error(err))
 	}
 
+	// Explicit isolated Prometheus registry with Go, Process, build_info, and sql.DB pool stats collectors
+	promReg := metricsx.NewRegistry("depositor", repo.DB(), cfg.DBName)
+	metricsCollector := metrics.NewCollector(promReg)
+	repo.SetBatchObserver(metricsCollector)
+	metricsSrv := metricsx.StartServer(cfg.MetricsPort, promReg, log)
+
 	natsBroker, err := broker.NewNATSBroker(sigCtx, cfg.NatsURL, log)
 	if err != nil {
 		_ = repo.Close()
@@ -72,11 +79,6 @@ func main() {
 		_ = repo.Close()
 		log.Fatal("Failed to initialize NATS durable consumer", zap.Error(err))
 	}
-
-	metricsCollector := metrics.NewCollector()
-	prevProcessed, _ := repo.GetTotalProcessedCount(sigCtx)
-	qStats, _ := natsBroker.GetQueueStats(sigCtx)
-	metricsCollector.RestoreState(prevProcessed, qStats.DLQTotalMsgs)
 
 	var inFlightWg sync.WaitGroup
 	proc := worker.NewProcessor(
@@ -96,7 +98,31 @@ func main() {
 		log.Fatal("Failed to start worker consumer group", zap.Error(err))
 	}
 
-	settlementWorker := worker.NewSettlementWorker(repo, cfg.SettlementInterval, log)
+	metricsCollector.WorkersActive.Set(float64(consumerGroup.ActiveWorkerCount()))
+	if natsBroker.IsConnected() {
+		metricsCollector.NATSConnected.Set(1)
+	}
+
+	// Background gauge updater for depositor_workers_active and depositor_nats_connected
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sigCtx.Done():
+				return
+			case <-ticker.C:
+				metricsCollector.WorkersActive.Set(float64(consumerGroup.ActiveWorkerCount()))
+				if natsBroker.IsConnected() {
+					metricsCollector.NATSConnected.Set(1)
+				} else {
+					metricsCollector.NATSConnected.Set(0)
+				}
+			}
+		}
+	}()
+
+	settlementWorker := worker.NewSettlementWorker(repo, cfg.SettlementInterval, log, metricsCollector)
 	settlementWorker.Start(workCtx)
 
 	natsBroker.OnReconnect(func(reconnCtx context.Context) {
@@ -123,6 +149,7 @@ func main() {
 
 	log.Info("Shutdown signal received")
 	consumerGroup.DrainAll()
+	metricsCollector.WorkersActive.Set(0)
 
 	waitDone := make(chan struct{})
 	go func() {
@@ -148,7 +175,13 @@ func main() {
 	flushCancel()
 
 	natsBroker.Close()
+	metricsCollector.NATSConnected.Set(0)
 	_ = repo.Close()
+
+	// Shut down Prometheus metrics HTTP server LAST
+	metricsCtx, metricsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	metricsSrv.Shutdown(metricsCtx)
+	metricsCancel()
 
 	log.Info("Depositor service stopped")
 	_ = log.Sync()

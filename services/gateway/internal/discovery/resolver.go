@@ -18,19 +18,25 @@ const (
 )
 
 type Builder struct {
-	refreshInterval time.Duration
-	retireGrace     time.Duration
-	logger          *zap.Logger
+	refreshInterval     time.Duration
+	retireGrace         time.Duration
+	onEndpointsResolved func(count int)
+	logger              *zap.Logger
 }
 
-func NewBuilder(refreshInterval time.Duration, logger *zap.Logger) *Builder {
+func NewBuilder(refreshInterval time.Duration, logger *zap.Logger, onEndpoints ...func(int)) *Builder {
 	if refreshInterval <= 0 {
 		refreshInterval = 2 * time.Second
 	}
+	var cb func(int)
+	if len(onEndpoints) > 0 {
+		cb = onEndpoints[0]
+	}
 	return &Builder{
-		refreshInterval: refreshInterval,
-		retireGrace:     15 * time.Second,
-		logger:          logger,
+		refreshInterval:     refreshInterval,
+		retireGrace:         15 * time.Second,
+		onEndpointsResolved: cb,
+		logger:              logger,
 	}
 }
 
@@ -60,17 +66,18 @@ func (b *Builder) Build(target resolver.Target, cc resolver.ClientConn, _ resolv
 
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &swarmDNSResolver{
-		host:            host,
-		tlsServerName:   tlsServerName,
-		port:            port,
-		cc:              cc,
-		refreshInterval: b.refreshInterval,
-		retireGrace:     b.retireGrace,
-		logger:          b.logger,
-		ctx:             ctx,
-		cancel:          cancel,
-		resolveNowCh:    make(chan struct{}, 1),
-		knownIPs:        make(map[string]time.Time),
+		host:                host,
+		tlsServerName:       tlsServerName,
+		port:                port,
+		cc:                  cc,
+		refreshInterval:     b.refreshInterval,
+		retireGrace:         b.retireGrace,
+		onEndpointsResolved: b.onEndpointsResolved,
+		logger:              b.logger,
+		ctx:                 ctx,
+		cancel:              cancel,
+		resolveNowCh:        make(chan struct{}, 1),
+		knownIPs:            make(map[string]time.Time),
 	}
 
 	r.wg.Add(1)
@@ -79,13 +86,14 @@ func (b *Builder) Build(target resolver.Target, cc resolver.ClientConn, _ resolv
 }
 
 type swarmDNSResolver struct {
-	host            string
-	tlsServerName   string
-	port            string
-	cc              resolver.ClientConn
-	refreshInterval time.Duration
-	retireGrace     time.Duration
-	logger          *zap.Logger
+	host                string
+	tlsServerName       string
+	port                string
+	cc                  resolver.ClientConn
+	refreshInterval     time.Duration
+	retireGrace         time.Duration
+	onEndpointsResolved func(int)
+	logger              *zap.Logger
 
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -195,6 +203,10 @@ func (r *swarmDNSResolver) resolve(force bool) {
 			Addr:       net.JoinHostPort(r.host, r.port),
 			ServerName: r.tlsServerName,
 		}}
+	}
+
+	if r.onEndpointsResolved != nil {
+		r.onEndpointsResolved(len(addrs))
 	}
 
 	_ = r.cc.UpdateState(resolver.State{Addresses: addrs})

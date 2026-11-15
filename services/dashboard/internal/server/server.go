@@ -17,14 +17,17 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
+	"github.com/alihojaty/reliable-deposit-processor/services/dashboard/internal/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -34,6 +37,7 @@ const (
 	maxDashboardBodySize = 32 * 1024 // 32 KB
 	dashboardSessionCook = "dashboard_session"
 	gatewaySnapGraceTTL  = 6 * time.Second
+	routeUnmatched       = "unmatched"
 )
 
 type DepositorTelemetry struct {
@@ -153,6 +157,16 @@ type UserBalanceRow struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
 type DashboardServer struct {
 	mu             sync.RWMutex
 	replicas       map[string]DepositorTelemetry
@@ -169,6 +183,7 @@ type DashboardServer struct {
 	uiSessionToken string
 	uiSessionHash  [32]byte
 	httpClient     *http.Client
+	metrics        *metrics.DashboardMetrics
 	publishEnabled atomic.Bool
 	loadgenRunning atomic.Bool
 
@@ -239,6 +254,7 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 		uiSessionToken: sessionToken,
 		uiSessionHash:  sha256.Sum256([]byte(sessionToken)),
 		httpClient:     &http.Client{Timeout: 3 * time.Second},
+		metrics:        metrics.NewDashboardMetrics(prometheus.NewRegistry()),
 		gwSnaps:        make(map[string]cachedGatewaySnap),
 		cachedRecon: LedgerReconciliationReport{
 			IsBalanced:      true,
@@ -254,21 +270,60 @@ func NewDashboardServer(nc *nats.Conn, db *sql.DB, extra ...string) *DashboardSe
 	return s
 }
 
-func (s *DashboardServer) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	mux.HandleFunc("/", s.handleUI)
-	mux.HandleFunc("/api/stats", s.handleStats)
-	mux.HandleFunc("/api/publisher/toggle", s.guardPost(s.handleTogglePublisher))
-	mux.HandleFunc("/api/settlement/trigger", s.guardPost(s.handleTriggerSettlement))
-	mux.HandleFunc("/api/dlq/replay", s.guardPost(s.handleReplayDLQ))
-	mux.HandleFunc("/api/dlq/inject", s.guardPost(s.handleInjectInvalidEvent))
-	mux.HandleFunc("/api/gateway/send", s.guardPost(s.handleGatewaySendSingle))
-	mux.HandleFunc("/api/gateway/loadgen", s.guardPost(s.handleGatewayLoadGen))
+func (s *DashboardServer) SetMetrics(m *metrics.DashboardMetrics) {
+	if m != nil {
+		s.metrics = m
+	}
 }
 
+func (s *DashboardServer) Metrics() *metrics.DashboardMetrics {
+	return s.metrics
+}
+
+func (s *DashboardServer) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/healthz", s.instrumentRoute("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	mux.HandleFunc("/", s.instrumentRootOrUnmatched(s.handleUI))
+	mux.HandleFunc("/api/stats", s.instrumentRoute("/api/stats", s.handleStats))
+	mux.HandleFunc("/api/publisher/toggle", s.instrumentRoute("/api/publisher/toggle", s.guardPost(s.handleTogglePublisher)))
+	mux.HandleFunc("/api/settlement/trigger", s.instrumentRoute("/api/settlement/trigger", s.guardPost(s.handleTriggerSettlement)))
+	mux.HandleFunc("/api/dlq/replay", s.instrumentRoute("/api/dlq/replay", s.guardPost(s.handleReplayDLQ)))
+	mux.HandleFunc("/api/dlq/inject", s.instrumentRoute("/api/dlq/inject", s.guardPost(s.handleInjectInvalidEvent)))
+	mux.HandleFunc("/api/gateway/send", s.instrumentRoute("/api/gateway/send", s.guardPost(s.handleGatewaySendSingle)))
+	mux.HandleFunc("/api/gateway/loadgen", s.instrumentRoute("/api/gateway/loadgen", s.guardPost(s.handleGatewayLoadGen)))
+}
+
+func (s *DashboardServer) instrumentRoute(routePattern string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		s.metrics.HTTPRequestsInFlight.Inc()
+		defer s.metrics.HTTPRequestsInFlight.Dec()
+
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next(rec, r)
+
+		duration := time.Since(start).Seconds()
+		s.metrics.HTTPRequestsTotal.WithLabelValues(r.Method, routePattern, strconv.Itoa(rec.status)).Inc()
+		s.metrics.HTTPRequestDuration.WithLabelValues(r.Method, routePattern).Observe(duration)
+	}
+}
+
+func (s *DashboardServer) instrumentRootOrUnmatched(rootHandler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			s.instrumentRoute(routeUnmatched, func(rw http.ResponseWriter, req *http.Request) {
+				http.NotFound(rw, req)
+			})(w, r)
+			return
+		}
+		s.instrumentRoute("/", rootHandler)(w, r)
+	}
+}
+
+// guardPost enforces strict authentication on every mutating endpoint,
+// even when the request has no Origin header or when apiKey is unconfigured.
 func (s *DashboardServer) guardPost(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -309,7 +364,7 @@ func (s *DashboardServer) guardPost(next http.HandlerFunc) http.HandlerFunc {
 			authenticated = true
 		}
 
-		if s.apiKey != "" && !authenticated {
+		if !authenticated {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
@@ -729,8 +784,6 @@ func (s *DashboardServer) runLedgerReconciliationSinglePass(ctx context.Context)
 	}
 	var totalCount int64
 
-	// Uses the 60-row pre-aggregated ledger_settled_summary table + Index-Only Scan
-	// on idx_deposits_unsettled_pending (WHERE is_settled = FALSE) for O(1) sub-millisecond reconciliation.
 	const unifiedReconQuery = `
 		WITH pending_by_user AS (
 			SELECT
@@ -1534,7 +1587,7 @@ const dashboardHTML = `<!DOCTYPE html>
     <div id="loadgenResultBanner" class="hidden bg-slate-900 text-white rounded-2xl p-3.5 text-xs font-mono ltr-num mt-3"></div>
   </div>
 
-  <!-- Global Cluster Metric Cards (2 Balanced Rows of 4 Cards) -->
+  <!-- Global Cluster Metric Cards -->
   <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 gap-4 animate-section delay-1">
     
     <div class="glass-card metric-card p-4 rounded-2xl">

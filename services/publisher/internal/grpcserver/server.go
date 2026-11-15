@@ -13,6 +13,8 @@ import (
 	"github.com/alihojaty/reliable-deposit-processor/pkg/domain"
 	depositv1 "github.com/alihojaty/reliable-deposit-processor/pkg/pb/deposit/v1"
 	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/healthmgr"
+	"github.com/alihojaty/reliable-deposit-processor/services/publisher/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -38,10 +40,21 @@ type pubIdemShard struct {
 	previous map[string]pubIdemEntry
 }
 
+type ServerOption func(*Server)
+
+func WithPublisherMetrics(m *metrics.PublisherMetrics) ServerOption {
+	return func(s *Server) {
+		if m != nil {
+			s.metrics = m
+		}
+	}
+}
+
 type Server struct {
 	depositv1.UnimplementedDepositPublisherServiceServer
 	broker     broker.Broker
 	health     *healthmgr.Manager
+	metrics    *metrics.PublisherMetrics
 	logger     *zap.Logger
 	idemShards [pubIdemShards]pubIdemShard
 }
@@ -52,14 +65,33 @@ func NewServer(b broker.Broker, logger *zap.Logger, hm ...*healthmgr.Manager) *S
 		h = hm[0]
 	}
 	s := &Server{
-		broker: b,
-		health: h,
-		logger: logger,
+		broker:  b,
+		health:  h,
+		metrics: metrics.NewPublisherMetrics(prometheus.NewRegistry(), h),
+		logger:  logger,
+	}
+	if h != nil {
+		h.AttachMetrics(s.metrics)
 	}
 	for i := 0; i < pubIdemShards; i++ {
 		s.idemShards[i].current = make(map[string]pubIdemEntry, 256)
 	}
 	return s
+}
+
+func NewServerWithMetrics(b broker.Broker, logger *zap.Logger, hm *healthmgr.Manager, pm *metrics.PublisherMetrics) *Server {
+	s := NewServer(b, logger, hm)
+	if pm != nil {
+		s.metrics = pm
+		if hm != nil {
+			hm.AttachMetrics(pm)
+		}
+	}
+	return s
+}
+
+func (s *Server) Metrics() *metrics.PublisherMetrics {
+	return s.metrics
 }
 
 func (s *Server) shardFor(eventID string) *pubIdemShard {
@@ -173,6 +205,7 @@ func marshalValidatedEventFast(ev *domain.DepositEvent, amountStr string) []byte
 }
 
 func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepositRequest) (*depositv1.PublishDepositResponse, error) {
+	s.metrics.RequestsInFlight.Inc()
 	var receivedAt time.Time
 	var draining bool
 	if s.health != nil {
@@ -181,6 +214,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 	}
 	succeeded := false
 	defer func() {
+		s.metrics.RequestsInFlight.Dec()
 		if s.health != nil {
 			completedAt := s.health.RecordRequestEnd(succeeded)
 			if draining && req != nil {
@@ -232,6 +266,7 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 	normAmountStr := event.Amount.String()
 	fingerprint := buildPublisherFingerprint(event.UserID, event.Currency, normAmountStr)
 	if !s.checkOrRememberPayload(event.EventID, fingerprint) {
+		s.metrics.IdempotencyConflicts.Inc()
 		s.logger.Warn("Rejected conflicting idempotency key with different deposit parameters",
 			zap.String("request_id", reqID),
 			zap.String("event_id", event.EventID),
@@ -241,8 +276,12 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 
 	payload := marshalValidatedEventFast(event, normAmountStr)
 
+	pubStart := time.Now()
 	ack, err := s.broker.PublishDeposit(ctx, event.EventID, payload)
+	s.metrics.JetStreamPublishDuration.Observe(time.Since(pubStart).Seconds())
+
 	if err != nil {
+		s.metrics.JetStreamPublishTotal.WithLabelValues(metrics.PublishResultError).Inc()
 		s.logger.Error("Failed to publish deposit event to NATS JetStream",
 			zap.String("request_id", reqID),
 			zap.String("event_id", event.EventID),
@@ -260,6 +299,12 @@ func (s *Server) PublishDeposit(ctx context.Context, req *depositv1.PublishDepos
 
 	s.markPayloadCommitted(event.EventID, fingerprint)
 	succeeded = true
+	if ack.Duplicate {
+		s.metrics.JetStreamPublishTotal.WithLabelValues(metrics.PublishResultDuplicate).Inc()
+	} else {
+		s.metrics.JetStreamPublishTotal.WithLabelValues(metrics.PublishResultOK).Inc()
+	}
+
 	if s.logger.Core().Enabled(zapcore.InfoLevel) {
 		s.logger.Info("Deposit event published via gRPC",
 			zap.String("request_id", reqID),
@@ -287,9 +332,10 @@ func extractRequestID(ctx context.Context) string {
 	return "unknown"
 }
 
-func UnaryInterceptors(logger *zap.Logger) grpc.ServerOption {
-	return grpc.ChainUnaryInterceptor(
-		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+func UnaryInterceptors(logger *zap.Logger, extra ...grpc.UnaryServerInterceptor) grpc.ServerOption {
+	chain := make([]grpc.UnaryServerInterceptor, 0, 2+len(extra))
+	chain = append(chain,
+		func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 			defer func() {
 				if r := recover(); r != nil {
 					logger.Error("Recovered from panic in gRPC handler",
@@ -301,6 +347,9 @@ func UnaryInterceptors(logger *zap.Logger) grpc.ServerOption {
 			}()
 			return handler(ctx, req)
 		},
+	)
+	chain = append(chain, extra...)
+	chain = append(chain,
 		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if !logger.Core().Enabled(zapcore.InfoLevel) {
 				return handler(ctx, req)
@@ -318,4 +367,5 @@ func UnaryInterceptors(logger *zap.Logger) grpc.ServerOption {
 			return resp, err
 		},
 	)
+	return grpc.ChainUnaryInterceptor(chain...)
 }
