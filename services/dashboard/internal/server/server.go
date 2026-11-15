@@ -355,8 +355,6 @@ func (s *DashboardServer) instrumentRootOrUnmatched(rootHandler http.HandlerFunc
 	}
 }
 
-// guardPost enforces strict authentication on every mutating endpoint,
-// even when the request has no Origin header or when apiKey is unconfigured.
 func (s *DashboardServer) guardPost(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -886,6 +884,7 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.db != nil {
+		// Uses backward primary-key index scan on event_id DESC to avoid a sequential sort over millions of rows
 		rows, err := s.db.QueryContext(r.Context(), `
 			SELECT
 				ROW_NUMBER() OVER (ORDER BY sub.processed_at DESC, sub.event_id DESC) AS rn,
@@ -898,7 +897,7 @@ func (s *DashboardServer) handleStats(w http.ResponseWriter, r *http.Request) {
 			FROM (
 				SELECT event_id, user_id, currency, amount, is_settled, processed_at
 				FROM deposits
-				ORDER BY processed_at DESC
+				ORDER BY event_id DESC
 				LIMIT 15
 			) sub
 		`)

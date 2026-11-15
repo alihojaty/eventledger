@@ -16,7 +16,7 @@ import (
 
 const (
 	maxBatchSize         = 256
-	batchWaitDelay       = 250 * time.Microsecond
+	batchWaitDelay       = 2 * time.Millisecond
 	batchFlushers        = 4
 	batchQueryTimeout    = 10 * time.Second
 	settlementBatchLimit = 100_000
@@ -90,7 +90,6 @@ type PostgresRepository struct {
 }
 
 // NewPostgresRepository connects to PostgreSQL and applies database migrations exclusively via golang-migrate.
-// All runtime DDL execution on startup has been removed so schema is managed strictly by migrations.
 func NewPostgresRepository(
 	ctx context.Context,
 	databaseURL, migrationsPath string,
@@ -179,7 +178,7 @@ drainFast:
 		}
 	}
 
-	if len(batch) < 64 {
+	if len(batch) < 128 {
 		timer.Reset(batchWaitDelay)
 	waitMore:
 		for len(batch) < maxBatchSize {

@@ -90,7 +90,9 @@ AS $$
 DECLARE
 v_settled_count BIGINT := 0;
 BEGIN
-    PERFORM pg_advisory_xact_lock(778899);
+    IF NOT pg_try_advisory_xact_lock(778899) THEN
+        RETURN 0;
+END IF;
 
     IF p_batch_limit IS NULL OR p_batch_limit <= 0 THEN
         p_batch_limit := 100000;
